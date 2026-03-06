@@ -135,6 +135,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
                     contextUpdates: normalizedContextUpdates,
                   },
                 },
+                origin: 'context-recall',
               }, targetSessionId)
             }
             catch (err) {

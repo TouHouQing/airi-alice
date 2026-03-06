@@ -29,6 +29,15 @@ export interface ChatAssistantMessage extends AssistantMessage {
     speech: string
     reasoning: string
   }
+  structured?: {
+    thought: string
+    emotion: string
+    reply: string
+    userSentimentScore?: number
+    sentimentConfidenceRaw?: number
+    sentimentConfidence?: number
+    format: 'epoch1-v1' | 'fallback-v1'
+  }
 }
 
 export type ChatMessage = ChatAssistantMessage | SystemMessage | ToolMessage | UserMessage

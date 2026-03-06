@@ -56,6 +56,7 @@ async function handleSend() {
       providerConfig,
       attachments: attachmentsToSend,
       tools: widgetsTools,
+      origin: 'ui-user',
     })
 
     attachmentsToSend.forEach(att => URL.revokeObjectURL(att.url))

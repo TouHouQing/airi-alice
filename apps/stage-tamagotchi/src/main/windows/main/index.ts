@@ -44,6 +44,8 @@ const appConfigSchema = object({
 
 type AppConfig = InferOutput<typeof appConfigSchema>
 
+const mainWindowTitle = 'AIRI-ALICE'
+
 export async function setupMainWindow(params: {
   settingsWindow: () => Promise<BrowserWindow>
   chatWindow: () => Promise<BrowserWindow>
@@ -67,10 +69,10 @@ export async function setupMainWindow(params: {
 
   setupConfig()
 
-  const mainWindowConfig = getConfig().windows?.find(w => w.title === 'AIRI' && w.tag === 'main')
+  const mainWindowConfig = getConfig().windows?.find(w => w.tag === 'main')
 
   const window = new BrowserWindow({
-    title: 'AIRI',
+    title: mainWindowTitle,
     width: mainWindowConfig?.width ?? 450.0,
     height: mainWindowConfig?.height ?? 600.0,
     x: mainWindowConfig?.x,
@@ -109,11 +111,11 @@ export async function setupMainWindow(params: {
       config.windows = []
     }
 
-    const existingConfigIndex = config.windows.findIndex(w => w.title === 'AIRI' && w.tag === 'main')
+    const existingConfigIndex = config.windows.findIndex(w => w.tag === 'main')
 
     if (existingConfigIndex === -1) {
       config.windows.push({
-        title: 'AIRI',
+        title: mainWindowTitle,
         tag: 'main',
         x: newBounds.x,
         y: newBounds.y,
@@ -122,8 +124,9 @@ export async function setupMainWindow(params: {
       })
     }
     else {
-      const mainWindowConfig = defu(config.windows[existingConfigIndex], { title: 'AIRI', tag: 'main' })
+      const mainWindowConfig = defu(config.windows[existingConfigIndex], { title: mainWindowTitle, tag: 'main' })
 
+      mainWindowConfig.title = mainWindowTitle
       mainWindowConfig.x = newBounds.x
       mainWindowConfig.y = newBounds.y
       mainWindowConfig.width = newBounds.width

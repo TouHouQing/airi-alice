@@ -22,6 +22,7 @@ import { createI18n } from './libs/i18n'
 import { setupServerChannel } from './services/airi/channel-server'
 import { setupMcpStdioManager } from './services/airi/mcp-servers'
 import { setupPluginHost } from './services/airi/plugins'
+import { setupAliceRuntime } from './services/alice/runtime'
 import { setupAutoUpdater } from './services/electron/auto-updater'
 import { setupTray } from './tray'
 import { setupAboutWindowReusable } from './windows/about'
@@ -103,6 +104,10 @@ app.whenReady().then(async () => {
     build: () => setupPluginHost(),
   })
 
+  const aliceRuntime = injeca.provide('modules:alice-runtime', {
+    build: async () => setupAliceRuntime(),
+  })
+
   // BeatSync will create a background window to capture and process audio.
   const beatSync = injeca.provide('windows:beat-sync', () => setupBeatSync())
 
@@ -148,7 +153,7 @@ app.whenReady().then(async () => {
   })
 
   injeca.invoke({
-    dependsOn: { mainWindow, tray, serverChannel, pluginHost, mcpStdioManager },
+    dependsOn: { mainWindow, tray, serverChannel, pluginHost, mcpStdioManager, aliceRuntime },
     callback: noop,
   })
 

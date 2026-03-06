@@ -223,7 +223,11 @@ async function startAudioInteraction() {
               }
 
               console.info('[Main Page] Sending transcription to chat:', finalText)
-              await chatStore.ingest(finalText, { model: activeChatModel.value, chatProvider: provider as ChatProvider })
+              await chatStore.ingest(finalText, {
+                model: activeChatModel.value,
+                chatProvider: provider as ChatProvider,
+                origin: 'ui-user',
+              })
             }
             catch (err) {
               console.error('[Main Page] Failed to send chat from voice:', err)
@@ -263,7 +267,11 @@ async function startAudioInteraction() {
         if (!provider || !activeChatModel.value)
           return
 
-        await chatStore.ingest(text, { model: activeChatModel.value, chatProvider: provider as ChatProvider })
+        await chatStore.ingest(text, {
+          model: activeChatModel.value,
+          chatProvider: provider as ChatProvider,
+          origin: 'ui-user',
+        })
       }
       catch (err) {
         console.error('Failed to send chat from voice:', err)

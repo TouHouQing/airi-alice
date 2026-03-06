@@ -30,6 +30,7 @@ import {
   electronMcpOpenConfigFile,
 } from '../../../../shared/eventa'
 import { onAppBeforeQuit } from '../../../libs/bootkit/lifecycle'
+import { isAliceKillSwitchSuspended } from '../../alice/state'
 
 interface McpServerSession {
   client: Client
@@ -328,6 +329,10 @@ export function createMcpStdioManager(): McpStdioManager {
   }
 
   const callTool = async (payload: ElectronMcpCallToolPayload): Promise<ElectronMcpCallToolResult> => {
+    if (isAliceKillSwitchSuspended()) {
+      throw new Error('A.L.I.C.E kill switch is suspended; MCP tool execution is disabled.')
+    }
+
     const normalizedRequestId = payload.requestId?.trim()
     if (normalizedRequestId) {
       pruneCompletedToolCalls()

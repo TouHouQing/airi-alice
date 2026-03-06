@@ -209,5 +209,89 @@ export const widgetsUpdateEvent = defineEventa<{ id: string, componentProps?: Re
 export const i18nSetLocale = defineInvokeEventa<void, Locale>('eventa:invoke:electron:i18n:set-locale')
 export const i18nGetLocale = defineInvokeEventa<Locale>('eventa:invoke:electron:i18n:get-locale')
 
+export type AliceKillSwitchState = 'ACTIVE' | 'SUSPENDED'
+
+export interface AlicePersonalityState {
+  obedience: number
+  liveliness: number
+  sensibility: number
+}
+
+export interface AliceSoulFrontmatter {
+  schemaVersion: number
+  initialized: boolean
+  profile: {
+    hostName: string
+    mindAge: number
+  }
+  personality: AlicePersonalityState
+  boundaries: {
+    killSwitch: boolean
+    mcpGuard: boolean
+  }
+}
+
+export interface AliceSoulSnapshot {
+  soulPath: string
+  content: string
+  frontmatter: AliceSoulFrontmatter
+  revision: number
+  hash: string
+  needsGenesis: boolean
+  watching: boolean
+}
+
+export interface AliceGenesisInput {
+  hostName: string
+  mindAge: number
+  personality: AlicePersonalityState
+  allowOverwrite?: boolean
+}
+
+export interface AliceInitializeGenesisResult {
+  soul: AliceSoulSnapshot
+  conflict: boolean
+  conflictCandidate?: AliceSoulSnapshot
+}
+
+export interface AlicePersonalityUpdatePayload {
+  expectedRevision?: number
+  reason?: string
+  deltas: Partial<AlicePersonalityState>
+}
+
+export interface AliceSoulUpdatePayload {
+  expectedRevision?: number
+  content: string
+}
+
+export interface AliceKillSwitchSnapshot {
+  state: AliceKillSwitchState
+  reason?: string
+  updatedAt: number
+}
+
+export interface AliceMemoryStats {
+  total: number
+  active: number
+  archived: number
+  lastPrunedAt: number | null
+}
+
+export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
+export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:get-soul')
+export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
+export const electronAliceUpdateSoul = defineInvokeEventa<AliceSoulSnapshot, AliceSoulUpdatePayload>('eventa:invoke:electron:alice:update-soul')
+export const electronAliceUpdatePersonality = defineInvokeEventa<AliceSoulSnapshot, AlicePersonalityUpdatePayload>('eventa:invoke:electron:alice:update-personality')
+export const electronAliceKillSwitchGetState = defineInvokeEventa<AliceKillSwitchSnapshot>('eventa:invoke:electron:alice:kill-switch:get-state')
+export const electronAliceKillSwitchSuspend = defineInvokeEventa<AliceKillSwitchSnapshot, { reason?: string }>('eventa:invoke:electron:alice:kill-switch:suspend')
+export const electronAliceKillSwitchResume = defineInvokeEventa<AliceKillSwitchSnapshot, { reason?: string }>('eventa:invoke:electron:alice:kill-switch:resume')
+export const electronAliceGetMemoryStats = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:get-stats')
+export const electronAliceRunMemoryPrune = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:run-prune')
+export const electronAliceUpdateMemoryStats = defineInvokeEventa<AliceMemoryStats, AliceMemoryStats>('eventa:invoke:electron:alice:memory:update-stats')
+
+export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
+export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')
+
 export { electron } from '@proj-airi/electron-eventa'
 export * from '@proj-airi/electron-eventa/electron-updater'

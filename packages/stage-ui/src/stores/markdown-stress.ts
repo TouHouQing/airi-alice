@@ -312,6 +312,7 @@ export const useMarkdownStressStore = defineStore('markdownStress', () => {
           await chatStore.ingest(message.text, {
             model: activeModel.value!,
             chatProvider: provider,
+            origin: 'system',
           })
         }
         catch (error) {
@@ -368,6 +369,7 @@ export const useMarkdownStressStore = defineStore('markdownStress', () => {
           await chatStore.ingest(message.text, {
             model: modelToUse,
             chatProvider: mockProvider,
+            origin: 'system',
           })
         }
         catch (error) {

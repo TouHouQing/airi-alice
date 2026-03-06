@@ -11,8 +11,10 @@ import { defineStore, storeToRefs } from 'pinia'
 import { ref, toRaw } from 'vue'
 
 import { useAnalytics } from '../composables'
+import { normalizeStructuredOutput } from '../composables/alice-structured-output'
 import { useLlmmarkerParser } from '../composables/llm-marker-parser'
 import { categorizeResponse, createStreamingCategorizer } from '../composables/response-categoriser'
+import { hasAliceBridge, getAliceBridge } from './alice-bridge'
 import { createDatetimeContext } from './chat/context-providers'
 import { useChatContextStore } from './chat/context-store'
 import { createChatHooks } from './chat/hooks'
@@ -28,6 +30,7 @@ interface SendOptions {
   attachments?: { type: 'image', data: string, mimeType: string }[]
   tools?: StreamOptions['tools']
   input?: WebSocketEventInputs
+  origin?: 'ui-user' | 'tool-output' | 'context-recall' | 'system'
 }
 
 interface ForkOptions {
@@ -46,6 +49,30 @@ interface QueuedSend {
   deferred: {
     resolve: () => void
     reject: (error: unknown) => void
+  }
+}
+
+function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null {
+  const normalized = message.trim()
+  const suspendPattern = /^(?:A\.?L\.?I\.?C\.?E\.?[,，]?\s*)?(?:强制休眠|休眠|suspend|sleep)\s*$/i
+  const resumePattern = /^(?:A\.?L\.?I\.?C\.?E\.?[,，]?\s*)?(?:恢复|唤醒|resume|wake)\s*$/i
+  if (suspendPattern.test(normalized))
+    return 'suspend'
+  if (resumePattern.test(normalized))
+    return 'resume'
+  return null
+}
+
+async function safelyGetAliceSoulPrompt() {
+  if (!hasAliceBridge())
+    return null
+
+  try {
+    const soul = await getAliceBridge().getSoul()
+    return soul.content.trim() || null
+  }
+  catch {
+    return null
   }
 }
 
@@ -140,6 +167,51 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     trackFirstMessage()
 
     try {
+      if (options.origin === 'ui-user' && hasAliceBridge()) {
+        const directive = parseKillSwitchDirective(sendingMessage)
+        if (directive) {
+          const bridge = getAliceBridge()
+          const nextState = directive === 'suspend'
+            ? await bridge.suspendKillSwitch({ reason: 'user-command' })
+            : await bridge.resumeKillSwitch({ reason: 'user-command' })
+
+          const sessionMessagesForCommand = chatSession.getSessionMessages(sessionId)
+          sessionMessagesForCommand.push({ role: 'user', content: sendingMessage, createdAt: sendingCreatedAt, id: nanoid() })
+
+          const reply = directive === 'suspend'
+            ? '已进入强制休眠模式，执行链路已暂停。'
+            : '已恢复运行，执行链路重新启用。'
+
+          sessionMessagesForCommand.push({
+            role: 'assistant',
+            content: reply,
+            slices: [{ type: 'text', text: reply }],
+            tool_results: [],
+            categorization: {
+              speech: reply,
+              reasoning: '',
+            },
+            structured: {
+              thought: '',
+              emotion: nextState.state === 'SUSPENDED' ? 'tired' : 'neutral',
+              reply,
+              userSentimentScore: 0,
+              sentimentConfidenceRaw: 0.8,
+              sentimentConfidence: 0.6,
+              format: 'fallback-v1',
+            },
+            createdAt: Date.now(),
+            id: nanoid(),
+          })
+
+          chatSession.persistSessionMessages(sessionId)
+          if (isForegroundSession()) {
+            streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }
+          }
+          return
+        }
+      }
+
       await hooks.emitBeforeMessageComposedHooks(sendingMessage, streamingMessageContext)
 
       const contentParts: CommonContentPart[] = [{ type: 'text', text: sendingMessage }]
@@ -216,11 +288,23 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             return
 
           const finalCategorization = categorizeResponse(fullText, activeProvider.value)
+          const previousAssistant = [...sessionMessagesForSend]
+            .reverse()
+            .find(message => message.role === 'assistant' && 'structured' in message && message.structured)
+          const structured = normalizeStructuredOutput({
+            fullText,
+            thought: finalCategorization.reasoning,
+            reply: finalCategorization.speech,
+            previousEmotion: previousAssistant && 'structured' in previousAssistant
+              ? previousAssistant.structured?.emotion
+              : undefined,
+          })
 
           buildingMessage.categorization = {
             speech: finalCategorization.speech,
             reasoning: finalCategorization.reasoning,
           }
+          buildingMessage.structured = structured
           updateUI()
         },
         minLiteralEmitLength: 24,
@@ -250,12 +334,38 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         const rawMessage = toRaw(withoutContext)
 
         if (rawMessage.role === 'assistant') {
-          const { slices: _slices, tool_results: _toolResults, categorization: _categorization, ...rest } = rawMessage as ChatAssistantMessage
+          const {
+            slices: _slices,
+            tool_results: _toolResults,
+            categorization: _categorization,
+            structured: _structured,
+            ...rest
+          } = rawMessage as ChatAssistantMessage
           return toRaw(rest)
         }
 
         return rawMessage
       })
+
+      const soulPrompt = await safelyGetAliceSoulPrompt()
+      if (soulPrompt) {
+        const currentSystem = newMessages.at(0)
+        if (currentSystem?.role === 'system') {
+          const currentContent = typeof currentSystem.content === 'string'
+            ? currentSystem.content
+            : JSON.stringify(currentSystem.content)
+          newMessages[0] = {
+            ...currentSystem,
+            content: `${currentContent}\n\n${soulPrompt}`,
+          }
+        }
+        else {
+          newMessages = [
+            { role: 'system', content: soulPrompt },
+            ...newMessages,
+          ]
+        }
+      }
 
       const contextsSnapshot = chatContext.getContextsSnapshot()
       if (Object.keys(contextsSnapshot).length > 0) {
@@ -361,6 +471,19 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     options: SendOptions,
     targetSessionId?: string,
   ) {
+    if (hasAliceBridge()) {
+      const origin = options.origin ?? 'ui-user'
+      const isTopLevelInput = origin === 'ui-user'
+      const directive = isTopLevelInput ? parseKillSwitchDirective(sendingMessage) : null
+
+      if (!directive) {
+        const killSwitch = await getAliceBridge().getKillSwitchState().catch(() => null)
+        if (killSwitch?.state === 'SUSPENDED' && isTopLevelInput) {
+          throw new Error('A.L.I.C.E is currently suspended. Send "A.L.I.C.E，恢复" to resume.')
+        }
+      }
+    }
+
     const sessionId = targetSessionId || activeSessionId.value
     const generation = chatSession.getSessionGeneration(sessionId)
 
