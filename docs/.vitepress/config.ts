@@ -275,6 +275,17 @@ export default defineConfig({
                 text: '配置',
                 items: [
                   { text: '配置指南', link: withBase('/zh-Hans/docs/manual/config/') },
+                  { text: '不同的版本', link: withBase('/zh-Hans/docs/manual/versions') },
+                ],
+              },
+              {
+                text: 'A.L.I.C.E',
+                items: [
+                  { text: '文档索引', link: withBase('/zh-Hans/docs/alice/') },
+                  { text: '全景需求（Epoch 1-5）', link: withBase('/zh-Hans/docs/alice/requirements') },
+                  { text: '架构设计', link: withBase('/zh-Hans/docs/alice/architecture') },
+                  { text: '未来规划', link: withBase('/zh-Hans/docs/alice/roadmap') },
+                  { text: '开发需求（Epoch 1）', link: withBase('/zh-Hans/docs/alice/development-epoch1') },
                 ],
               },
             ],

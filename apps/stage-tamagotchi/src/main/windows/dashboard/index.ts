@@ -40,6 +40,8 @@ const appConfigSchema = object({
 
 type AppConfig = InferOutput<typeof appConfigSchema>
 
+const dashboardWindowTitle = 'AIRI-ALICE Dashboard'
+
 export async function setupDashboardWindow(params: {
   settingsWindow: () => Promise<BrowserWindow>
   chatWindow: () => Promise<BrowserWindow>
@@ -60,10 +62,10 @@ export async function setupDashboardWindow(params: {
 
   setupConfig()
 
-  const windowConfig = getConfig().windows?.find(w => w.title === 'AIRI Dashboard' && w.tag === 'dashboard')
+  const windowConfig = getConfig().windows?.find(w => w.tag === 'dashboard')
 
   const window = new BrowserWindow({
-    title: 'AIRI Dashboard',
+    title: dashboardWindowTitle,
     width: windowConfig?.width ?? 1200.0,
     height: windowConfig?.height ?? 600.0,
     x: windowConfig?.x,
@@ -96,11 +98,11 @@ export async function setupDashboardWindow(params: {
       config.windows = []
     }
 
-    const existingConfigIndex = config.windows.findIndex(w => w.title === 'AIRI Dashboard' && w.tag === 'dashboard')
+    const existingConfigIndex = config.windows.findIndex(w => w.tag === 'dashboard')
 
     if (existingConfigIndex === -1) {
       config.windows.push({
-        title: 'AIRI Dashboard',
+        title: dashboardWindowTitle,
         tag: 'dashboard',
         x: newBounds.x,
         y: newBounds.y,
@@ -109,8 +111,9 @@ export async function setupDashboardWindow(params: {
       })
     }
     else {
-      const windowConfig = defu(config.windows[existingConfigIndex], { title: 'AIRI Dashboard', tag: 'dashboard' })
+      const windowConfig = defu(config.windows[existingConfigIndex], { title: dashboardWindowTitle, tag: 'dashboard' })
 
+      windowConfig.title = dashboardWindowTitle
       windowConfig.x = newBounds.x
       windowConfig.y = newBounds.y
       windowConfig.width = newBounds.width

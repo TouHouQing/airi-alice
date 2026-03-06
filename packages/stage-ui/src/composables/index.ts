@@ -1,4 +1,5 @@
 export * from './audio'
+export * from './alice-structured-output'
 export * from './canvas-alpha'
 export * from './llm-marker-parser'
 export * from './markdown'
