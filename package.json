@@ -49,6 +49,7 @@
     "@iconify/utils": "^3.1.0",
     "@moeru/eslint-config": "catalog:",
     "@proj-airi/unocss-preset-chromatic": "^1.0.2",
+    "@rolldown/binding-darwin-arm64": "catalog:",
     "@types/node": "^24.10.14",
     "@unocss/eslint-config": "^66.6.2",
     "@unocss/eslint-plugin": "^66.6.2",

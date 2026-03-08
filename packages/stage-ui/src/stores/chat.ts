@@ -11,16 +11,20 @@ import { defineStore, storeToRefs } from 'pinia'
 import { ref, toRaw } from 'vue'
 
 import { useAnalytics } from '../composables'
+import { applyPromptBudget, sanitizeAssistantOutputForDisplay, sanitizeForRemoteModel } from '../composables/alice-guardrails'
+import { composeAlicePromptMessages } from '../composables/alice-prompt-composer'
+import { detectRealtimeQueryIntent, runRealtimeQueryPreflight } from '../composables/alice-realtime-query'
 import { normalizeStructuredOutput } from '../composables/alice-structured-output'
 import { useLlmmarkerParser } from '../composables/llm-marker-parser'
 import { categorizeResponse, createStreamingCategorizer } from '../composables/response-categoriser'
-import { hasAliceBridge, getAliceBridge } from './alice-bridge'
+import { getAliceBridge, hasAliceBridge } from './alice-bridge'
 import { createDatetimeContext } from './chat/context-providers'
 import { useChatContextStore } from './chat/context-store'
 import { createChatHooks } from './chat/hooks'
 import { useChatSessionStore } from './chat/session-store'
 import { useChatStreamStore } from './chat/stream-store'
 import { useLLM } from './llm'
+import { getMcpToolBridge } from './mcp-tool-bridge'
 import { useConsciousnessStore } from './modules/consciousness'
 
 interface SendOptions {
@@ -52,6 +56,15 @@ interface QueuedSend {
   }
 }
 
+const assistantLeakFallbackReply = '我刚才的检索结果混入了内部调用片段，已自动过滤。请你再说一次你的问题，我会直接给你整理后的结果。'
+const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外部数据。请稍后重试，或在设置里检查 MCP 实时工具是否可用。'
+
+interface TurnToolEvidence {
+  toolCallCount: number
+  toolResultCount: number
+  verifiedToolResult: boolean
+}
+
 function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null {
   const normalized = message.trim()
   const suspendPattern = /^(?:A\.?L\.?I\.?C\.?E\.?[,，]?\s*)?(?:强制休眠|休眠|suspend|sleep)\s*$/i
@@ -63,17 +76,98 @@ function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null 
   return null
 }
 
-async function safelyGetAliceSoulPrompt() {
+function replaceAssistantTextSlices(slices: ChatSlices[], text: string): ChatSlices[] {
+  const normalizedText = text.trim()
+  const nextSlices: ChatSlices[] = []
+  let inserted = false
+
+  for (const slice of slices) {
+    if (slice.type === 'text') {
+      if (!inserted && normalizedText) {
+        nextSlices.push({
+          type: 'text',
+          text: normalizedText,
+        })
+        inserted = true
+      }
+      continue
+    }
+
+    nextSlices.push(slice)
+  }
+
+  if (!inserted && normalizedText) {
+    nextSlices.unshift({
+      type: 'text',
+      text: normalizedText,
+    })
+  }
+
+  return nextSlices
+}
+
+function stringifyAssistantContent(content: unknown) {
+  if (typeof content === 'string')
+    return content
+
+  if (!Array.isArray(content))
+    return ''
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string')
+        return part
+      if (part && typeof part === 'object' && 'text' in part)
+        return String((part as { text?: unknown }).text ?? '')
+      return ''
+    })
+    .join('')
+}
+
+function hasVerifiedToolResult(result?: string | CommonContentPart[]) {
+  if (typeof result === 'string') {
+    return result.trim().length > 0
+  }
+
+  if (!Array.isArray(result))
+    return false
+
+  return result.some((part) => {
+    if (part && typeof part === 'object' && 'text' in part)
+      return String((part as { text?: unknown }).text ?? '').trim().length > 0
+    return Boolean(part && Object.keys(part).length > 0)
+  })
+}
+
+async function safelyGetAliceSoulSnapshot() {
   if (!hasAliceBridge())
     return null
 
   try {
-    const soul = await getAliceBridge().getSoul()
-    return soul.content.trim() || null
+    return await getAliceBridge().getSoul()
   }
   catch {
     return null
   }
+}
+
+async function appendAliceAuditLog(payload: {
+  level: 'info' | 'notice' | 'warning' | 'critical'
+  category: string
+  action: string
+  message: string
+  details?: Record<string, unknown>
+}) {
+  if (!hasAliceBridge())
+    return
+
+  await getAliceBridge().appendAuditLog({
+    level: payload.level,
+    category: payload.category,
+    action: payload.action,
+    message: payload.message,
+    payload: payload.details,
+  }).catch(() => {})
 }
 
 export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
@@ -249,8 +343,68 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       sessionMessagesForSend.push({ role: 'user', content: finalContent, createdAt: sendingCreatedAt, id: nanoid() })
       chatSession.persistSessionMessages(sessionId)
 
+      const origin = options.origin ?? 'ui-user'
+      const realtimeIntent = hasAliceBridge() && origin === 'ui-user'
+        ? detectRealtimeQueryIntent(sendingMessage)
+        : detectRealtimeQueryIntent('')
+      const turnToolEvidence: TurnToolEvidence = {
+        toolCallCount: 0,
+        toolResultCount: 0,
+        verifiedToolResult: false,
+      }
+
       const categorizer = createStreamingCategorizer(activeProvider.value)
       let streamPosition = 0
+      let finalAssistantDisplayText = ''
+
+      const applyAssistantResult = (payload: {
+        fullText: string
+        reasoning: string
+        reply: string
+      }) => {
+        const previousAssistant = [...sessionMessagesForSend]
+          .reverse()
+          .find(message => message.role === 'assistant' && 'structured' in message && message.structured)
+
+        const structured = normalizeStructuredOutput({
+          fullText: payload.fullText,
+          thought: payload.reasoning,
+          reply: payload.reply,
+          previousEmotion: previousAssistant && 'structured' in previousAssistant
+            ? previousAssistant.structured?.emotion
+            : undefined,
+        })
+
+        buildingMessage.categorization = {
+          speech: payload.reply,
+          reasoning: payload.reasoning,
+        }
+        buildingMessage.structured = structured
+        buildingMessage.content = payload.reply
+        buildingMessage.slices = replaceAssistantTextSlices(buildingMessage.slices, payload.reply)
+        finalAssistantDisplayText = payload.reply
+        updateUI()
+      }
+
+      const persistBuiltAssistantMessage = () => {
+        if (!isStaleGeneration() && buildingMessage.slices.length > 0) {
+          sessionMessagesForSend.push(toRaw(buildingMessage))
+          chatSession.persistSessionMessages(sessionId)
+        }
+      }
+
+      const emitAssistantTurnHooks = async (assistantOutputText: string) => {
+        await hooks.emitStreamEndHooks(streamingMessageContext)
+        await hooks.emitAssistantResponseEndHooks(assistantOutputText, streamingMessageContext)
+
+        await hooks.emitAfterSendHooks(sendingMessage, streamingMessageContext)
+        await hooks.emitAssistantMessageHooks({ ...buildingMessage }, assistantOutputText, streamingMessageContext)
+        await hooks.emitChatTurnCompleteHooks({
+          output: { ...buildingMessage },
+          outputText: assistantOutputText,
+          toolCalls: sessionMessagesForSend.filter(msg => msg.role === 'tool') as ToolMessage[],
+        }, streamingMessageContext)
+      }
 
       const parser = useLlmmarkerParser({
         onLiteral: async (literal) => {
@@ -291,24 +445,83 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             return
 
           const finalCategorization = categorizeResponse(fullText, activeProvider.value)
-          const previousAssistant = [...sessionMessagesForSend]
-            .reverse()
-            .find(message => message.role === 'assistant' && 'structured' in message && message.structured)
-          const structured = normalizeStructuredOutput({
-            fullText,
-            thought: finalCategorization.reasoning,
-            reply: finalCategorization.speech,
-            previousEmotion: previousAssistant && 'structured' in previousAssistant
-              ? previousAssistant.structured?.emotion
-              : undefined,
+          const sanitizedOutput = sanitizeAssistantOutputForDisplay(finalCategorization.speech, {
+            realtimeIntent: realtimeIntent.needsRealtime,
+            verifiedToolResult: turnToolEvidence.verifiedToolResult,
           })
+          const emptyAfterSanitize = !sanitizedOutput.cleanText.trim()
+          const realtimeFallbackApplied = realtimeIntent.needsRealtime && !turnToolEvidence.verifiedToolResult
+          const leakFallbackApplied = sanitizedOutput.leakDetected && emptyAfterSanitize
+          const emptyOutputFallbackApplied = !realtimeFallbackApplied && !leakFallbackApplied && emptyAfterSanitize
+          const finalSpeech = realtimeFallbackApplied
+            ? assistantRealtimeUnavailableReply
+            : (leakFallbackApplied || emptyOutputFallbackApplied)
+                ? assistantLeakFallbackReply
+                : sanitizedOutput.cleanText
 
-          buildingMessage.categorization = {
-            speech: finalCategorization.speech,
-            reasoning: finalCategorization.reasoning,
+          if (sanitizedOutput.fabricationDetected) {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'output-guard',
+              action: 'output-fabrication-sanitized',
+              message: 'Assistant output contained fabricated execution fragments and was sanitized.',
+              details: {
+                removedCount: sanitizedOutput.fabricationRemovedCount,
+                realtimeIntent: realtimeIntent.needsRealtime,
+                verifiedToolResult: turnToolEvidence.verifiedToolResult,
+              },
+            })
           }
-          buildingMessage.structured = structured
-          updateUI()
+
+          if (sanitizedOutput.leakDetected) {
+            await appendAliceAuditLog({
+              level: leakFallbackApplied ? 'warning' : 'notice',
+              category: 'output-guard',
+              action: leakFallbackApplied ? 'sanitize-fallback' : 'sanitize-leak',
+              message: leakFallbackApplied
+                ? 'Assistant output leak detected and fallback reply applied.'
+                : 'Assistant output leak detected and sanitized before display.',
+              details: {
+                removedCount: sanitizedOutput.removedCount,
+                redactedSecrets: sanitizedOutput.redactedSecrets,
+                fallbackApplied: leakFallbackApplied,
+              },
+            })
+          }
+
+          if (emptyOutputFallbackApplied) {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'output-guard',
+              action: 'sanitize-empty-fallback',
+              message: 'Assistant output became empty after sanitization; fallback reply applied.',
+              details: {
+                removedCount: sanitizedOutput.removedCount,
+                fabricationDetected: sanitizedOutput.fabricationDetected,
+              },
+            })
+          }
+
+          if (realtimeFallbackApplied) {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'output-guard',
+              action: 'realtime-unverified-fallback',
+              message: 'Realtime query did not yield verified tool result; fallback reply applied.',
+              details: {
+                categories: realtimeIntent.categories,
+                toolCallCount: turnToolEvidence.toolCallCount,
+                toolResultCount: turnToolEvidence.toolResultCount,
+                verifiedToolResult: turnToolEvidence.verifiedToolResult,
+              },
+            })
+          }
+
+          applyAssistantResult({
+            fullText,
+            reasoning: finalCategorization.reasoning,
+            reply: finalSpeech,
+          })
         },
         minLiteralEmitLength: 24,
       })
@@ -350,28 +563,65 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         return rawMessage
       })
 
-      const soulPrompt = await safelyGetAliceSoulPrompt()
-      if (soulPrompt) {
-        const currentSystem = newMessages.at(0)
-        if (currentSystem?.role === 'system') {
-          const currentContent = typeof currentSystem.content === 'string'
-            ? currentSystem.content
-            : JSON.stringify(currentSystem.content)
-          newMessages[0] = {
-            ...currentSystem,
-            content: `${currentContent}\n\n${soulPrompt}`,
-          }
-        }
-        else {
-          newMessages = [
-            { role: 'system', content: soulPrompt },
-            ...newMessages,
-          ]
-        }
-      }
-
       const contextsSnapshot = chatContext.getContextsSnapshot()
-      if (Object.keys(contextsSnapshot).length > 0) {
+      if (hasAliceBridge()) {
+        const soulSnapshot = await safelyGetAliceSoulSnapshot()
+        const composed = composeAlicePromptMessages({
+          messages: newMessages as Message[],
+          soulContent: soulSnapshot?.content ?? null,
+          hostName: soulSnapshot?.frontmatter?.profile?.hostName ?? null,
+          contextsSnapshot,
+        })
+        newMessages = composed.messages as any
+
+        const budgeted = applyPromptBudget(newMessages as Message[])
+        newMessages = budgeted.messages as any
+        if (budgeted.report.truncated) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'prompt-budget',
+            action: 'truncate',
+            message: 'Prompt budget manager truncated context before model call.',
+            details: {
+              totalBeforeTokens: budgeted.report.totalBeforeTokens,
+              totalAfterTokens: budgeted.report.totalAfterTokens,
+              droppedMessageCount: budgeted.report.droppedMessageCount,
+              sections: budgeted.report.sections,
+            },
+          })
+        }
+
+        const sanitized = sanitizeForRemoteModel(newMessages as Message[], { timeBudgetMs: 50, chunkSize: 2048 })
+        if (sanitized.blocked) {
+          await appendAliceAuditLog({
+            level: 'critical',
+            category: 'sanitize',
+            action: 'blocked',
+            message: 'Outbound model request blocked by sanitize gateway.',
+            details: {
+              reason: sanitized.reason,
+              elapsedMs: sanitized.elapsedMs,
+            },
+          })
+          throw new Error('A.L.I.C.E blocked this outbound request to protect privacy.')
+        }
+
+        if (sanitized.redactions > 0) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'sanitize',
+            action: 'redacted',
+            message: 'Sanitize gateway redacted sensitive content before model call.',
+            details: {
+              redactions: sanitized.redactions,
+              elapsedMs: sanitized.elapsedMs,
+            },
+          })
+        }
+
+        newMessages = sanitized.messages as any
+      }
+      else if (Object.keys(contextsSnapshot).length > 0) {
         const system = newMessages.slice(0, 1)
         const afterSystem = newMessages.slice(1, newMessages.length)
 
@@ -403,6 +653,44 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       if (shouldAbort())
         return
 
+      if (realtimeIntent.needsRealtime) {
+        const preflight = await runRealtimeQueryPreflight({
+          intent: realtimeIntent,
+          timeoutMs: 1500,
+          listTools: async () => {
+            return await getMcpToolBridge().listTools()
+          },
+        })
+
+        if (!preflight.allowed) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'output-guard',
+            action: 'realtime-preflight-blocked',
+            message: 'Realtime query blocked because no suitable MCP tool is currently available.',
+            details: {
+              reason: preflight.reason,
+              categories: preflight.categories,
+              matchedCategories: preflight.matchedCategories,
+              availableToolCount: preflight.availableToolCount,
+            },
+          })
+
+          applyAssistantResult({
+            fullText: assistantRealtimeUnavailableReply,
+            reasoning: '',
+            reply: assistantRealtimeUnavailableReply,
+          })
+          persistBuiltAssistantMessage()
+          await emitAssistantTurnHooks(assistantRealtimeUnavailableReply)
+
+          if (isForegroundSession()) {
+            streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }
+          }
+          return
+        }
+      }
+
       await llmStore.stream(options.model, options.chatProvider, newMessages as Message[], {
         headers,
         tools: options.tools,
@@ -412,6 +700,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         onStreamEvent: async (event: StreamEvent) => {
           switch (event.type) {
             case 'tool-call':
+              turnToolEvidence.toolCallCount += 1
               toolCallQueue.enqueue({
                 type: 'tool-call',
                 toolCall: event,
@@ -419,6 +708,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
               break
             case 'tool-result':
+              turnToolEvidence.toolResultCount += 1
+              if (hasVerifiedToolResult(event.result))
+                turnToolEvidence.verifiedToolResult = true
               toolCallQueue.enqueue({
                 type: 'tool-call-result',
                 id: event.toolCallId,
@@ -440,21 +732,14 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
       await parser.end()
 
-      if (!isStaleGeneration() && buildingMessage.slices.length > 0) {
-        sessionMessagesForSend.push(toRaw(buildingMessage))
-        chatSession.persistSessionMessages(sessionId)
-      }
+      persistBuiltAssistantMessage()
 
-      await hooks.emitStreamEndHooks(streamingMessageContext)
-      await hooks.emitAssistantResponseEndHooks(fullText, streamingMessageContext)
+      const assistantOutputText = finalAssistantDisplayText
+        || buildingMessage.structured?.reply
+        || stringifyAssistantContent(buildingMessage.content)
+        || fullText
 
-      await hooks.emitAfterSendHooks(sendingMessage, streamingMessageContext)
-      await hooks.emitAssistantMessageHooks({ ...buildingMessage }, fullText, streamingMessageContext)
-      await hooks.emitChatTurnCompleteHooks({
-        output: { ...buildingMessage },
-        outputText: fullText,
-        toolCalls: sessionMessagesForSend.filter(msg => msg.role === 'tool') as ToolMessage[],
-      }, streamingMessageContext)
+      await emitAssistantTurnHooks(assistantOutputText)
 
       if (isForegroundSession()) {
         streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }

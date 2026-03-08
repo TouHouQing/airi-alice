@@ -28,6 +28,19 @@ vi.mock('vue-i18n', () => ({
   }),
 }))
 
+vi.mock('~build/time', () => ({
+  default: '1970-01-01T00:00:00.000Z',
+}))
+
+vi.mock('~build/git', () => ({
+  abbreviatedSha: 'test-sha',
+  branch: 'test-branch',
+}))
+
+vi.mock('~build/package', () => ({
+  version: '0.0.0-test',
+}))
+
 function mockedStore<TStoreDef extends () => unknown>(
   useStore: TStoreDef,
 ): TStoreDef extends StoreDefinition<

@@ -1,4 +1,4 @@
-import type { AliceMemoryStats, AliceSoulSnapshot } from './alice-bridge'
+import type { AliceGenesisInput, AliceKillSwitchSnapshot, AliceMemoryStats, AliceSoulSnapshot } from './alice-bridge'
 import type { AliceMemoryFact } from './alice-memory'
 
 import { ContextUpdateStrategy } from '@proj-airi/server-sdk'
@@ -8,7 +8,7 @@ import { ref } from 'vue'
 
 import { calibrateSentimentConfidence, estimateLexicalSentiment } from '../composables/alice-structured-output'
 import { getAliceBridge, hasAliceBridge } from './alice-bridge'
-import { extractRuleFacts, getMemoryStats, retrieveFacts, runMemoryPrune, upsertFacts } from './alice-memory'
+import { ensureRuntimeMemoryMigration, extractRuleFacts, getMemoryStats, retrieveFacts, runMemoryPrune, upsertFacts } from './alice-memory'
 import { computePersonalityDelta } from './alice-personality'
 import { useChatOrchestratorStore } from './chat'
 import { useChatContextStore } from './chat/context-store'
@@ -32,6 +32,30 @@ function parseUserText(content: unknown) {
     }).join('')
   }
   return ''
+}
+
+function extractSoulBody(content: string) {
+  if (!content.startsWith('---\n'))
+    return content.trim()
+  const secondMarkerIndex = content.indexOf('\n---\n', 4)
+  if (secondMarkerIndex < 0)
+    return content.trim()
+  return content.slice(secondMarkerIndex + 5).trim()
+}
+
+function replaceSoulBody(content: string, body: string) {
+  const normalizedBody = body.trim()
+  if (!content.startsWith('---\n')) {
+    return `${normalizedBody}\n`
+  }
+
+  const secondMarkerIndex = content.indexOf('\n---\n', 4)
+  if (secondMarkerIndex < 0) {
+    return `${normalizedBody}\n`
+  }
+
+  const frontmatterBlock = content.slice(0, secondMarkerIndex + 5)
+  return `${frontmatterBlock}${normalizedBody}\n`
 }
 
 const pruneIntervalMs = 24 * 60 * 60 * 1000
@@ -67,6 +91,11 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
   const soul = ref<AliceSoulSnapshot | null>(null)
   const needsGenesis = ref(false)
   const genesisConflictCandidate = ref<AliceSoulSnapshot | null>(null)
+  const killSwitch = ref<AliceKillSwitchSnapshot>({
+    state: 'ACTIVE',
+    reason: 'bootstrap',
+    updatedAt: Date.now(),
+  })
   const memoryStats = ref<AliceMemoryStats>({
     total: 0,
     active: 0,
@@ -83,19 +112,57 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
   async function syncMemoryStatsToRuntime() {
     const stats = await getMemoryStats()
     memoryStats.value = stats
-    if (hasAliceBridge()) {
-      await getAliceBridge().updateMemoryStats(stats).catch(() => {})
-    }
     return stats
   }
 
   async function runPruneNow() {
-    await runMemoryPrune()
-    const stats = await syncMemoryStatsToRuntime()
-    if (hasAliceBridge()) {
-      await getAliceBridge().runMemoryPrune().catch(() => {})
+    const stats = await runMemoryPrune()
+    memoryStats.value = stats
+    return await syncMemoryStatsToRuntime()
+  }
+
+  async function refreshMemoryStats() {
+    return await syncMemoryStatsToRuntime()
+  }
+
+  async function syncKillSwitchState() {
+    if (!hasAliceBridge()) {
+      killSwitch.value = {
+        state: 'ACTIVE',
+        reason: 'bridge-unavailable',
+        updatedAt: Date.now(),
+      }
+      return killSwitch.value
     }
-    return stats
+
+    const snapshot = await getAliceBridge().getKillSwitchState().catch(() => null)
+    if (snapshot)
+      killSwitch.value = snapshot
+    return killSwitch.value
+  }
+
+  function setKillSwitchSnapshot(snapshot: AliceKillSwitchSnapshot) {
+    killSwitch.value = snapshot
+  }
+
+  async function suspendKillSwitch(reason = 'manual-ui') {
+    if (!hasAliceBridge())
+      return killSwitch.value
+
+    const snapshot = await getAliceBridge().suspendKillSwitch({ reason }).catch(() => null)
+    if (snapshot)
+      killSwitch.value = snapshot
+    return killSwitch.value
+  }
+
+  async function resumeKillSwitch(reason = 'manual-ui') {
+    if (!hasAliceBridge())
+      return killSwitch.value
+
+    const snapshot = await getAliceBridge().resumeKillSwitch({ reason }).catch(() => null)
+    if (snapshot)
+      killSwitch.value = snapshot
+    return killSwitch.value
   }
 
   function setupPruneTimer() {
@@ -163,27 +230,11 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
       stopGenesisPolling()
   }
 
-  async function initializeGenesis(payload: {
-    hostName: string
-    mindAge: number
-    obedience: number
-    liveliness: number
-    sensibility: number
-    allowOverwrite?: boolean
-  }) {
+  async function initializeGenesis(payload: AliceGenesisInput) {
     if (!hasAliceBridge())
       return
 
-    const result = await getAliceBridge().initializeGenesis({
-      hostName: payload.hostName,
-      mindAge: payload.mindAge,
-      allowOverwrite: payload.allowOverwrite,
-      personality: {
-        obedience: payload.obedience,
-        liveliness: payload.liveliness,
-        sensibility: payload.sensibility,
-      },
-    })
+    const result = await getAliceBridge().initializeGenesis(payload)
 
     soul.value = result.soul
     needsGenesis.value = result.soul.needsGenesis
@@ -193,6 +244,40 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
     else
       stopGenesisPolling()
     return result
+  }
+
+  async function refreshSoul() {
+    if (!hasAliceBridge())
+      return soul.value
+
+    const snapshot = await getAliceBridge().getSoul().catch(() => null)
+    if (snapshot)
+      setSoulSnapshot(snapshot)
+    return soul.value
+  }
+
+  async function updateSoulContent(content: string) {
+    if (!hasAliceBridge() || !soul.value)
+      return soul.value
+
+    const updated = await getAliceBridge().updateSoul({
+      expectedRevision: soul.value.revision,
+      content,
+    }).catch(() => null)
+
+    if (updated)
+      setSoulSnapshot(updated)
+    return soul.value
+  }
+
+  async function updateSoulBody(body: string) {
+    if (!soul.value)
+      return soul.value
+
+    const nextContent = replaceSoulBody(soul.value.content, body)
+    if (extractSoulBody(nextContent) === extractSoulBody(soul.value.content))
+      return soul.value
+    return await updateSoulContent(nextContent)
   }
 
   function attachChatHooks() {
@@ -213,9 +298,8 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
           id: nanoid(),
           contextId: 'alice:memory',
           strategy: ContextUpdateStrategy.ReplaceSelf,
-          text: `Relevant memory facts:\n${summary}`,
+          text: summary,
           createdAt: Date.now(),
-          source: 'alice-memory',
         })
 
         await syncMemoryStatsToRuntime()
@@ -303,8 +387,10 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
     initialized = true
 
     await bootstrapRuntime()
+    await ensureRuntimeMemoryMigration()
     attachChatHooks()
     await syncMemoryStatsToRuntime()
+    await syncKillSwitchState()
     await runPruneNow()
     setupPruneTimer()
   }
@@ -339,9 +425,18 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
     needsGenesis,
     memoryStats,
     genesisConflictCandidate,
+    killSwitch,
     initialize,
     initializeGenesis,
     setSoulSnapshot,
+    setKillSwitchSnapshot,
+    refreshSoul,
+    updateSoulContent,
+    updateSoulBody,
+    suspendKillSwitch,
+    resumeKillSwitch,
+    syncKillSwitchState,
+    refreshMemoryStats,
     runPruneNow,
     dispose,
   }

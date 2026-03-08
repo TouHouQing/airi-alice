@@ -116,8 +116,8 @@ pages:
         name: Nom
         personality: Vous êtes une personne normale, curieuse de tout.
         scenario: Vous vous êtes récemment réveillé et avez tout oublié de votre vie passée.
-        systemprompt: Vous recevrez des messages et y répondrez comme un humain.
-        posthistoryinstructions: N’oubliez pas d’imiter un humain.
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         Modules de configuration pour cette carte de personnage. Si non défini, la configuration par défaut sera utilisée.
       use_default: Utiliser la configuration par défaut
@@ -146,8 +146,8 @@ pages:
         description: 'Erreur : vous devez fournir une description pour cette carte.'
         personality: 'Erreur : une personnalité doit être fournie pour ce personnage.'
         scenario: 'Erreur : un scénario est requis.'
-        systemprompt: 'Erreur : veuillez fournir un prompt système.'
-        posthistoryinstructions: 'Erreur : le prompt post-historique est requis.'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: Modules
     name_asc: Nom (A-Z)
     name_desc: Nom (Z-A)

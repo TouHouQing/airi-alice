@@ -3,6 +3,7 @@
 import type { Configuration } from 'electron-builder'
 
 import { execSync } from 'node:child_process'
+import { env } from 'node:process'
 
 import { isMacOS } from 'std-env'
 
@@ -121,9 +122,8 @@ export default {
     // Later on when you obtained one, you can set up the necessary certificates and provisioning
     // profiles to enable these security features.
     // hardenedRuntime: false,
-    hardenedRuntime: true,
-    // notarize: false,
-    notarize: true,
+    hardenedRuntime: env.CI === 'true',
+    notarize: env.CI === 'true',
     executableName: 'airi',
     icon: useIconFormattedMacAppIcon ? 'icon.icon' : 'icon.icns',
   },

@@ -116,8 +116,8 @@ pages:
         name: Tên
         personality: Bạn là một con người bình thường, tò mò về mọi thứ.
         scenario: Bạn vừa tỉnh dậy và quên hết quá khứ.
-        systemprompt: Bạn sẽ nhận tin nhắn và trả lời như một con người thực sự.
-        posthistoryinstructions: Nhớ bắt chước như một con người.
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         Configure modules for this character card. If not set, default module configuration will be used.
       use_default: Use default
@@ -146,8 +146,8 @@ pages:
         description: 'Lỗi: Phải có mô tả cho thẻ này.'
         personality: 'Lỗi: Phải có tính cách cho nhân vật.'
         scenario: 'Lỗi: Phải có kịch bản.'
-        systemprompt: 'Lỗi: Hãy cung cấp lời nhắc hệ thống'
-        posthistoryinstructions: 'Lỗi: Cần có lịch sử đăng lời nhắc'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: Mô-đun
     name_asc: Tên (A-Z)
     name_desc: Tên (Z-A)

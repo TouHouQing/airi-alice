@@ -19,7 +19,7 @@ describe('alice structured output', () => {
     })
 
     expect(result.sentimentConfidenceRaw).toBe(0.99)
-    expect(result.sentimentConfidence).toBeLessThanOrEqual(result.sentimentConfidenceRaw)
+    expect(result.sentimentConfidence).toBeLessThanOrEqual(result.sentimentConfidenceRaw!)
     expect(result.sentimentConfidence).toBeGreaterThan(0)
   })
 

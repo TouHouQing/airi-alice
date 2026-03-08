@@ -218,11 +218,18 @@ export interface AlicePersonalityState {
   sensibility: number
 }
 
+export type AliceGender = 'female' | 'male' | 'non-binary' | 'neutral' | 'custom'
+
 export interface AliceSoulFrontmatter {
   schemaVersion: number
   initialized: boolean
   profile: {
+    ownerName: string
     hostName: string
+    aliceName: string
+    gender: AliceGender
+    genderCustom: string
+    relationship: string
     mindAge: number
   }
   personality: AlicePersonalityState
@@ -243,7 +250,13 @@ export interface AliceSoulSnapshot {
 }
 
 export interface AliceGenesisInput {
+  ownerName: string
   hostName: string
+  aliceName: string
+  gender: AliceGender
+  genderCustom?: string
+  relationship: string
+  personaNotes?: string
   mindAge: number
   personality: AlicePersonalityState
   allowOverwrite?: boolean
@@ -279,6 +292,57 @@ export interface AliceMemoryStats {
   lastPrunedAt: number | null
 }
 
+export type AliceMemorySource = 'rule' | 'async-llm'
+
+export interface AliceMemoryFact {
+  id: string
+  subject: string
+  predicate: string
+  object: string
+  confidence: number
+  source: AliceMemorySource
+  dedupeKey: string
+  createdAt: number
+  updatedAt: number
+  lastAccessAt: number | null
+  accessCount: number
+}
+
+export interface AliceMemoryArchiveRecord extends AliceMemoryFact {
+  archivedAt: number
+}
+
+export interface AliceMemoryFactInput {
+  subject: string
+  predicate: string
+  object: string
+  confidence: number
+}
+
+export interface AliceMemoryLegacySnapshot {
+  facts: AliceMemoryFact[]
+  archive: AliceMemoryArchiveRecord[]
+  lastPrunedAt: number | null
+}
+
+export interface AliceMemoryMigrationResult {
+  migrated: boolean
+  importedFacts: number
+  importedArchive: number
+  marker: string
+}
+
+export type AliceAuditLogLevel = 'info' | 'notice' | 'warning' | 'critical'
+
+export interface AliceAuditLogInput {
+  level?: AliceAuditLogLevel
+  category: string
+  action: string
+  message: string
+  payload?: Record<string, unknown>
+  createdAt?: number
+}
+
 export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
 export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:get-soul')
 export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
@@ -290,6 +354,10 @@ export const electronAliceKillSwitchResume = defineInvokeEventa<AliceKillSwitchS
 export const electronAliceGetMemoryStats = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:get-stats')
 export const electronAliceRunMemoryPrune = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:run-prune')
 export const electronAliceUpdateMemoryStats = defineInvokeEventa<AliceMemoryStats, AliceMemoryStats>('eventa:invoke:electron:alice:memory:update-stats')
+export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFact[], { query: string, limit?: number }>('eventa:invoke:electron:alice:memory:retrieve-facts')
+export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
+export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
+export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
 
 export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
 export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')

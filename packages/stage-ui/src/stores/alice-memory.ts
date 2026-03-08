@@ -1,6 +1,13 @@
-import type { AliceMemoryStats } from './alice-bridge'
+import type {
+  AliceMemoryFactInput,
+  AliceMemoryStats,
+  AliceMemoryArchiveRecord as BridgeAliceMemoryArchiveRecord,
+  AliceMemoryFact as BridgeAliceMemoryFact,
+  AliceMemorySource as BridgeAliceMemorySource,
+} from './alice-bridge'
 
 import { storage } from '../database/storage'
+import { getAliceBridge, hasAliceBridge } from './alice-bridge'
 
 const memoryFactsKey = 'local:alice/memory/facts:v1'
 const memoryArchiveKey = 'local:alice/memory/archive:v1'
@@ -8,25 +15,13 @@ const memoryMetaKey = 'local:alice/memory/meta:v1'
 
 const dayMs = 24 * 60 * 60 * 1000
 
-export type AliceMemorySource = 'rule' | 'async-llm'
+let migrationAttempted = false
+let runtimeWriteBlocked = false
+let runtimeWriteBlockLogged = false
 
-export interface AliceMemoryFact {
-  id: string
-  subject: string
-  predicate: string
-  object: string
-  confidence: number
-  source: AliceMemorySource
-  dedupeKey: string
-  createdAt: number
-  updatedAt: number
-  lastAccessAt: number | null
-  accessCount: number
-}
-
-export interface AliceMemoryArchiveRecord extends AliceMemoryFact {
-  archivedAt: number
-}
+export type AliceMemorySource = BridgeAliceMemorySource
+export type AliceMemoryFact = BridgeAliceMemoryFact
+export type AliceMemoryArchiveRecord = BridgeAliceMemoryArchiveRecord
 
 interface AliceMemoryMeta {
   lastPrunedAt: number | null
@@ -105,6 +100,81 @@ async function saveMeta(meta: AliceMemoryMeta) {
   await storage.setItemRaw(memoryMetaKey, meta)
 }
 
+async function appendAuditLog(payload: {
+  level: 'info' | 'notice' | 'warning' | 'critical'
+  category: string
+  action: string
+  message: string
+  details?: Record<string, unknown>
+}) {
+  if (!hasAliceBridge())
+    return
+
+  await getAliceBridge().appendAuditLog({
+    level: payload.level,
+    category: payload.category,
+    action: payload.action,
+    message: payload.message,
+    payload: payload.details,
+  }).catch(() => {})
+}
+
+function shouldUseRuntimeMemoryBackend() {
+  return hasAliceBridge() && !runtimeWriteBlocked
+}
+
+function toFactInput(facts: Array<Pick<AliceMemoryFact, 'subject' | 'predicate' | 'object' | 'confidence'>>): AliceMemoryFactInput[] {
+  return facts
+    .map(fact => ({
+      subject: fact.subject.trim(),
+      predicate: fact.predicate.trim(),
+      object: fact.object.trim(),
+      confidence: clamp01(fact.confidence),
+    }))
+    .filter(item => item.subject && item.predicate && item.object)
+}
+
+async function markRuntimeWriteBlocked(reason: string, details?: Record<string, unknown>) {
+  runtimeWriteBlocked = true
+  if (runtimeWriteBlockLogged)
+    return
+
+  runtimeWriteBlockLogged = true
+  await appendAuditLog({
+    level: 'warning',
+    category: 'memory',
+    action: 'write-blocked',
+    message: reason,
+    details,
+  })
+}
+
+export async function ensureRuntimeMemoryMigration() {
+  if (!hasAliceBridge() || migrationAttempted)
+    return
+
+  migrationAttempted = true
+
+  const [facts, archive, meta] = await Promise.all([
+    getFacts(),
+    getArchive(),
+    getMeta(),
+  ])
+
+  try {
+    await getAliceBridge().importLegacyMemory({
+      facts,
+      archive,
+      lastPrunedAt: meta.lastPrunedAt ?? null,
+    })
+  }
+  catch (error) {
+    await markRuntimeWriteBlocked('Legacy memory migration failed, switched to read-only fallback.', {
+      reason: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 export function extractRuleFacts(input: AliceMemoryExtractInput): Array<Pick<AliceMemoryFact, 'subject' | 'predicate' | 'object' | 'confidence'>> {
   const text = input.userText.trim()
   if (!text)
@@ -112,7 +182,7 @@ export function extractRuleFacts(input: AliceMemoryExtractInput): Array<Pick<Ali
 
   const results: Array<Pick<AliceMemoryFact, 'subject' | 'predicate' | 'object' | 'confidence'>> = []
 
-  const likes = /我(?:很)?喜欢(.{1,24})/.exec(text)
+  const likes = /我很?喜欢(.{1,24})/.exec(text)
   if (likes?.[1]) {
     results.push({
       subject: 'user',
@@ -122,7 +192,7 @@ export function extractRuleFacts(input: AliceMemoryExtractInput): Array<Pick<Ali
     })
   }
 
-  const dislikes = /我(?:很)?不喜欢(.{1,24})/.exec(text)
+  const dislikes = /我很?不喜欢(.{1,24})/.exec(text)
   if (dislikes?.[1]) {
     results.push({
       subject: 'user',
@@ -132,7 +202,7 @@ export function extractRuleFacts(input: AliceMemoryExtractInput): Array<Pick<Ali
     })
   }
 
-  const plans = /(?:明天|下周|周五|今天)\s*(?:要|得|需要)?\s*(.{1,32})/.exec(text)
+  const plans = /(?:明天|下周|周五|今天)\s*(?:(?:要|得|需要)\s*)?(.{1,32})/.exec(text)
   if (plans?.[1]) {
     results.push({
       subject: 'user',
@@ -150,6 +220,24 @@ export async function upsertFacts(
   source: AliceMemorySource,
 ) {
   if (facts.length === 0)
+    return
+
+  await ensureRuntimeMemoryMigration()
+
+  if (shouldUseRuntimeMemoryBackend()) {
+    const normalized = toFactInput(facts)
+    if (normalized.length === 0)
+      return
+
+    await getAliceBridge().upsertMemoryFacts({ facts: normalized, source }).catch(async (error) => {
+      await markRuntimeWriteBlocked('SQLite memory write failed, switched to read-only fallback.', {
+        reason: error instanceof Error ? error.message : String(error),
+      })
+    })
+    return
+  }
+
+  if (runtimeWriteBlocked)
     return
 
   const current = await getFacts()
@@ -190,6 +278,14 @@ export async function upsertFacts(
 }
 
 export async function retrieveFacts(query: string, limit = 6) {
+  await ensureRuntimeMemoryMigration()
+
+  if (shouldUseRuntimeMemoryBackend()) {
+    const result = await getAliceBridge().retrieveMemoryFacts({ query, limit }).catch(() => null)
+    if (result)
+      return result
+  }
+
   const facts = await getFacts()
   if (!query.trim() || facts.length === 0)
     return []
@@ -229,6 +325,14 @@ function computePruneScore(fact: AliceMemoryFact, currentTs: number) {
 }
 
 export async function runMemoryPrune() {
+  await ensureRuntimeMemoryMigration()
+
+  if (shouldUseRuntimeMemoryBackend()) {
+    const stats = await getAliceBridge().runMemoryPrune().catch(() => null)
+    if (stats)
+      return stats
+  }
+
   const currentTs = now()
   const thresholdArchive = 0.72
   const thresholdDelete = 0.92
@@ -269,6 +373,14 @@ export async function runMemoryPrune() {
 }
 
 export async function getMemoryStats(): Promise<AliceMemoryStats> {
+  await ensureRuntimeMemoryMigration()
+
+  if (shouldUseRuntimeMemoryBackend()) {
+    const stats = await getAliceBridge().getMemoryStats().catch(() => null)
+    if (stats)
+      return stats
+  }
+
   const [facts, archive, meta] = await Promise.all([
     getFacts(),
     getArchive(),
