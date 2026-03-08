@@ -116,8 +116,8 @@ pages:
         name: 名前
         personality: あなたはあらゆることに好奇心旺盛な普通の人間です。
         scenario: あなたは最近目覚め、前世のすべてを忘れてしまいました。
-        systemprompt: 受け取ったメッセージに、本物の人間のように答えてください。
-        posthistoryinstructions: 人間の真似をすることを忘れないでください。
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         このキャラクターカード用のモジュールを設定してください。設定されていない場合は、デフォルトのモジュール設定が使用されます。
       use_default: デフォルトを使用
@@ -146,8 +146,8 @@ pages:
         description: 'エラー: このカードの説明を入力してください。'
         personality: 'エラー: このキャラクターには性格が必要です。'
         scenario: 'エラー: シナリオは必須です。'
-        systemprompt: 'エラー: システムプロンプトを入力してください。'
-        posthistoryinstructions: 'エラー: 履歴の後のプロンプトは必須です。'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: モジュール
     name_asc: 名前(A-Z)
     name_desc: 名前(Z-A)

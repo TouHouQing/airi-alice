@@ -6,11 +6,18 @@ export interface AlicePersonalityState {
   sensibility: number
 }
 
+export type AliceGender = 'female' | 'male' | 'non-binary' | 'neutral' | 'custom'
+
 export interface AliceSoulFrontmatter {
   schemaVersion: number
   initialized: boolean
   profile: {
+    ownerName: string
     hostName: string
+    aliceName: string
+    gender: AliceGender
+    genderCustom: string
+    relationship: string
     mindAge: number
   }
   personality: AlicePersonalityState
@@ -31,7 +38,13 @@ export interface AliceSoulSnapshot {
 }
 
 export interface AliceGenesisInput {
+  ownerName: string
   hostName: string
+  aliceName: string
+  gender: AliceGender
+  genderCustom?: string
+  relationship: string
+  personaNotes?: string
   mindAge: number
   personality: AlicePersonalityState
   allowOverwrite?: boolean
@@ -67,6 +80,57 @@ export interface AliceMemoryStats {
   lastPrunedAt: number | null
 }
 
+export type AliceMemorySource = 'rule' | 'async-llm'
+
+export interface AliceMemoryFact {
+  id: string
+  subject: string
+  predicate: string
+  object: string
+  confidence: number
+  source: AliceMemorySource
+  dedupeKey: string
+  createdAt: number
+  updatedAt: number
+  lastAccessAt: number | null
+  accessCount: number
+}
+
+export interface AliceMemoryArchiveRecord extends AliceMemoryFact {
+  archivedAt: number
+}
+
+export interface AliceMemoryFactInput {
+  subject: string
+  predicate: string
+  object: string
+  confidence: number
+}
+
+export interface AliceMemoryLegacySnapshot {
+  facts: AliceMemoryFact[]
+  archive: AliceMemoryArchiveRecord[]
+  lastPrunedAt: number | null
+}
+
+export interface AliceMemoryMigrationResult {
+  migrated: boolean
+  importedFacts: number
+  importedArchive: number
+  marker: string
+}
+
+export type AliceAuditLogLevel = 'info' | 'notice' | 'warning' | 'critical'
+
+export interface AliceAuditLogInput {
+  level?: AliceAuditLogLevel
+  category: string
+  action: string
+  message: string
+  payload?: Record<string, unknown>
+  createdAt?: number
+}
+
 interface AliceBridge {
   bootstrap: () => Promise<AliceSoulSnapshot>
   getSoul: () => Promise<AliceSoulSnapshot>
@@ -79,6 +143,10 @@ interface AliceBridge {
   getMemoryStats: () => Promise<AliceMemoryStats>
   runMemoryPrune: () => Promise<AliceMemoryStats>
   updateMemoryStats: (payload: AliceMemoryStats) => Promise<AliceMemoryStats>
+  retrieveMemoryFacts: (payload: { query: string, limit?: number }) => Promise<AliceMemoryFact[]>
+  upsertMemoryFacts: (payload: { facts: AliceMemoryFactInput[], source: AliceMemorySource }) => Promise<void>
+  importLegacyMemory: (payload: AliceMemoryLegacySnapshot) => Promise<AliceMemoryMigrationResult>
+  appendAuditLog: (payload: AliceAuditLogInput) => Promise<void>
 }
 
 let bridge: AliceBridge | undefined

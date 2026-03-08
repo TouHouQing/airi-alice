@@ -119,8 +119,8 @@ pages:
         name: Name
         personality: You are a regular human, curious about everything.
         scenario: You recently woke up and forgot everything about your previous life.
-        systemprompt: You will receive messages, answer to them like a real human.
-        posthistoryinstructions: Remember to imitate an human.
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         Configure modules for this character card. If not set, default module
         configuration will be used.
@@ -154,8 +154,8 @@ pages:
         description: 'Error: You must provide a description for this card.'
         personality: 'Error: A personality must be provided for this character.'
         scenario: 'Error: A scenario is required.'
-        systemprompt: 'Error: Please, provide a system prompt.'
-        posthistoryinstructions: 'Error: Post history prompt is required.'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: Modules
     name_asc: Name (A-Z)
     name_desc: Name (Z-A)

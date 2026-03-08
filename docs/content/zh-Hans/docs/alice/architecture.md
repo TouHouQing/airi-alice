@@ -20,6 +20,7 @@ description: 全局架构与 Epoch 1 落地接口草案
 3. 可降级（Graceful fallback）：结构化输出失败、模型失败时可回退，不阻塞主流程。
 4. 可审计（Auditable）：关键行为（记忆写入、工具调用、Kill Switch）可追踪。
 5. 低侵入上游同步（Upstream-friendly）：新增能力以插件/模块注入，不改写上游核心链路。
+6. 灵魂真源单一化（Soul-as-Source）：`SOUL.md` 是人格与边界唯一真源，数据库不保存人格主状态。
 
 ## 3. 全局架构总览
 
@@ -33,7 +34,7 @@ flowchart LR
   E --> D["全息表现层 Holographic Presence"]
   D --> E
 
-  S[("本地存储 SQLite/Files")]
+  S[("本地存储 SOUL.md + SQLite + Files")]
   B --- S
   A --- S
   C --- S
@@ -79,10 +80,11 @@ interface AliceEvent<TPayload = unknown> {
 
 | Topic | 生产者 | 消费者 | 用途 |
 | --- | --- | --- | --- |
-| `alice.onboarding.completed` | Holographic | Fluctlight | 初始化完成后建立人格初始状态 |
+| `alice.onboarding.completed` | Holographic | Fluctlight | 初始化完成后写入并加载 `SOUL.md` |
 | `alice.dialogue.requested` | Holographic | Fluctlight | 提交用户输入 |
 | `alice.dialogue.responded` | Fluctlight | Holographic | 返回 `thought/emotion/reply` |
 | `alice.memory.fact.upserted` | Fluctlight | Fluctlight/Audit | 写入短期事实记忆 |
+| `alice.soul.changed` | System/FileWatcher | Fluctlight/Holographic | 外部修改 `SOUL.md` 后触发热重载 |
 | `alice.safety.kill-switch.triggered` | System | All | 立即中断感知与执行 |
 | `alice.audit.recorded` | Any | Audit Store | 本地审计日志 |
 
@@ -99,38 +101,85 @@ interface AliceEvent<TPayload = unknown> {
 状态更新约束：
 
 - 单轮变化幅度上限：`|delta| <= 0.02`
+- 静默死区（Deadzone）：`abs(userSentimentScore) < 0.25` 时，强制 `delta = 0`
 - 仅允许缓慢漂移，禁止跨阈值跳变。
-- 持久化到本地数据库，随会话累计。
+- 人格向量持久化到 `SOUL.md` Frontmatter，随会话累计。
+- 置信度使用 `calibratedConfidence`，不直接使用模型自评 `sentimentConfidenceRaw`。
 
 ### 5.2 瞬时情绪状态
 
 - 输入：用户消息 + 短期记忆 + 人格向量。
 - 输出：`emotion` 标签（如 `neutral`, `concerned`, `happy`, `tired`）。
-- 失败策略：解析失败回退 `emotion = neutral`，并记录审计事件。
+- 失败策略：解析失败回退 `emotion = neutral`、`reply = rawText`，并记录审计事件。
+- 系统提示注入策略：`SOUL.md + 固定系统模板 + 上下文片段`，不开放 Prompt/Spark 模板运行时配置。
 
 ### 5.3 Kill Switch 状态
 
 - `ACTIVE`：正常运行。
 - `SUSPENDED`：感知输入关闭、执行器停机，仅允许恢复指令。
 - 状态切换来源：快捷键事件或明确口令。
+- 指令拦截必须带来源标记，仅在 `origin=ui-user` 且尚未拼接外部上下文阶段触发。
 
 ## 6. 数据与存储设计
 
 ### 6.1 本地数据分层
 
-1. `SQLite`：结构化状态与记忆。
-2. `Local Files`：缓存（未来截图、音频片段）。
-3. `In-memory Cache`：会话级上下文与短 TTL 索引。
+1. `SOUL.md`：人格、边界、输出契约唯一真源。
+2. `SQLite`：结构化流式记录（记忆、轮次、审计）。
+3. `Local Files`：缓存（未来截图、音频片段）。
+4. `In-memory Cache`：会话级上下文与短 TTL 索引。
 
-### 6.2 Epoch 1 数据模型（建议）
+### 6.2 `SOUL.md` 真源模型与并发控制
+
+- 存储位置：`<userData>/alice/SOUL.md`
+- Frontmatter 托管：
+  - `ownerName`
+  - `hostName`
+  - `aliceName`
+  - `gender` / `genderCustom`
+  - `relationship`
+  - `mindAge`
+  - `obedience`
+  - `liveliness`
+  - `sensibility`
+- Markdown 正文托管：
+  - 输出契约、人格底色、边界规则、长期偏好描述。
+
+并发与一致性要求：
+
+1. 原子写策略：`tmp file -> fsync -> rename` 覆盖。
+2. CAS（Compare-And-Swap）：基于版本戳或哈希，避免并发脏写。
+3. 单写队列：同一进程内串行化所有 `SOUL.md` 写操作。
+4. 文件监听：`fs.watch` 监听外部编辑，发布 `alice.soul.changed` 并热重载。
+5. 生命周期顺序：
+   - `needsGenesis=true` 时先完成 Genesis，不启动 `fs.watch`。
+   - Genesis 持久化成功后再启动 `fs.watch`。
+   - Genesis 期间捕获外部变更时，只作为“预填充候选”交给用户确认，禁止静默覆盖。
+
+### 6.3 Epoch 1 SQLite 数据模型（建议）
 
 | 表名 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `alice_profile` | `id`, `host_name`, `mind_age`, `created_at` | 初始化配置 |
-| `alice_personality_state` | `profile_id`, `obedience`, `liveliness`, `sensibility`, `updated_at` | 人格矩阵当前值 |
-| `alice_memory_facts` | `id`, `subject`, `predicate`, `object`, `confidence`, `source_turn_id` | 短期事实记忆 |
-| `alice_conversation_turns` | `id`, `session_id`, `user_text`, `thought`, `emotion`, `reply` | 对话轮次记录 |
-| `alice_audit_logs` | `id`, `event_topic`, `level`, `payload`, `created_at` | 审计日志 |
+| `memory_facts` | `id`, `subject`, `predicate`, `object`, `confidence`, `calibrated_confidence`, `source_turn_id`, `last_access_at`, `access_count`, `created_at` | 短期事实记忆 |
+| `conversation_turns` | `id`, `session_id`, `origin`, `user_text`, `thought`, `emotion`, `reply`, `created_at` | 对话轮次记录 |
+| `audit_logs` | `id`, `event_topic`, `level`, `payload`, `created_at` | 审计日志 |
+| `memory_archive` | `id`, `fact_id`, `snapshot`, `archived_at`, `expire_at` | 低价值记忆归档（可恢复） |
+
+说明：
+
+- 禁止在 SQLite 新建人格主状态表（如 `profile/personality_state`）。
+- `SOUL.md` 解析后可生成内存快照供运行时读取，但快照不是持久化真源。
+
+### 6.4 记忆检索预算与遗忘曲线
+
+- Prompt Budget Manager：
+  - 固定预算按比例切分：`SOUL`、记忆片段、当前轮上下文。
+  - 超预算时按优先级截断：低相关、低置信、低时效记忆先剔除。
+- Memory Pruning（低频任务）：
+  - 启动后执行一次 + 每 24h 执行一次。
+  - `pruneScore = timeDecay * (1 - accessFrequencyNorm) * (1 - confidenceNorm)`。
+  - `pruneScore >= thresholdArchive`：写入 `memory_archive`。
+  - `pruneScore >= thresholdDelete` 且长期未命中：硬删除。
 
 ## 7. 安全、隐私与控制设计
 
@@ -151,6 +200,7 @@ interface AliceEvent<TPayload = unknown> {
 - 主进程全局快捷键。
 - 对话命令 `A.L.I.C.E，强制休眠`。
 - 触发后广播 `alice.safety.kill-switch.triggered` 并强制执行器停机。
+- Kill Switch 文本指令只允许在 `origin=ui-user` 的原始输入层匹配，禁止在工具输出、网页内容、RAG 拼接上下文中匹配，防止 Prompt Injection 误触发。
 
 ## 8. Epoch 1 实现边界
 
@@ -160,6 +210,8 @@ interface AliceEvent<TPayload = unknown> {
 - Personality Matrix v0（ALICE-F1.2）。
 - 结构化情绪输出协议（ALICE-F2.2）。
 - 短期事实记忆写入/检索（ALICE-F1.3 基础能力）。
+- `SOUL.md` 原子写、热重载、Genesis 竞态兜底。
+- 记忆预算管理与低频修剪任务。
 - Kill Switch、本地审计、脱敏守卫（NFR）。
 
 ### 8.2 Out of Scope
@@ -175,18 +227,28 @@ interface AliceEvent<TPayload = unknown> {
 
 ```ts
 interface InitializeAliceInput {
+  ownerName: string
   hostName: string
+  aliceName: string
+  gender: 'female' | 'male' | 'non-binary' | 'neutral' | 'custom'
+  genderCustom?: string
+  relationship: string
+  personaNotes?: string
   mindAge: number
-  personalitySeed: {
+  personality: {
     obedience: number
     liveliness: number
     sensibility: number
   }
+  allowOverwrite?: boolean
 }
 
 interface InitializeAliceOutput {
-  profileId: string
-  initializedAt: string
+  soulRevision: string
+  conflict: boolean
+  conflictCandidate?: {
+    hash: string
+  }
 }
 ```
 
@@ -196,12 +258,15 @@ interface InitializeAliceOutput {
 interface DialogueRequest {
   sessionId: string
   text: string
+  origin: 'ui-user' | 'system' | 'tool'
 }
 
 interface DialogueResponse {
   thought: string
   emotion: 'neutral' | 'happy' | 'concerned' | 'tired' | 'apologetic'
   reply: string
+  sentimentConfidenceRaw?: number
+  sentimentConfidence?: number // calibrated
   memoryWrites: Array<{ subject: string, predicate: string, object: string }>
 }
 ```
@@ -216,9 +281,34 @@ interface KillSwitchState {
 }
 
 interface KillSwitchController {
-  suspend(reason: string): Promise<KillSwitchState>
-  resume(reason: string): Promise<KillSwitchState>
-  getState(): Promise<KillSwitchState>
+  suspend: (reason: string, origin: 'ui-user' | 'system-hotkey') => Promise<KillSwitchState>
+  resume: (reason: string, origin: 'ui-user' | 'system-hotkey') => Promise<KillSwitchState>
+  getState: () => Promise<KillSwitchState>
+}
+```
+
+### 9.4 SOUL 文件服务接口
+
+```ts
+interface SoulFileService {
+  readSoul: () => Promise<{ content: string, revision: string }>
+  writeSoulAtomic: (nextContent: string, expectedRevision: string) => Promise<{ revision: string }>
+  startWatch: () => Promise<void>
+  stopWatch: () => Promise<void>
+}
+```
+
+### 9.5 记忆维护接口
+
+```ts
+interface MemoryMaintenanceService {
+  getMemoryStats: () => Promise<{
+    total: number
+    active: number
+    archived: number
+    lastPrunedAt?: string
+  }>
+  runMemoryPrune: () => Promise<{ archived: number, deleted: number }>
 }
 ```
 
@@ -234,17 +324,17 @@ interface KillSwitchController {
 
 | 需求ID | 架构章节 |
 | --- | --- |
-| ALICE-F1.1 | 8.1, 9.1 |
+| ALICE-F1.1 | 6.2, 8.1, 9.1, 9.4 |
 | ALICE-F1.2 | 5.1, 6.2 |
-| ALICE-F1.3 | 4.3, 6.2 |
+| ALICE-F1.3 | 4.3, 6.3, 6.4, 9.2, 9.5 |
 | ALICE-F2.1 | 5.2（预留，Epoch 4/5 实装） |
 | ALICE-F2.2 | 5.2, 9.2 |
 | ALICE-F3.1 | 3.1（Sensory Bus 预留） |
 | ALICE-F3.2 | 3.1（Sensory Bus 预留） |
 | ALICE-F3.3 | 3.1, 4.3（事件模型） |
 | ALICE-F4.1 | 4.3（调度主题预留） |
-| ALICE-F4.2 | 3.1 + 6.2（记忆驱动预留） |
-| ALICE-F4.3 | 7.2, 7.3 |
+| ALICE-F4.2 | 3.1 + 6.4（记忆驱动预留） |
+| ALICE-F4.3 | 7.2, 7.3, 9.3 |
 | ALICE-F5.1 | 3.1（Holographic 预留） |
 | ALICE-F5.2 | 3.1（Holographic 预留） |
 | ALICE-NFR-PRIV-001/002/003 | 6, 7 |

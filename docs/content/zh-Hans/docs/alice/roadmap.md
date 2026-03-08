@@ -35,9 +35,11 @@ description: Epoch 1-5 路线图、里程碑、风险与进退场标准
 
 - 目标：建立可运行的“认知内核 + 安全底座”。
 - 范围：
-  - 初始化配置与持久化。
+  - 人格事实采集式 Genesis（结构化字段 + 自由文）与 `SOUL.md` 真源持久化。
+  - 主对话与 spark:notify 采用系统固定注入模板（不开放 Prompt/Spark 配置）。
   - `thought/emotion/reply` 结构化输出。
-  - 短期记忆写入与检索。
+  - 短期记忆写入与检索（含 Prompt Budget 与低频修剪）。
+  - 记忆抽取置信度二次校准（不直用 LLM raw confidence）。
   - Kill Switch、本地审计、脱敏守卫。
 - 入场条件：
   - 文档编号体系冻结（需求/架构/开发任务 ID）。
@@ -45,6 +47,7 @@ description: Epoch 1-5 路线图、里程碑、风险与进退场标准
 - 退场条件：
   - `development-epoch1.md` 全部任务 DoD 达成。
   - 能稳定完成端到端会话 + Kill Switch 中断恢复。
+  - 冷热启动与外部编辑 `SOUL.md` 时人格状态最终一致，无脏读写。
 
 ### 3.2 Epoch 2（M2）
 
@@ -113,6 +116,7 @@ description: Epoch 1-5 路线图、里程碑、风险与进退场标准
 - 上游层：尽量保持原始结构（apps/packages 核心链路）。
 - Alice 适配层：新增 `alice` 域模块，以组合注入方式接入。
 - 品牌层：文案、配置、入口与默认参数在品牌层完成。
+- 构建层边界：**绝对禁止修改 `appId` 与 workspace 包名**。
 
 2. 变更策略
 - 优先新增文件，避免大面积改动上游已有核心文件。

@@ -116,8 +116,8 @@ pages:
         name: 이름
         personality: 당신은 모든 것에 호기심이 많은 평범한 사람이다.
         scenario: 당신은 최근에 일어나서 전생에 대한 모든 것을 잊어버렸다.
-        systemprompt: 메시지를 받고 실제 사람처럼 답장할 것이다.
-        posthistoryinstructions: 인간을 모방하는 것을 잊지 마라.
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         이 캐릭터 카드의 모듈을 구성합니다. 설정하지 않으면 기본 모듈 구성이 사용됩니다.
       use_default: 기본값 사용
@@ -146,8 +146,8 @@ pages:
         description: '오류: 이 카드에 대한 설명을 제공해야 합니다.'
         personality: '오류: 이 캐릭터에 대한 성격이 제공되어야 합니다.'
         scenario: '오류: 시나리오가 필요합니다.'
-        systemprompt: '오류: 시스템 프롬프트를 제공해 주세요.'
-        posthistoryinstructions: '오류: 기록 게시 후 프롬프트가 필요합니다.'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: 모듈
     name_asc: 이름 (A-Z)
     name_desc: 이름 (Z-A)

@@ -4,9 +4,6 @@ import { useLocalStorageManualReset } from '@proj-airi/stage-shared/composables'
 import { nanoid } from 'nanoid'
 import { defineStore, storeToRefs } from 'pinia'
 import { computed, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
-
-import SystemPromptV2 from '../../constants/prompts/system-v2'
 
 import { useConsciousnessStore } from './consciousness'
 import { useSpeechStore } from './speech'
@@ -57,8 +54,6 @@ export interface AiriCard extends Card {
 }
 
 export const useAiriCardStore = defineStore('airi-card', () => {
-  const { t } = useI18n()
-
   const cards = useLocalStorageManualReset<Map<string, AiriCard>>('airi-cards', new Map())
   const activeCardId = useLocalStorageManualReset<string>('airi-card-active-id', 'default')
 
@@ -210,10 +205,7 @@ export const useAiriCardStore = defineStore('airi-card', () => {
     cards.value.set('default', newAiriCard({
       name: 'ReLU',
       version: '1.0.0',
-      description: SystemPromptV2(
-        t('base.prompt.prefix'),
-        t('base.prompt.suffix'),
-      ).content,
+      description: '',
     }))
     if (!activeCardId.value)
       activeCardId.value = 'default'

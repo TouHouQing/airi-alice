@@ -116,8 +116,8 @@ pages:
         name: Имя
         personality: Вы обычный человек, любопытный ко всему.
         scenario: Вы недавно проснулись и забыли всё о прошлой жизни.
-        systemprompt: Вы будете получать сообщения, отвечайте на них как настоящий человек.
-        posthistoryinstructions: Не забывайте подражать человеку.
+        systemprompt: ''
+        posthistoryinstructions: ''
       modules_info: >-
         Configure modules for this character card. If not set, default module configuration will be used.
       use_default: Use default
@@ -146,8 +146,8 @@ pages:
         description: 'Ошибка: необходимо указать описание карты.'
         personality: 'Ошибка: необходимо указать личность персонажа.'
         scenario: 'Ошибка: требуется сценарий.'
-        systemprompt: 'Ошибка: укажите системный промпт.'
-        posthistoryinstructions: 'Ошибка: требуется post-history промпт.'
+        systemprompt: Legacy optional field.
+        posthistoryinstructions: Legacy optional field.
     modules: Модули
     name_asc: Имя (А-Я)
     name_desc: Имя (Я-А)

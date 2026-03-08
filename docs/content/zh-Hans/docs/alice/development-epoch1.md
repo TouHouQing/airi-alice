@@ -12,15 +12,16 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 适用范围：`stage-tamagotchi` 优先。
 - 非目标：Epoch 2-5 的 Live2D、TTS、多模态感知、预测执行等能力。
 - 任务编号：`ALICE-E1-T001` 起。
+- 核心边界：`SOUL.md` 为人格真源，SQLite 仅记录结构化流式数据。
 
 ## 2. Epoch 1 交付基线
 
 必须交付：
 
-1. 初始化配置持久化（ALICE-F1.1）。
+1. 初始化流程与 `SOUL.md` 真源（ALICE-F1.1）。
 2. Personality Matrix v0（ALICE-F1.2）。
 3. 每轮结构化输出 `thought/emotion/reply`（ALICE-F2.2）。
-4. 短期事实记忆写入/检索（ALICE-F1.3 基础）。
+4. 短期事实记忆写入/检索与修剪（ALICE-F1.3 基础）。
 5. 本地隐私、Kill Switch、审计链路（NFR）。
 
 ## 3. 任务清单（开发即执行）
@@ -46,7 +47,7 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 完成定义（DoD）：
   - 有独立入口模块。
   - 无跨域硬编码引用。
-  - 文档中说明上游同步边界。
+  - 文档中明确“不改 `appId`/workspace 包名”的硬边界。
 - 风险与回滚点：
   - 风险：目录调整影响现有导入路径。
   - 回滚：保留原入口并通过 feature flag 切回。
@@ -78,31 +79,38 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
   - 风险：事件风暴导致调试困难。
   - 回滚：保留直接调用路径作为临时降级开关。
 
-### ALICE-E1-T003 初始化流程与配置持久化
+### ALICE-E1-T003 Genesis + `SOUL.md` 真源与文件并发控制
 
-- 关联需求ID：`ALICE-F1.1`
-- 关联架构章节：`8.1`、`9.1`、`6.2`
-- 背景/目标：实现首次启动参数采集和本地持久化，形成会话基线人格。
+- 关联需求ID：`ALICE-F1.1`、`ALICE-NFR-SAFE-003`
+- 关联架构章节：`6.2`、`8.1`、`9.1`、`9.4`
+- 背景/目标：实现首次初始化与人格真源文件管理，保证外部编辑与系统回写不冲突。
 - 输入输出与接口：
-  - 输入：`hostName`、`mindAge`、`personalitySeed`。
-  - 输出：`profileId`、初始化完成事件。
-  - 接口：`initializeAlice(input)`。
-- 影响模块：`main/services/alice/onboarding`、`shared/alice/contracts`。
+  - 输入：`ownerName`、`hostName`、`aliceName`、`gender`、`relationship`、`mindAge`、`personality`、`personaNotes`。
+  - 输出：`SOUL.md` 初始文件、`alice.onboarding.completed` 事件。
+  - 接口：`initializeGenesis(input)`、`readSoul()`、`writeSoulAtomic(next, expectedRevision)`。
+- 影响模块：`main/services/alice/onboarding`、`main/services/alice/soul`、`shared/alice/contracts`。
 - 前置依赖：`ALICE-E1-T001`、`ALICE-E1-T002`。
 - 实现步骤：
-  1. 定义初始化 Schema（Valibot）。
-  2. 写入本地数据库并返回 `profileId`。
-  3. 发布 `alice.onboarding.completed`。
+  1. 定义 Genesis Schema（Valibot）并生成 `SOUL.md` Frontmatter + 正文模板。
+  2. 实现原子写：`tmp -> fsync -> rename`。
+  3. 实现 CAS + 单写队列，避免并发脏写。
+  4. 生命周期控制：`needsGenesis=true` 期间不启动 `fs.watch`。
+  5. Genesis 成功后启动 `fs.watch`，收到外部变更时发布 `alice.soul.changed` 并热重载。
+  6. Genesis 期间外部变更只作为“表单预填充候选”，由用户确认合并。
+  7. 升级时清理并废弃 `prompt-profile.json` / `spark-profile.json`，不再进入运行链路。
 - 测试点：
-  1. 输入越界值时校验失败。
-  2. 重启后读取同一 profile。
-  3. 初始化完成事件 payload 正确。
+  1. 输入越界值校验失败。
+  2. 重启后读取同一 `SOUL.md`。
+  3. 外部手改 `SOUL.md` 后热重载成功。
+  4. 并发写不会损坏文件。
 - 完成定义（DoD）：
-  - 可重复初始化但不会产生脏状态。
-  - 初始化数据可用于后续对话流程。
+  - `SOUL.md` 是人格唯一真源。
+  - 原子写与 CAS 生效。
+  - Genesis 与热重载无竞态脏写。
+  - Prompt/Spark 使用系统固定注入，不存在运行时用户配置链路。
 - 风险与回滚点：
-  - 风险：重复初始化导致多 profile 冲突。
-  - 回滚：启用单 profile 锁并提供重置脚本。
+  - 风险：文件监听在部分平台行为不一致。
+  - 回滚：降级为定时 hash 轮询 + 手动重载按钮。
 
 ### ALICE-E1-T004 Personality Matrix v0 状态机
 
@@ -110,21 +118,23 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 关联架构章节：`5.1`、`6.2`
 - 背景/目标：实现慢速、可累计、可持久化的人格漂移。
 - 输入输出与接口：
-  - 输入：用户反馈信号、任务结果信号。
+  - 输入：`userSentimentScore`、`sentimentConfidence`、任务结果信号。
   - 输出：更新后人格向量。
-  - 接口：`updatePersonality(signal)`、`getPersonality(profileId)`。
-- 影响模块：`main/services/alice/personality`、`packages/stage-shared/src/alice`。
+  - 接口：`updatePersonality(signal)`、`getPersonality()`。
+- 影响模块：`main/services/alice/personality`、`main/services/alice/soul`。
 - 前置依赖：`ALICE-E1-T003`。
 - 实现步骤：
   1. 定义人格维度和阈值常量。
-  2. 实现 `delta` 限幅逻辑（单轮 <= 0.02）。
-  3. 落库并发布状态变更事件。
+  2. 漂移计算：`delta = clamp(score * confidence * weight, -0.02, 0.02)`。
+  3. 增加 Deadzone：`abs(score) < 0.25 => delta = 0`。
+  4. 回写 `SOUL.md` Frontmatter 并发布状态变更事件。
 - 测试点：
-  1. 连续 100 轮更新无跳变。
-  2. 越界更新会被截断。
+  1. 连续 100 轮中性事务对话无漂移。
+  2. 边界值 `0.24 / 0.25 / 0.26` 行为正确。
   3. 冷启动后人格状态一致。
 - 完成定义（DoD）：
-  - 漂移可解释（有更新原因日志）。
+  - 漂移可解释（更新原因与前后值日志）。
+  - 中性噪声不会导致累积漂移。
   - 人格参数可被对话编排读取。
 - 风险与回滚点：
   - 风险：漂移过快造成角色失真。
@@ -142,10 +152,10 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 影响模块：`main/services/alice/orchestrator`。
 - 前置依赖：`ALICE-E1-T002`、`ALICE-E1-T003`、`ALICE-E1-T004`。
 - 实现步骤：
-  1. 聚合 profile、人格、短期记忆构造上下文。
+  1. 聚合 `SOUL`、短期记忆与当前输入构造上下文。
   2. 调用模型网关并拿到原始响应。
-  3. 交给结构化解析器，失败时走回退。
-  4. 发布 `alice.dialogue.responded`。
+  3. 交给结构化解析器，失败时走安全回退。
+  4. 发布 `alice.dialogue.responded` 并记录 `conversation_turns`。
 - 测试点：
   1. 正常路径返回完整结构体。
   2. 模型超时时可返回降级回复。
@@ -157,11 +167,11 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
   - 风险：链路耦合过高难以扩展。
   - 回滚：保留分段调用开关，支持逐段排障。
 
-### ALICE-E1-T006 结构化输出解析器与回退策略
+### ALICE-E1-T006 结构化输出解析器与防御性回退
 
 - 关联需求ID：`ALICE-F2.2`
 - 关联架构章节：`5.2`、`9.2`
-- 背景/目标：强制每轮响应生成 `thought/emotion/reply`，解析失败可回退。
+- 背景/目标：强制每轮响应生成 `thought/emotion/reply`，解析失败也不能宕机。
 - 输入输出与接口：
   - 输入：模型原始文本。
   - 输出：标准化 `DialogueResponse`。
@@ -169,65 +179,70 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 影响模块：`main/services/alice/orchestrator/parsers`。
 - 前置依赖：`ALICE-E1-T005`。
 - 实现步骤：
-  1. 定义结构化 JSON schema。
-  2. 实现解析与字段兜底规则。
-  3. 为 `emotion` 提供白名单映射。
+  1. 定义结构化 JSON Schema。
+  2. 主解析失败后执行正则清洗（补全括号、去除非法转义、裁剪前后噪声）。
+  3. 二次解析仍失败时进入绝对安全 Fallback：
+     - `reply = rawText`
+     - `emotion = neutral`
+     - `thought = ''`
+  4. `emotion` 白名单映射，非法值归一到 `neutral`。
 - 测试点：
   1. 合法 JSON 全字段解析通过。
-  2. 缺失字段时自动补默认值。
-  3. 非法输出不阻断主流程。
+  2. 破损 JSON（缺括号、非法转义）可经清洗后解析。
+  3. 彻底失败时触发安全 Fallback 且不中断会话。
 - 完成定义（DoD）：
-  - 解析成功率满足验收阈值。
-  - 回退路径可审计。
+  - 解析器具备主路径 + 清洗路径 + 绝对回退三层防线。
+  - 任意模型输出都能返回有效 `DialogueResponse`。
 - 风险与回滚点：
-  - 风险：模型输出漂移导致解析波动。
-  - 回滚：启用纯文本回复模式并标记 `emotion=neutral`。
+  - 风险：清洗规则误修复造成语义偏差。
+  - 回滚：跳过清洗直接进入安全 Fallback。
 
-### ALICE-E1-T007 短期事实记忆抽取与写入
+### ALICE-E1-T007 记忆抽取与置信度校准（异步）
 
 - 关联需求ID：`ALICE-F1.3`
-- 关联架构章节：`6.2`、`9.2`
-- 背景/目标：从对话轮中抽取事实三元组，形成可检索短期记忆。
+- 关联架构章节：`6.3`、`6.4`、`9.2`
+- 背景/目标：降低规则抽取脆弱性，并避免盲信 LLM 自评置信度。
 - 输入输出与接口：
-  - 输入：用户文本、回复文本。
-  - 输出：`memoryWrites[]`。
-  - 接口：`extractFacts(turn)`、`upsertFacts(facts)`。
-- 影响模块：`main/services/alice/memory`。
+  - 输入：最近 N 轮对话、规则抽取结果、LLM 抽取结果。
+  - 输出：`memoryWrites[]`（含 `confidenceRaw` 与 `confidenceCalibrated`）。
+  - 接口：`extractFactsAsync(turnWindow)`、`calibrateConfidence(input)`。
+- 影响模块：`main/services/alice/memory/extractor`、`main/services/alice/confidence`。
 - 前置依赖：`ALICE-E1-T005`。
 - 实现步骤：
-  1. 定义三元组结构和置信度字段。
-  2. 实现抽取规则（先规则后模型）。
-  3. 写入 `alice_memory_facts` 并发布事件。
+  1. 规则抽取快速路径（同步）。
+  2. 异步 LLM 抽取器在后台补充/修正三元组。
+  3. 置信度校准器融合：`raw + 情绪词典强度 + 近两轮连贯性 + 抽取器一致性`。
+  4. 上游写入统一使用 `calibratedConfidence`，保留 `raw` 供审计。
 - 测试点：
-  1. 用户偏好类事实可正确抽取。
-  2. 重复事实执行 upsert 而非重复插入。
-  3. 低置信度事实可过滤。
+  1. 规则抽取失败时异步路径可补救。
+  2. 高 raw 低一致场景置信度被下调。
+  3. `raw` 缺失时启发式置信度仍可用。
 - 完成定义（DoD）：
-  - 单轮记忆写入可控且可追踪。
-  - 事实表可被检索模块使用。
+  - 抽取过程不阻塞主对话链路。
+  - 记忆写入不直接依赖 raw confidence。
 - 风险与回滚点：
-  - 风险：误抽取造成脏记忆。
-  - 回滚：关闭自动抽取，仅保留人工确认写入。
+  - 风险：异步任务积压。
+  - 回滚：降级为仅规则抽取 + 低置信阈值过滤。
 
-### ALICE-E1-T008 短期记忆检索注入
+### ALICE-E1-T008 短期记忆检索注入与 Prompt Budget Manager
 
-- 关联需求ID：`ALICE-F1.3`
-- 关联架构章节：`6.2`、`9.2`
-- 背景/目标：在对话前检索相关事实并注入上下文。
+- 关联需求ID：`ALICE-F1.3`、`ALICE-NFR-PERF-002`
+- 关联架构章节：`6.4`、`9.2`
+- 背景/目标：在对话前检索相关事实并受控注入，避免 Token 爆炸。
 - 输入输出与接口：
   - 输入：当前用户输入 + 会话信息。
   - 输出：排序后的记忆片段列表。
-  - 接口：`retrieveFacts(queryContext)`。
+  - 接口：`retrieveFacts(queryContext)`、`buildPromptWithBudget(input)`。
 - 影响模块：`main/services/alice/memory/retriever`、`orchestrator`。
 - 前置依赖：`ALICE-E1-T007`。
 - 实现步骤：
-  1. 定义检索排序（时间衰减 + 置信度）。
-  2. 设置注入条目上限与 token 预算。
-  3. 将命中事实写入调试日志。
+  1. 定义检索排序（时间衰减 + 置信度 + 访问频率）。
+  2. 设计预算切片（`SOUL`/记忆/当前轮）。
+  3. 超预算时执行可解释截断策略并记录日志。
 - 测试点：
   1. 命中率在典型场景下可接受。
   2. 长会话下 token 不超预算。
-  3. 无命中时可平滑退化。
+  3. 无命中时平滑退化。
 - 完成定义（DoD）：
   - 检索结果稳定且可解释。
   - 上下文注入不破坏响应时延。
@@ -235,33 +250,59 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
   - 风险：检索噪音影响回复质量。
   - 回滚：降低注入上限或关闭记忆注入开关。
 
-### ALICE-E1-T009 本地存储与数据访问层（DAO）
+### ALICE-E1-T009 本地存储与 DAO（仅结构化流式数据）
 
 - 关联需求ID：`ALICE-NFR-PRIV-001`、`ALICE-DEP-002`
-- 关联架构章节：`6.1`、`6.2`
+- 关联架构章节：`6.1`、`6.3`
 - 背景/目标：建立统一本地数据访问层，防止各模块直接写库造成混乱。
 - 输入输出与接口：
-  - 输入：profile、turn、fact、audit 数据对象。
+  - 输入：turn、fact、audit、archive 数据对象。
   - 输出：统一 DAO API。
-  - 接口：`profileDao`、`memoryDao`、`conversationDao`、`auditDao`。
+  - 接口：`memoryDao`、`conversationDao`、`auditDao`、`memoryArchiveDao`。
 - 影响模块：`main/services/alice/storage`。
-- 前置依赖：`ALICE-E1-T003`、`ALICE-E1-T007`。
+- 前置依赖：`ALICE-E1-T007`、`ALICE-E1-T008`。
 - 实现步骤：
-  1. 创建表结构与迁移脚本。
+  1. 创建 `memory_facts`、`conversation_turns`、`audit_logs`、`memory_archive` 表及迁移脚本。
   2. 封装 DAO，禁止业务层直写 SQL。
-  3. 增加基础数据清理策略接口（保留默认本地）。
+  3. 给检索命中更新 `lastAccessAt` 与 `accessCount`。
 - 测试点：
   1. 迁移可重复执行。
-  2. DAO 异常会返回可诊断错误。
+  2. DAO 异常返回可诊断错误。
   3. 并发读写不出现数据损坏。
 - 完成定义（DoD）：
+  - SQLite 不包含人格主状态表。
   - 数据操作统一收敛到 DAO。
-  - 关键表具备迁移与回滚脚本。
 - 风险与回滚点：
   - 风险：迁移失败导致启动失败。
-  - 回滚：保留上一版 schema，支持自动降级读取。
+  - 回滚：保留上一版 schema 并支持只读降级。
 
-### ALICE-E1-T010 脱敏网关与云调用防护
+### ALICE-E1-T010 记忆修剪任务（Memory Pruning）
+
+- 关联需求ID：`ALICE-F1.3`、`ALICE-NFR-PERF-001`
+- 关联架构章节：`6.4`、`9.5`
+- 背景/目标：控制记忆规模和检索时延，避免只增不减。
+- 输入输出与接口：
+  - 输入：`memory_facts` 命中历史与置信度。
+  - 输出：归档数、删除数、统计信息。
+  - 接口：`runMemoryPrune()`、`getMemoryStats()`。
+- 影响模块：`main/services/alice/memory/maintenance`。
+- 前置依赖：`ALICE-E1-T009`。
+- 实现步骤：
+  1. 启动后执行一次修剪并注册 24h 定时任务。
+  2. 实现 `pruneScore` 计算与归档/删除阈值。
+  3. 暴露手动触发与统计 IPC（开发调试用途）。
+- 测试点：
+  1. 长期未命中低置信记忆被归档/删除。
+  2. 高频命中记忆不会被误删。
+  3. 修剪后检索性能稳定。
+- 完成定义（DoD）：
+  - 修剪任务默认启用。
+  - 提供统计接口：总量、活跃量、归档量、最近修剪时间。
+- 风险与回滚点：
+  - 风险：阈值不当导致过删。
+  - 回滚：仅归档不删除 + 提高阈值。
+
+### ALICE-E1-T011 脱敏网关与云调用防护
 
 - 关联需求ID：`ALICE-NFR-PRIV-002`、`ALICE-NFR-PRIV-003`
 - 关联架构章节：`7.1`
@@ -287,59 +328,35 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
   - 风险：误杀导致回复质量下降。
   - 回滚：启用规则分级并支持白名单配置。
 
-### ALICE-E1-T011 Kill Switch 全链路
+### ALICE-E1-T012 Kill Switch 全链路（含 Origin Tracking）
 
 - 关联需求ID：`ALICE-NFR-SAFE-001`、`ALICE-NFR-SAFE-003`
 - 关联架构章节：`5.3`、`7.3`、`9.3`
-- 背景/目标：提供硬中断能力，能瞬时切断感知探针与执行权。
+- 背景/目标：提供硬中断能力，能瞬时切断感知探针与执行权，且防止上下文注入误触发。
 - 输入输出与接口：
-  - 输入：快捷键事件或命令口令。
+  - 输入：快捷键事件或用户原始口令。
   - 输出：系统状态 `ACTIVE/SUSPENDED`。
-  - 接口：`suspend(reason)`、`resume(reason)`、`getState()`。
+  - 接口：`suspend(reason, origin)`、`resume(reason, origin)`、`getState()`。
 - 影响模块：`main/services/alice/safety`、`shared/alice/contracts`。
 - 前置依赖：`ALICE-E1-T002`。
 - 实现步骤：
   1. 在主进程注册 Kill Switch 触发器。
-  2. 广播 kill-switch 事件并停用相关模块。
-  3. 增加恢复流程与状态查询。
+  2. 对文本口令增加来源标记：仅 `origin=ui-user` 执行拦截。
+  3. 广播 kill-switch 事件并停用相关模块。
+  4. 增加恢复流程与状态查询。
 - 测试点：
   1. 触发后执行链路立即拒绝请求。
   2. 恢复后可继续正常对话。
-  3. 连续触发/恢复不出现状态漂移。
+  3. MCP/网页工具输出中包含口令文本时不会触发休眠。
 - 完成定义（DoD）：
   - 中断耗时在目标阈值内。
+  - 指令拦截只发生在原始用户输入层。
   - 状态可观测且可恢复。
 - 风险与回滚点：
-  - 风险：中断不彻底导致安全隐患。
-  - 回滚：进入只读安全模式并提示重启。
+  - 风险：来源标记漏传导致误判。
+  - 回滚：关闭文本口令，仅保留物理快捷键。
 
-### ALICE-E1-T012 审计日志与最小观测能力
-
-- 关联需求ID：`ALICE-NFR-PRIV-003`、`ALICE-NFR-SAFE-002`
-- 关联架构章节：`4.3`、`6.2`、`7`
-- 背景/目标：关键行为可追踪，为问题定位和后续合规打基础。
-- 输入输出与接口：
-  - 输入：事件总线关键事件。
-  - 输出：结构化审计记录。
-  - 接口：`recordAudit(event, level)`、`queryAudit(filter)`。
-- 影响模块：`main/services/alice/audit`。
-- 前置依赖：`ALICE-E1-T002`、`ALICE-E1-T009`。
-- 实现步骤：
-  1. 设计审计等级与字段。
-  2. 订阅关键事件并落库。
-  3. 提供调试查询接口（开发态）。
-- 测试点：
-  1. 初始化、对话、Kill Switch 均有审计。
-  2. 审计查询支持按 `traceId` 过滤。
-  3. 高并发下日志不丢失。
-- 完成定义（DoD）：
-  - 关键链路可完整回放。
-  - 审计数据不包含敏感明文。
-- 风险与回滚点：
-  - 风险：日志过量导致磁盘膨胀。
-  - 回滚：启用日志级别和保留策略限制。
-
-### ALICE-E1-T013 集成验证与交付门禁
+### ALICE-E1-T013 审计日志、集成验证与 Epoch1 退场门禁
 
 - 关联需求ID：`ALICE-EPOCH-1`、`ALICE-NFR-PERF-001`、`ALICE-NFR-PERF-002`
 - 关联架构章节：`3`、`4`、`8.1`
@@ -352,32 +369,25 @@ description: 面向开发团队的 Epoch 1 任务级执行清单
 - 前置依赖：`ALICE-E1-T001` 至 `ALICE-E1-T012`。
 - 实现步骤：
   1. 编写主链路集成测试（初始化 -> 对话 -> 记忆 -> Kill Switch）。
-  2. 建立性能基线采样（空闲态 CPU、对话时延）。
-  3. 汇总验收报告并冻结 M1 基线标签。
+  2. 增加 `SOUL.md` 外部编辑一致性测试（冷热启动 + 热重载）。
+  3. 建立性能基线采样（空闲态 CPU、对话时延）。
+  4. 汇总验收报告并冻结 M1 基线标签。
 - 测试点：
   1. 端到端链路连续通过。
   2. Kill Switch 中断/恢复通过。
-  3. 关键性能指标满足阈值。
+  3. 冷/热启动与文件外部篡改下人格状态最终一致。
+  4. 关键性能指标满足阈值。
 - 完成定义（DoD）：
-  - CI 门禁可稳定运行。
-  - M1 验收报告可追溯到需求与架构。
+  - M1 验收报告可复现。
+  - 关键链路与安全边界无阻断缺陷。
 - 风险与回滚点：
-  - 风险：集成环境不稳定导致假失败。
-  - 回滚：拆分 smoke 与 full test 两级门禁。
+  - 风险：CI 环境无法稳定复现文件监听行为。
+  - 回滚：补充平台隔离测试并在本地门禁强制执行。
 
-## 4. 任务依赖关系（执行顺序）
+## 4. 任务执行顺序建议
 
-建议顺序：
-
-1. `T001 -> T002 -> T003 -> T004`
-2. `T005 -> T006`
-3. `T007 -> T008`
-4. `T009 -> T010 -> T011 -> T012`
-5. `T013`
-
-## 5. Epoch 1 明确不做
-
-1. Live2D 与 TTS 表现层实现。
-2. 屏幕截图、麦克风静默监听、VLM/Whisper 接入。
-3. 预测性代办、自动学习工具链。
-4. 生物钟成熟机制与跨端同步。
+1. `T001 -> T002 -> T003 -> T004`（先立边界与真源）。
+2. `T005 -> T006 -> T007 -> T008`（完成对话与记忆主链路）。
+3. `T009 -> T010`（收敛存储并实现遗忘曲线）。
+4. `T011 -> T012`（隐私与安全闭环）。
+5. `T013`（统一验收与发布门禁）。

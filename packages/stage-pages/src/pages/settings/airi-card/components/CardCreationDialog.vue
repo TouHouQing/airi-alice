@@ -224,18 +224,6 @@ function saveCard(card: Card): boolean {
     errorMessage.value = t('settings.pages.card.creation.errors.scenario')
     return false
   }
-  else if (!(rawCard.systemPrompt!.length > 0)) {
-    // No sys prompt
-    showError.value = true
-    errorMessage.value = t('settings.pages.card.creation.errors.systemprompt')
-    return false
-  }
-  else if (!(rawCard.postHistoryInstructions!.length > 0)) {
-    // No post history prompt
-    showError.value = true
-    errorMessage.value = t('settings.pages.card.creation.errors.posthistoryinstructions')
-    return false
-  }
   showError.value = false
 
   // Build card with modules extension
@@ -301,8 +289,8 @@ function initializeCard(): Card {
     notes: undefined,
     personality: t('settings.pages.card.creation.defaults.personality'),
     scenario: t('settings.pages.card.creation.defaults.scenario'),
-    systemPrompt: t('settings.pages.card.creation.defaults.systemprompt'),
-    postHistoryInstructions: t('settings.pages.card.creation.defaults.posthistoryinstructions'),
+    systemPrompt: '',
+    postHistoryInstructions: '',
     greetings: [],
     messageExample: [],
   }
@@ -510,8 +498,8 @@ function getDefaultPlaceholder(defaultValue: string | undefined): string {
           <!-- Settings -->
           <div v-else-if="activeTab === 'settings'" class="tab-content ml-auto mr-auto w-95%">
             <div class="input-list ml-auto mr-auto w-90% flex flex-row flex-wrap justify-center gap-8">
-              <FieldInput v-model="cardSystemPrompt" :label="t('settings.pages.card.systemprompt')" :single-line="false" :required="true" :description="t('settings.pages.card.creation.fields_info.systemprompt')" />
-              <FieldInput v-model="cardPostHistoryInstructions" :label="t('settings.pages.card.posthistoryinstructions')" :single-line="false" :required="true" :description="t('settings.pages.card.creation.fields_info.posthistoryinstructions')" />
+              <FieldInput v-model="cardSystemPrompt" :label="`${t('settings.pages.card.systemprompt')} (Legacy)`" :single-line="false" :description="t('settings.pages.card.creation.fields_info.systemprompt')" />
+              <FieldInput v-model="cardPostHistoryInstructions" :label="`${t('settings.pages.card.posthistoryinstructions')} (Legacy)`" :single-line="false" :description="t('settings.pages.card.creation.fields_info.posthistoryinstructions')" />
               <FieldInput v-model="cardVersion" :label="t('settings.pages.card.creation.version')" :required="true" :description="t('settings.pages.card.creation.fields_info.version')" />
             </div>
           </div>

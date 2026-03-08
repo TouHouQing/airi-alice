@@ -1,20 +1,10 @@
-<picture>
-  <source
-    width="100%"
-    srcset="./docs/content/public/banner-dark-1280x640.avif"
-    media="(prefers-color-scheme: dark)"
-  />
-  <source
-    width="100%"
-    srcset="./docs/content/public/banner-light-1280x640.avif"
-    media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)"
-  />
-  <img width="250" src="./docs/content/public/banner-light-1280x640.avif" />
-</picture>
+<p align="center">
+  <img width="220" src="./docs/content/public/alice-logo.png" alt="AIRI-ALICE logo" />
+</p>
 
-<h1 align="center">Project AIRI</h1>
+<h1 align="center">Project AIRI-ALICE</h1>
 
-<p align="center">Re-creating Neuro-sama, a soul container of AI waifu / virtual characters to bring them into our world.</p>
+<p align="center">Artificial Labile Intelligent Cybernated Existence (A.L.I.C.E.), a local-first digital companion and super assistant system.</p>
 
 <p align="center">
   [<a href="https://discord.gg/TgQ3Cu2F7A">Join Discord Server</a>] [<a href="https://airi.moeru.ai">Try it</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.zh-CN.md">简体中文</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.ja-JP.md">日本語</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.ru-RU.md">Русский</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.vi.md">Tiếng Việt</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.fr.md">Français</a>] [<a href="https://github.com/moeru-ai/airi/blob/main/docs/README.ko-KR.md">한국어</a>]
@@ -58,7 +48,11 @@ With the power of modern large language models like [ChatGPT](https://chatgpt.co
 
 Perhaps you know [Neuro-sama](https://www.youtube.com/@Neurosama) already. She is currently the best virtual streamer capable of playing games, chatting, and interacting with you and the participants. Some also call this kind of being "digital human." **Sadly, as it's not open sourced, you cannot interact with her after her live streams go offline**.
 
-Therefore, this project, AIRI, offers another possibility here: **let you own your digital life, cyber living, easily, anywhere, anytime**.
+Therefore, this project, AIRI-ALICE, offers another possibility here: **let you own your digital life, cyber living, easily, anywhere, anytime**.
+
+> [!NOTE]
+> A.L.I.C.E planning and implementation docs are available under `docs/content/zh-Hans/docs/alice/`:
+> `requirements.md`, `architecture.md`, `roadmap.md`, `development-epoch1.md`.
 
 ## DevLogs We Posted & Recent Updates
 
