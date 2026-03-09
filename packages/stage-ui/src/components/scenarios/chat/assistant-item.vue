@@ -62,6 +62,17 @@ const boxClasses = computed(() => [
             class="mb-2"
           />
           <template v-else-if="slice.type === 'tool-call-result'" />
+          <div
+            v-else-if="slice.type === 'execution-status'"
+            :class="[
+              'mb-2 rounded-md border px-2 py-1 text-xs',
+              slice.phase === 'tool-failed'
+                ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-950/20 dark:text-amber-300'
+                : 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-700 dark:bg-sky-950/20 dark:text-sky-300',
+            ]"
+          >
+            <span class="font-medium">{{ slice.label }}</span>
+          </div>
           <template v-else-if="slice.type === 'text'">
             <MarkdownRenderer :content="slice.text" />
           </template>

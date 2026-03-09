@@ -35,6 +35,9 @@ const emotionToSentiment: Record<string, number> = {
   curious: 0.1,
 }
 
+const jsonRepairMaxChars = 32 * 1024
+const jsonRepairTimeBudgetMs = 20
+
 function clamp(value: number, min: number, max: number) {
   if (Number.isNaN(value))
     return min
@@ -53,40 +56,199 @@ interface ActPayload {
   [key: string]: unknown
 }
 
-function parseLastActPayload(content: string): ActPayload | null {
-  const matches = [...content.matchAll(/<\|ACT\s*(?::\s*)?(\{[\s\S]*?\})\|>/gi)]
-  if (matches.length === 0)
-    return null
+export type StructuredParsePath = 'json' | 'repair-json' | 'act' | 'fallback'
 
-  const lastPayloadText = matches[matches.length - 1]?.[1]
-  if (!lastPayloadText)
-    return null
+interface StructuredPayloadParseResult {
+  payload: Record<string, unknown> | null
+  parsePath: StructuredParsePath
+  repairTimedOut: boolean
+}
 
+function toObjectRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return null
+  return value as Record<string, unknown>
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value))
+    return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value)
+    if (Number.isFinite(parsed))
+      return parsed
+  }
+  return undefined
+}
+
+function parseObjectCandidate(candidate: string): Record<string, unknown> | null {
   try {
-    const payload = JSON.parse(lastPayloadText) as unknown
-    if (payload && typeof payload === 'object' && !Array.isArray(payload))
-      return payload as ActPayload
+    const parsed = JSON.parse(candidate) as unknown
+    return toObjectRecord(parsed)
   }
   catch {
-    return null
+    const normalizedCandidate = candidate
+      .replace(/,\s*\}/g, '}')
+      .replace(/,\s*\]/g, ']')
+      .replace(/^\uFEFF/, '')
+      .trim()
+
+    try {
+      const repaired = JSON.parse(normalizedCandidate) as unknown
+      return toObjectRecord(repaired)
+    }
+    catch {
+      return null
+    }
+  }
+}
+
+function parseLastActPayload(content: string): ActPayload | null {
+  let searchEnd = content.length
+  while (searchEnd > 0) {
+    const openIndex = content.lastIndexOf('<|ACT', searchEnd)
+    if (openIndex < 0)
+      return null
+
+    const closeIndex = content.indexOf('|>', openIndex)
+    if (closeIndex < 0) {
+      searchEnd = openIndex - 1
+      continue
+    }
+
+    const block = content.slice(openIndex + '<|ACT'.length, closeIndex)
+    const jsonStart = block.indexOf('{')
+    const jsonEnd = block.lastIndexOf('}')
+    if (jsonStart < 0 || jsonEnd < jsonStart) {
+      searchEnd = openIndex - 1
+      continue
+    }
+
+    const payloadText = block.slice(jsonStart, jsonEnd + 1)
+    const parsed = parseObjectCandidate(payloadText)
+    if (parsed)
+      return parsed as ActPayload
+
+    searchEnd = openIndex - 1
   }
 
   return null
 }
 
-function getNumeric(payload: ActPayload | null, keys: string[]) {
+function parseStrictJsonPayload(content: string): Record<string, unknown> | null {
+  const trimmed = content.trim()
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}'))
+    return null
+  return parseObjectCandidate(trimmed)
+}
+
+function extractJsonWindow(content: string, maxChars: number, startedAt: number): { candidate?: string, timedOut: boolean } {
+  const text = content.trim()
+  if (!text)
+    return { timedOut: false }
+
+  const firstBrace = text.indexOf('{')
+  const lastBrace = text.lastIndexOf('}')
+  if (firstBrace < 0 || lastBrace < firstBrace)
+    return { timedOut: false }
+
+  if (Date.now() - startedAt > jsonRepairTimeBudgetMs)
+    return { timedOut: true }
+
+  if (lastBrace - firstBrace + 1 > maxChars)
+    return { timedOut: true }
+
+  return {
+    candidate: text.slice(firstBrace, lastBrace + 1),
+    timedOut: false,
+  }
+}
+
+function parseStructuredPayloadFromText(content: string): StructuredPayloadParseResult {
+  const strict = parseStrictJsonPayload(content)
+  if (strict) {
+    return {
+      payload: strict,
+      parsePath: 'json',
+      repairTimedOut: false,
+    }
+  }
+
+  const startedAt = Date.now()
+  const repairWindow = extractJsonWindow(content, jsonRepairMaxChars, startedAt)
+  if (repairWindow.timedOut) {
+    return {
+      payload: null,
+      parsePath: 'fallback',
+      repairTimedOut: true,
+    }
+  }
+
+  if (repairWindow.candidate) {
+    const repaired = parseObjectCandidate(repairWindow.candidate)
+    if (repaired) {
+      return {
+        payload: repaired,
+        parsePath: 'repair-json',
+        repairTimedOut: false,
+      }
+    }
+  }
+
+  const actPayload = parseLastActPayload(content)
+  if (actPayload) {
+    return {
+      payload: actPayload as Record<string, unknown>,
+      parsePath: 'act',
+      repairTimedOut: false,
+    }
+  }
+
+  return {
+    payload: null,
+    parsePath: 'fallback',
+    repairTimedOut: false,
+  }
+}
+
+function getNumeric(payload: Record<string, unknown> | null, keys: string[]) {
+  if (!payload)
+    return undefined
+
+  for (const key of keys) {
+    const value = toFiniteNumber(payload[key])
+    if (typeof value === 'number')
+      return value
+  }
+
+  return undefined
+}
+
+function getString(payload: Record<string, unknown> | null, keys: string[]) {
   if (!payload)
     return undefined
 
   for (const key of keys) {
     const value = payload[key]
-    if (typeof value === 'number' && Number.isFinite(value))
-      return value
-    if (typeof value === 'string' && value.trim()) {
-      const parsed = Number.parseFloat(value)
-      if (Number.isFinite(parsed))
-        return parsed
-    }
+    if (typeof value === 'string' && value.trim())
+      return value.trim()
+  }
+
+  return undefined
+}
+
+function parsePayloadEmotion(payload: Record<string, unknown> | null) {
+  if (!payload)
+    return undefined
+
+  const direct = payload.emotion
+  if (typeof direct === 'string' && direct.trim())
+    return direct.trim().toLowerCase()
+
+  if (direct && typeof direct === 'object' && 'name' in direct) {
+    const name = (direct as { name?: unknown }).name
+    if (typeof name === 'string' && name.trim())
+      return name.trim().toLowerCase()
   }
 
   return undefined
@@ -94,18 +256,8 @@ function getNumeric(payload: ActPayload | null, keys: string[]) {
 
 export function parseLastActEmotion(content: string) {
   const payload = parseLastActPayload(content)
-  if (!payload)
-    return 'neutral'
-
-  if (typeof payload.emotion === 'string')
-    return payload.emotion.trim().toLowerCase() || 'neutral'
-  if (payload.emotion && typeof payload.emotion === 'object' && 'name' in payload.emotion) {
-    const name = (payload.emotion as { name?: unknown }).name
-    if (typeof name === 'string' && name.trim())
-      return name.trim().toLowerCase()
-  }
-
-  return 'neutral'
+  const emotion = parsePayloadEmotion(payload as Record<string, unknown> | null)
+  return emotion || 'neutral'
 }
 
 function computeConfidenceCap(input: {
@@ -189,14 +341,28 @@ export interface StructuredOutputResult {
   sentimentConfidenceRaw?: number
   sentimentConfidence: number
   format: 'epoch1-v1' | 'fallback-v1'
+  parsePath?: StructuredParsePath
+  repairTimedOut?: boolean
 }
 
 export function normalizeStructuredOutput(input: StructuredOutputInput): StructuredOutputResult {
+  const parsed = parseStructuredPayloadFromText(input.fullText)
+  const payload = parsed.payload
   const actPayload = parseLastActPayload(input.fullText)
-  const emotion = parseLastActEmotion(input.fullText)
+
+  const thought = getString(payload, ['thought'])
+    || input.thought.trim()
+  const reply = getString(payload, ['reply'])
+    || input.reply.trim()
+    || input.fullText.trim()
+  const emotion = parsePayloadEmotion(payload)
+    || parsePayloadEmotion(actPayload as Record<string, unknown> | null)
+    || 'neutral'
+
   const emotionScore = emotionToScore(emotion)
-  const lexicalScore = estimateLexicalSentiment(input.reply)
-  const modelSentiment = getNumeric(actPayload, ['userSentimentScore', 'user_sentiment_score'])
+  const lexicalScore = estimateLexicalSentiment(reply)
+  const modelSentiment = getNumeric(payload, ['userSentimentScore', 'user_sentiment_score'])
+    ?? getNumeric(actPayload as Record<string, unknown> | null, ['userSentimentScore', 'user_sentiment_score'])
   const scoreInput = input.userSentimentScore ?? modelSentiment
   const userSentimentScore = clamp(
     typeof scoreInput === 'number' && Number.isFinite(scoreInput)
@@ -207,13 +373,21 @@ export function normalizeStructuredOutput(input: StructuredOutputInput): Structu
   )
 
   const rawInput = input.sentimentConfidenceRaw
-    ?? getNumeric(actPayload, [
+    ?? getNumeric(payload, [
       'sentimentConfidenceRaw',
       'sentiment_confidence_raw',
       'sentimentConfidence',
       'sentiment_confidence',
       'confidence',
     ])
+    ?? getNumeric(actPayload as Record<string, unknown> | null, [
+      'sentimentConfidenceRaw',
+      'sentiment_confidence_raw',
+      'sentimentConfidence',
+      'sentiment_confidence',
+      'confidence',
+    ])
+
   const lexicalStrength = Math.abs(lexicalScore)
   const coherence = input.previousEmotion
     ? (input.previousEmotion === emotion ? 1 : 0.55)
@@ -227,14 +401,16 @@ export function normalizeStructuredOutput(input: StructuredOutputInput): Structu
   })
 
   return {
-    thought: input.thought.trim(),
+    thought,
     emotion,
-    reply: input.reply.trim(),
+    reply,
     userSentimentScore,
     sentimentConfidenceRaw: typeof rawInput === 'number' && Number.isFinite(rawInput)
       ? clamp(rawInput, 0, 1)
       : undefined,
     sentimentConfidence: calibrated,
-    format: 'epoch1-v1',
+    format: parsed.parsePath === 'fallback' ? 'fallback-v1' : 'epoch1-v1',
+    parsePath: parsed.parsePath,
+    repairTimedOut: parsed.repairTimedOut,
   }
 }

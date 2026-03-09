@@ -11,6 +11,8 @@ import { nanoid } from 'nanoid'
 import { validate } from 'xsschema'
 import { z } from 'zod'
 
+import { sanitizeAssistantOutputForDisplay } from '../../../../../composables/alice-guardrails'
+import { isAliceAbortError } from '../../../../../composables/alice-turn-abort'
 import { getEventSourceKey } from '../../../../../utils'
 
 export interface SparkNotifyCommandDraft {
@@ -38,6 +40,7 @@ export interface SparkNotifyAgentDeps {
       supportsTools?: boolean
       waitForTools?: boolean
       onStreamEvent?: (event: StreamEvent) => void | Promise<void>
+      abortSignal?: AbortSignal
     },
   ) => Promise<void>
   getActiveProvider: () => string | undefined
@@ -92,7 +95,30 @@ export const sparkCommandSchema = z.object({
 export type SparkCommandSchema = z.infer<typeof sparkCommandSchema>
 
 export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
-  async function runNotifyAgent(event: WebSocketEventOf<'spark:notify'>) {
+  function hasVerifiedToolResultPayload(result?: unknown) {
+    if (!result)
+      return false
+    if (typeof result === 'string')
+      return result.trim().length > 0
+    if (Array.isArray(result)) {
+      return result.some((part) => {
+        if (typeof part === 'string')
+          return part.trim().length > 0
+        if (part && typeof part === 'object' && 'text' in part)
+          return String((part as { text?: unknown }).text ?? '').trim().length > 0
+        return Boolean(part && typeof part === 'object' && Object.keys(part).length > 0)
+      })
+    }
+    if (typeof result !== 'object')
+      return false
+
+    const payload = result as Record<string, unknown>
+    if (payload.isError === true || payload.ok === false)
+      return false
+    return Boolean(payload.content || payload.structuredContent || payload.toolResult)
+  }
+
+  async function runNotifyAgent(event: WebSocketEventOf<'spark:notify'>, options?: { abortSignal?: AbortSignal }) {
     const activeProvider = deps.getActiveProvider()
     const activeModel = deps.getActiveModel()
     if (!activeProvider || !activeModel) {
@@ -178,6 +204,7 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
     }
 
     let fullText = ''
+    let hasVerifiedToolResult = false
 
     await deps.stream(activeModel, chatProvider, [systemMessage, userMessage], {
       tools: [
@@ -186,7 +213,11 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
       ],
       supportsTools: true,
       waitForTools: true,
+      abortSignal: options?.abortSignal,
       onStreamEvent: async (streamEvent: StreamEvent) => {
+        if (streamEvent.type === 'tool-result' && hasVerifiedToolResultPayload(streamEvent.result)) {
+          hasVerifiedToolResult = true
+        }
         if (streamEvent.type === 'text-delta') {
           if (noResponse)
             return
@@ -201,7 +232,13 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
             return
           }
 
-          deps.onReactionEnd(event.data.id, fullText)
+          const sanitizedOutput = sanitizeAssistantOutputForDisplay(fullText, {
+            realtimeIntent: false,
+            verifiedToolResult: hasVerifiedToolResult,
+          })
+          const finalText = sanitizedOutput.cleanText || fullText.trim()
+          deps.onReactionEnd(event.data.id, finalText)
+          fullText = finalText
         }
         if (streamEvent.type === 'error') {
           deps.onReactionEnd(event.data.id, fullText)
@@ -216,7 +253,7 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
     } satisfies SparkNotifyResponse
   }
 
-  async function handle(event: WebSocketEventOf<'spark:notify'>) {
+  async function handle(event: WebSocketEventOf<'spark:notify'>, options?: { abortSignal?: AbortSignal }) {
     if (event.data.urgency !== 'immediate' && deps.getPending().length > 0) {
       deps.setPending([...deps.getPending(), event])
       return undefined
@@ -229,7 +266,7 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
     deps.setProcessing(true)
 
     try {
-      const response = await runNotifyAgent(event)
+      const response = await runNotifyAgent(event, options)
       if (!response)
         return undefined
 
@@ -252,6 +289,13 @@ export function setupAgentSparkNotifyHandler(deps: SparkNotifyAgentDeps) {
       return {
         commands,
       }
+    }
+    catch (error) {
+      if (isAliceAbortError(error)) {
+        deps.onReactionEnd(event.data.id, '')
+        return undefined
+      }
+      throw error
     }
     finally {
       deps.setProcessing(false)

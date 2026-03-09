@@ -4,6 +4,7 @@ import { defineStore, storeToRefs } from 'pinia'
 import { ref } from 'vue'
 
 import { useCharacterNotebookStore, useCharacterStore } from '../'
+import { completeAliceTurnAbort, isAliceAbortError, registerAliceTurnAbort } from '../../../composables/alice-turn-abort'
 import { useLLM } from '../../llm'
 import { useModsServerChannelStore } from '../../mods/api/channel-server'
 import { useConsciousnessStore } from '../../modules/consciousness'
@@ -90,18 +91,28 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
   }
 
   async function processSparkNotify(event: WebSocketEventOf<'spark:notify'>) {
-    const result = await sparkNotifyAgent.handle(event)
-    if (!result?.commands?.length)
+    const turn = registerAliceTurnAbort({
+      scope: 'spark',
+      turnId: `spark:${event.data.id}`,
+    })
+
+    try {
+      const result = await sparkNotifyAgent.handle(event, { abortSignal: turn.signal })
+      if (!result?.commands?.length)
+        return result
+
+      for (const command of result.commands) {
+        modsServerChannelStore.send({
+          type: 'spark:command',
+          data: command,
+        })
+      }
+
       return result
-
-    for (const command of result.commands) {
-      modsServerChannelStore.send({
-        type: 'spark:command',
-        data: command,
-      })
     }
-
-    return result
+    finally {
+      completeAliceTurnAbort(turn.turnId)
+    }
   }
 
   async function handleIncomingSparkNotify(event: WebSocketEventOf<'spark:notify'>) {
@@ -161,6 +172,9 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
       await processSparkNotify(next.event)
     }
     catch (error) {
+      if (isAliceAbortError(error))
+        return
+
       if (next.attempts + 1 < next.maxAttempts) {
         scheduledNotifies.value = [...scheduledNotifies.value, {
           ...next,

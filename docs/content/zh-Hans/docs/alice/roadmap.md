@@ -37,8 +37,9 @@ description: Epoch 1-5 路线图、里程碑、风险与进退场标准
 - 范围：
   - 人格事实采集式 Genesis（结构化字段 + 自由文）与 `SOUL.md` 真源持久化。
   - 主对话与 spark:notify 采用系统固定注入模板（不开放 Prompt/Spark 配置）。
-  - `thought/emotion/reply` 结构化输出。
+  - `thought/emotion/reply` 结构化输出（非 JSON 重采样一次，失败安全回退）。
   - 短期记忆写入与检索（含 Prompt Budget 与低频修剪）。
+  - 会话轮次 `conversation_turns` 本地落库与中断零落盘。
   - 记忆抽取置信度二次校准（不直用 LLM raw confidence）。
   - Kill Switch、本地审计、脱敏守卫。
 - 入场条件：

@@ -2,6 +2,8 @@ import type { WebSocketEventInputs } from '@proj-airi/server-sdk'
 import type { ChatProvider } from '@xsai-ext/providers/utils'
 import type { CommonContentPart, Message, ToolMessage } from '@xsai/shared-chat'
 
+import type { StructuredOutputResult } from '../composables/alice-structured-output'
+import type { AliceAbortReason } from '../composables/alice-turn-abort'
 import type { ChatAssistantMessage, ChatSlices, ChatStreamEventContext, StreamingAssistantMessage } from '../types/chat'
 import type { StreamEvent, StreamOptions } from './llm'
 
@@ -13,18 +15,19 @@ import { ref, toRaw } from 'vue'
 import { useAnalytics } from '../composables'
 import { applyPromptBudget, sanitizeAssistantOutputForDisplay, sanitizeForRemoteModel } from '../composables/alice-guardrails'
 import { composeAlicePromptMessages } from '../composables/alice-prompt-composer'
-import { detectRealtimeQueryIntent, runRealtimeQueryPreflight } from '../composables/alice-realtime-query'
+import { detectRealtimeQueryIntent } from '../composables/alice-realtime-query'
 import { normalizeStructuredOutput } from '../composables/alice-structured-output'
+import { abortAliceTurns, completeAliceTurnAbort, isAliceAbortError, registerAliceTurnAbort } from '../composables/alice-turn-abort'
 import { useLlmmarkerParser } from '../composables/llm-marker-parser'
 import { categorizeResponse, createStreamingCategorizer } from '../composables/response-categoriser'
 import { getAliceBridge, hasAliceBridge } from './alice-bridge'
+import { useAliceExecutionEngineStore } from './alice-execution-engine'
 import { createDatetimeContext } from './chat/context-providers'
 import { useChatContextStore } from './chat/context-store'
 import { createChatHooks } from './chat/hooks'
 import { useChatSessionStore } from './chat/session-store'
 import { useChatStreamStore } from './chat/stream-store'
 import { useLLM } from './llm'
-import { getMcpToolBridge } from './mcp-tool-bridge'
 import { useConsciousnessStore } from './modules/consciousness'
 
 interface SendOptions {
@@ -56,14 +59,33 @@ interface QueuedSend {
   }
 }
 
+type ExternalPipelineAborter = (reason: AliceAbortReason) => Promise<void> | void
+
 const assistantLeakFallbackReply = '我刚才的检索结果混入了内部调用片段，已自动过滤。请你再说一次你的问题，我会直接给你整理后的结果。'
 const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外部数据。请稍后重试，或在设置里检查 MCP 实时工具是否可用。'
+const assistantStructuredContractFallbackReply = '我刚才没有稳定产出结构化结果，这一轮先按安全模式回复。'
+const structuredRetrySystemPrompt = [
+  'Return ONLY one strict JSON object with keys: thought, emotion, reply.',
+  'No markdown fences, no prose, no tool calls, no extra keys.',
+  'The "emotion" value must be a short lowercase label, and "reply" must be natural language.',
+].join(' ')
+
+function createEmptyStreamingMessage(): StreamingAssistantMessage {
+  return {
+    role: 'assistant',
+    content: '',
+    slices: [],
+    tool_results: [],
+  }
+}
 
 interface TurnToolEvidence {
   toolCallCount: number
   toolResultCount: number
   verifiedToolResult: boolean
 }
+
+type StructuredWithContract = StructuredOutputResult & { contractFailed?: boolean }
 
 function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null {
   const normalized = message.trim()
@@ -74,6 +96,21 @@ function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null 
   if (resumePattern.test(normalized))
     return 'resume'
   return null
+}
+
+function resolveAbortReason(error: unknown, stale: boolean): AliceAbortReason {
+  if (stale)
+    return 'session-reset'
+
+  if (typeof error === 'object' && error && 'message' in error) {
+    const message = String((error as { message?: unknown }).message ?? '')
+    const match = /Turn aborted:\s*([a-z-]+)/i.exec(message)
+    const reason = match?.[1]?.toLowerCase()
+    if (reason === 'kill-switch' || reason === 'session-reset' || reason === 'manual' || reason === 'shutdown')
+      return reason
+  }
+
+  return 'unknown'
 }
 
 function replaceAssistantTextSlices(slices: ChatSlices[], text: string): ChatSlices[] {
@@ -124,19 +161,70 @@ function stringifyAssistantContent(content: unknown) {
     .join('')
 }
 
-function hasVerifiedToolResult(result?: string | CommonContentPart[]) {
+function hasVerifiedToolResult(result?: unknown) {
   if (typeof result === 'string') {
     return result.trim().length > 0
   }
 
-  if (!Array.isArray(result))
+  if (Array.isArray(result)) {
+    return result.some((part) => {
+      if (typeof part === 'string')
+        return part.trim().length > 0
+      if (part && typeof part === 'object' && 'text' in part)
+        return String((part as { text?: unknown }).text ?? '').trim().length > 0
+      return Boolean(part && typeof part === 'object' && Object.keys(part).length > 0)
+    })
+  }
+
+  if (!result || typeof result !== 'object')
     return false
 
-  return result.some((part) => {
-    if (part && typeof part === 'object' && 'text' in part)
-      return String((part as { text?: unknown }).text ?? '').trim().length > 0
-    return Boolean(part && Object.keys(part).length > 0)
-  })
+  const payload = result as Record<string, unknown>
+  if (payload.isError === true || payload.ok === false)
+    return false
+
+  const content = payload.content
+  const structuredContent = payload.structuredContent
+  const toolResult = payload.toolResult
+
+  const hasContent = (value: unknown): boolean => {
+    if (typeof value === 'string')
+      return value.trim().length > 0
+    if (Array.isArray(value)) {
+      return value.some((entry) => {
+        if (typeof entry === 'string')
+          return entry.trim().length > 0
+        if (entry && typeof entry === 'object' && 'text' in entry)
+          return String((entry as { text?: unknown }).text ?? '').trim().length > 0
+        return Boolean(entry && typeof entry === 'object' && Object.keys(entry).length > 0)
+      })
+    }
+    if (value && typeof value === 'object')
+      return Object.keys(value as Record<string, unknown>).length > 0
+    return false
+  }
+
+  return hasContent(content) || hasContent(structuredContent) || hasContent(toolResult)
+}
+
+function hasStructuredJsonContract(structured: StructuredOutputResult | undefined) {
+  if (!structured?.parsePath)
+    return false
+  return structured.parsePath === 'json' || structured.parsePath === 'repair-json'
+}
+
+function createStructuredFallback(replyText: string): StructuredWithContract {
+  return {
+    thought: '',
+    emotion: 'neutral',
+    reply: replyText.trim() || assistantStructuredContractFallbackReply,
+    userSentimentScore: 0,
+    sentimentConfidence: 0.2,
+    format: 'fallback-v1',
+    parsePath: 'fallback',
+    repairTimedOut: false,
+    contractFailed: true,
+  }
 }
 
 async function safelyGetAliceSoulSnapshot() {
@@ -172,6 +260,7 @@ async function appendAliceAuditLog(payload: {
 
 export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
   const llmStore = useLLM()
+  const executionEngine = useAliceExecutionEngineStore()
   const consciousnessStore = useConsciousnessStore()
   const { activeProvider } = storeToRefs(consciousnessStore)
   const { trackFirstMessage } = useAnalytics()
@@ -184,6 +273,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
   const sending = ref(false)
   const pendingQueuedSends = ref<QueuedSend[]>([])
+  const externalPipelineAborters = new Set<ExternalPipelineAborter>()
   const hooks = createChatHooks()
 
   const sendQueue = createQueue<QueuedSend>({
@@ -234,6 +324,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
     const sendingCreatedAt = Date.now()
     const streamingMessageContext: ChatStreamEventContext = {
+      sessionId,
       message: { role: 'user', content: sendingMessage, createdAt: sendingCreatedAt, id: nanoid() },
       contexts: chatContext.getContextsSnapshot(),
       composedMessage: [],
@@ -241,9 +332,16 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     }
 
     const isStaleGeneration = () => chatSession.getSessionGeneration(sessionId) !== generation
-    const shouldAbort = () => isStaleGeneration()
-    if (shouldAbort())
+    if (isStaleGeneration())
       return
+
+    const activeTurn = registerAliceTurnAbort({
+      scope: 'chat',
+      turnId: `chat:${sessionId}:${streamingMessageContext.message.id}`,
+    })
+    const abortSignal = activeTurn.signal
+    const turnId = activeTurn.turnId
+    const shouldAbort = () => isStaleGeneration() || abortSignal.aborted
 
     sending.value = true
 
@@ -259,6 +357,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
     updateUI()
     trackFirstMessage()
+
+    const sessionMessagesForSend = chatSession.getSessionMessages(sessionId)
+    let userTurnMessageId: string | null = null
 
     try {
       if (options.origin === 'ui-user' && hasAliceBridge()) {
@@ -300,7 +401,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
           chatSession.persistSessionMessages(sessionId)
           if (isForegroundSession()) {
-            streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }
+            streamingMessage.value = createEmptyStreamingMessage()
           }
           return
         }
@@ -336,11 +437,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       if (shouldAbort())
         return
 
-      const sessionMessagesForSend = chatSession.sessionMessages[sessionId]
-      if (!sessionMessagesForSend) {
-        throw new Error('Session messages not found')
-      }
-      sessionMessagesForSend.push({ role: 'user', content: finalContent, createdAt: sendingCreatedAt, id: nanoid() })
+      userTurnMessageId = nanoid()
+      sessionMessagesForSend.push({ role: 'user', content: finalContent, createdAt: sendingCreatedAt, id: userTurnMessageId })
       chatSession.persistSessionMessages(sessionId)
 
       const origin = options.origin ?? 'ui-user'
@@ -352,38 +450,203 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         toolResultCount: 0,
         verifiedToolResult: false,
       }
+      const headers = (options.providerConfig?.headers || {}) as Record<string, string>
 
       const categorizer = createStreamingCategorizer(activeProvider.value)
       let streamPosition = 0
       let finalAssistantDisplayText = ''
 
-      const applyAssistantResult = (payload: {
-        fullText: string
-        reasoning: string
-        reply: string
-      }) => {
+      const getPreviousAssistantEmotion = () => {
         const previousAssistant = [...sessionMessagesForSend]
           .reverse()
           .find(message => message.role === 'assistant' && 'structured' in message && message.structured)
+        return previousAssistant && 'structured' in previousAssistant
+          ? previousAssistant.structured?.emotion
+          : undefined
+      }
 
-        const structured = normalizeStructuredOutput({
+      const runStructuredContractRetry = async (payload: {
+        reasoning: string
+        reply: string
+        fullText: string
+      }) => {
+        if (shouldAbort())
+          return null
+
+        const retryMessages: Message[] = [
+          {
+            role: 'system',
+            content: structuredRetrySystemPrompt,
+          },
+          {
+            role: 'user',
+            content: [
+              'Rewrite the draft assistant output into strict JSON contract.',
+              `User input:\n${sendingMessage}`,
+              `Assistant draft:\n${payload.reply || payload.fullText}`,
+              payload.reasoning.trim()
+                ? `Draft thought:\n${payload.reasoning.trim()}`
+                : '',
+            ].filter(Boolean).join('\n\n'),
+          },
+        ]
+
+        const sanitizedRetry = sanitizeForRemoteModel(retryMessages, { timeBudgetMs: 50, chunkSize: 2048 })
+        if (sanitizedRetry.blocked) {
+          await appendAliceAuditLog({
+            level: 'critical',
+            category: 'structured-output',
+            action: 'contract-retry-blocked',
+            message: 'Structured contract retry blocked by sanitize gateway.',
+            details: {
+              reason: sanitizedRetry.reason,
+              elapsedMs: sanitizedRetry.elapsedMs,
+            },
+          })
+          return null
+        }
+
+        let retryFullText = ''
+        try {
+          await llmStore.stream(options.model, options.chatProvider, sanitizedRetry.messages as Message[], {
+            headers,
+            supportsTools: false,
+            waitForTools: false,
+            abortSignal,
+            onStreamEvent: async (event: StreamEvent) => {
+              if (event.type === 'text-delta')
+                retryFullText += event.text
+              if (event.type === 'error')
+                throw event.error ?? new Error('Structured contract retry stream error')
+            },
+          })
+        }
+        catch (error) {
+          if (isAliceAbortError(error) || abortSignal.aborted)
+            throw error
+
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'structured-output',
+            action: 'contract-retry-failed',
+            message: 'Structured contract retry request failed.',
+            details: {
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          })
+          return null
+        }
+
+        const retriedStructured = normalizeStructuredOutput({
+          fullText: retryFullText,
+          thought: payload.reasoning,
+          reply: payload.reply,
+          previousEmotion: getPreviousAssistantEmotion(),
+        })
+
+        if (hasStructuredJsonContract(retriedStructured)) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'structured-output',
+            action: 'contract-retry-succeeded',
+            message: 'Structured contract retry succeeded with JSON output.',
+            details: {
+              parsePath: retriedStructured.parsePath,
+            },
+          })
+          return retriedStructured
+        }
+
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'structured-output',
+          action: 'contract-retry-unresolved',
+          message: 'Structured contract retry still did not produce JSON output.',
+          details: {
+            parsePath: retriedStructured.parsePath,
+          },
+        })
+
+        return null
+      }
+
+      const buildStructuredOutputWithGuard = async (payload: {
+        fullText: string
+        reasoning: string
+        reply: string
+      }): Promise<StructuredWithContract> => {
+        const normalized = normalizeStructuredOutput({
           fullText: payload.fullText,
           thought: payload.reasoning,
           reply: payload.reply,
-          previousEmotion: previousAssistant && 'structured' in previousAssistant
-            ? previousAssistant.structured?.emotion
-            : undefined,
+          previousEmotion: getPreviousAssistantEmotion(),
         })
 
+        if (hasStructuredJsonContract(normalized))
+          return normalized
+
+        const retried = await runStructuredContractRetry(payload)
+        if (retried)
+          return retried
+
+        const fallbackReply = payload.reply.trim() || payload.fullText.trim() || assistantStructuredContractFallbackReply
+        const fallback = createStructuredFallback(fallbackReply)
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'structured-output',
+          action: 'contract-fallback',
+          message: 'Structured contract failed after retry and switched to fallback-v1.',
+          details: {
+            parsePath: normalized.parsePath,
+          },
+        })
+        return fallback
+      }
+
+      const applyAssistantResult = async (payload: {
+        fullText: string
+        reasoning: string
+        reply: string
+        enforceContract?: boolean
+      }) => {
+        const structured = payload.enforceContract === false
+          ? createStructuredFallback(payload.reply.trim() || payload.fullText.trim() || assistantStructuredContractFallbackReply)
+          : await buildStructuredOutputWithGuard(payload)
+        const finalReply = structured.reply.trim() || payload.reply
+
         buildingMessage.categorization = {
-          speech: payload.reply,
+          speech: finalReply,
           reasoning: payload.reasoning,
         }
         buildingMessage.structured = structured
-        buildingMessage.content = payload.reply
-        buildingMessage.slices = replaceAssistantTextSlices(buildingMessage.slices, payload.reply)
-        finalAssistantDisplayText = payload.reply
+        buildingMessage.content = finalReply
+        buildingMessage.slices = replaceAssistantTextSlices(buildingMessage.slices, finalReply)
+        finalAssistantDisplayText = finalReply
         updateUI()
+      }
+
+      const appendConversationTurnRecord = async (assistantText: string) => {
+        if (!hasAliceBridge())
+          return
+
+        await getAliceBridge().appendConversationTurn({
+          sessionId,
+          userText: sendingMessage,
+          assistantText,
+          structured: buildingMessage.structured ? { ...buildingMessage.structured } : undefined,
+          createdAt: Date.now(),
+        }).catch(async (error) => {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'conversation',
+            action: 'append-turn-failed',
+            message: 'Failed to persist conversation turn into SQLite.',
+            details: {
+              sessionId,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          })
+        })
       }
 
       const persistBuiltAssistantMessage = () => {
@@ -517,11 +780,23 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             })
           }
 
-          applyAssistantResult({
+          await applyAssistantResult({
             fullText,
             reasoning: finalCategorization.reasoning,
             reply: finalSpeech,
           })
+
+          if (buildingMessage.structured?.repairTimedOut) {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'structured-output',
+              action: 'repair-timeout-fallback',
+              message: 'Structured output repair exceeded budget and fell back safely.',
+              details: {
+                parsePath: buildingMessage.structured.parsePath,
+              },
+            })
+          }
         },
         minLiteralEmitLength: 24,
       })
@@ -648,44 +923,54 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       await hooks.emitBeforeSendHooks(sendingMessage, streamingMessageContext)
 
       let fullText = ''
-      const headers = (options.providerConfig?.headers || {}) as Record<string, string>
 
       if (shouldAbort())
         return
 
-      if (realtimeIntent.needsRealtime) {
-        const preflight = await runRealtimeQueryPreflight({
-          intent: realtimeIntent,
-          timeoutMs: 1500,
-          listTools: async () => {
-            return await getMcpToolBridge().listTools()
+      if (origin === 'ui-user' && hasAliceBridge()) {
+        const realtimeExecution = await executionEngine.executeRealtimeQueryTurn({
+          origin,
+          message: sendingMessage,
+          abortSignal,
+          onStatus: (status) => {
+            buildingMessage.slices.push({
+              type: 'execution-status',
+              phase: status.phase,
+              label: status.label,
+              source: status.source,
+              category: status.category,
+            })
+            updateUI()
+          },
+          onAudit: async (entry) => {
+            await appendAliceAuditLog({
+              level: entry.level,
+              category: entry.category,
+              action: entry.action,
+              message: entry.message,
+              details: entry.details,
+            })
           },
         })
 
-        if (!preflight.allowed) {
-          await appendAliceAuditLog({
-            level: 'warning',
-            category: 'output-guard',
-            action: 'realtime-preflight-blocked',
-            message: 'Realtime query blocked because no suitable MCP tool is currently available.',
-            details: {
-              reason: preflight.reason,
-              categories: preflight.categories,
-              matchedCategories: preflight.matchedCategories,
-              availableToolCount: preflight.availableToolCount,
-            },
-          })
+        if (realtimeExecution.handled) {
+          if (abortSignal.aborted) {
+            throw abortSignal.reason ?? new DOMException('Aborted', 'AbortError')
+          }
 
-          applyAssistantResult({
-            fullText: assistantRealtimeUnavailableReply,
+          const reply = realtimeExecution.reply?.trim() || assistantRealtimeUnavailableReply
+          await applyAssistantResult({
+            fullText: reply,
             reasoning: '',
-            reply: assistantRealtimeUnavailableReply,
+            reply,
+            enforceContract: false,
           })
+          await appendConversationTurnRecord(finalAssistantDisplayText || reply)
           persistBuiltAssistantMessage()
-          await emitAssistantTurnHooks(assistantRealtimeUnavailableReply)
+          await emitAssistantTurnHooks(finalAssistantDisplayText || reply)
 
           if (isForegroundSession()) {
-            streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }
+            streamingMessage.value = createEmptyStreamingMessage()
           }
           return
         }
@@ -694,6 +979,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       await llmStore.stream(options.model, options.chatProvider, newMessages as Message[], {
         headers,
         tools: options.tools,
+        abortSignal,
         // NOTICE: xsai stream may emit `finish` before tool steps continue, so keep waiting until
         // the final non-tool finish to avoid ending the chat turn with no assistant reply.
         waitForTools: true,
@@ -739,17 +1025,64 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         || stringifyAssistantContent(buildingMessage.content)
         || fullText
 
+      await appendConversationTurnRecord(assistantOutputText)
+
       await emitAssistantTurnHooks(assistantOutputText)
 
       if (isForegroundSession()) {
-        streamingMessage.value = { role: 'assistant', content: '', slices: [], tool_results: [] }
+        streamingMessage.value = createEmptyStreamingMessage()
       }
     }
     catch (error) {
+      if (isAliceAbortError(error) || abortSignal.aborted || shouldAbort()) {
+        const abortReason = resolveAbortReason(error, isStaleGeneration())
+        const beforeLength = sessionMessagesForSend.length
+        if (userTurnMessageId) {
+          const nextMessages = sessionMessagesForSend.filter(item => item.id !== userTurnMessageId)
+          if (nextMessages.length !== sessionMessagesForSend.length) {
+            sessionMessagesForSend.splice(0, sessionMessagesForSend.length, ...nextMessages)
+            chatSession.persistSessionMessages(sessionId)
+          }
+        }
+
+        if (isForegroundSession()) {
+          streamingMessage.value = createEmptyStreamingMessage()
+        }
+
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-aborted',
+          message: 'Active chat turn aborted.',
+          details: {
+            sessionId,
+            turnId,
+            reason: abortReason,
+          },
+        })
+
+        const droppedCount = Math.max(0, beforeLength - sessionMessagesForSend.length)
+        if (droppedCount > 0) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'kill-switch',
+            action: 'turn-abort-dropped',
+            message: 'Dropped in-flight turn artifacts after abort.',
+            details: {
+              sessionId,
+              turnId,
+              droppedCount,
+            },
+          })
+        }
+        return
+      }
+
       console.error('Error sending message:', error)
       throw error
     }
     finally {
+      completeAliceTurnAbort(turnId)
       sending.value = false
     }
   }
@@ -804,18 +1137,78 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     return ingest(sendingMessage, options, forkSessionId || baseSessionId)
   }
 
-  function cancelPendingSends(sessionId?: string) {
+  function cancelPendingSends(sessionId?: string, reason = 'Chat session was reset before send could start') {
+    const error = new Error(reason)
     for (const queued of pendingQueuedSends.value) {
       if (sessionId && queued.sessionId !== sessionId)
         continue
 
       queued.cancelled = true
-      queued.deferred.reject(new Error('Chat session was reset before send could start'))
+      queued.deferred.reject(error)
     }
 
     pendingQueuedSends.value = sessionId
       ? pendingQueuedSends.value.filter(item => item.sessionId !== sessionId)
       : []
+  }
+
+  async function abortActiveTurns(reason: AliceAbortReason = 'kill-switch') {
+    const result = abortAliceTurns({ reason })
+    cancelPendingSends(undefined, `A.L.I.C.E turn aborted (${reason})`)
+    streamingMessage.value = createEmptyStreamingMessage()
+
+    if (result.aborted > 0) {
+      await appendAliceAuditLog({
+        level: 'notice',
+        category: 'kill-switch',
+        action: 'kill-switch-abort-broadcast',
+        message: 'Broadcasted turn abort to active pipelines.',
+        details: {
+          reason,
+          aborted: result.aborted,
+        },
+      })
+    }
+
+    return result
+  }
+
+  function registerPipelineAborter(aborter: ExternalPipelineAborter) {
+    externalPipelineAborters.add(aborter)
+    return () => {
+      externalPipelineAborters.delete(aborter)
+    }
+  }
+
+  async function abortAllPipelines(reason: AliceAbortReason = 'kill-switch') {
+    const turnAbortResult = await abortActiveTurns(reason)
+    const pipelines = [...externalPipelineAborters]
+    let pipelineErrors = 0
+
+    await Promise.all(pipelines.map(async (aborter) => {
+      try {
+        await aborter(reason)
+      }
+      catch (error) {
+        pipelineErrors += 1
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'kill-switch',
+          action: 'pipeline-abort-failed',
+          message: 'Failed to abort external pipeline during kill switch.',
+          details: {
+            reason,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+    }))
+
+    return {
+      ...turnAbortResult,
+      pipelineAborters: pipelines.length,
+      pipelineErrors,
+    }
   }
 
   return {
@@ -826,6 +1219,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     ingest,
     ingestOnFork,
     cancelPendingSends,
+    abortActiveTurns,
+    abortAllPipelines,
+    registerPipelineAborter,
 
     clearHooks: hooks.clearHooks,
 

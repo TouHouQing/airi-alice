@@ -16,11 +16,33 @@ export interface McpCallToolResult {
   structuredContent?: Record<string, unknown>
   toolResult?: unknown
   isError?: boolean
+  ok?: boolean
+  errorCode?: string
+  errorMessage?: string
+  durationMs?: number
+}
+
+export interface McpServerRuntimeStatus {
+  name: string
+  state: 'running' | 'stopped' | 'error'
+  command: string
+  args: string[]
+  pid: number | null
+  lastError?: string
+}
+
+export interface McpCapabilitiesSnapshot {
+  path: string
+  updatedAt: number
+  servers: McpServerRuntimeStatus[]
+  tools: McpToolDescriptor[]
+  healthyServers: number
 }
 
 interface McpToolBridge {
   listTools: () => Promise<McpToolDescriptor[]>
   callTool: (payload: McpCallToolPayload) => Promise<McpCallToolResult>
+  getCapabilitiesSnapshot?: () => Promise<McpCapabilitiesSnapshot>
 }
 
 let bridge: McpToolBridge | undefined
@@ -39,4 +61,20 @@ export function getMcpToolBridge(): McpToolBridge {
   }
 
   return bridge
+}
+
+export async function getMcpCapabilitiesSnapshot(): Promise<McpCapabilitiesSnapshot> {
+  const activeBridge = getMcpToolBridge()
+  if (activeBridge.getCapabilitiesSnapshot) {
+    return await activeBridge.getCapabilitiesSnapshot()
+  }
+
+  const tools = await activeBridge.listTools()
+  return {
+    path: '',
+    updatedAt: Date.now(),
+    servers: [],
+    tools,
+    healthyServers: 0,
+  }
 }

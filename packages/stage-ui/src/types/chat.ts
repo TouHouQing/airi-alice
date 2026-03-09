@@ -14,16 +14,24 @@ export interface ChatSlicesToolCall {
 export interface ChatSlicesToolCallResult {
   type: 'tool-call-result'
   id: string
-  result?: string | CommonContentPart[]
+  result?: unknown
 }
 
-export type ChatSlices = ChatSlicesText | ChatSlicesToolCall | ChatSlicesToolCallResult
+export interface ChatSlicesExecutionStatus {
+  type: 'execution-status'
+  phase: 'planning' | 'tool-running' | 'tool-failed' | 'completed'
+  label: string
+  source?: 'builtin' | 'mcp'
+  category?: 'news' | 'weather' | 'finance' | 'sports'
+}
+
+export type ChatSlices = ChatSlicesText | ChatSlicesToolCall | ChatSlicesToolCallResult | ChatSlicesExecutionStatus
 
 export interface ChatAssistantMessage extends AssistantMessage {
   slices: ChatSlices[]
   tool_results: {
     id: string
-    result?: string | CommonContentPart[]
+    result?: unknown
   }[]
   categorization?: {
     speech: string
@@ -37,6 +45,9 @@ export interface ChatAssistantMessage extends AssistantMessage {
     sentimentConfidenceRaw?: number
     sentimentConfidence?: number
     format: 'epoch1-v1' | 'fallback-v1'
+    parsePath?: 'json' | 'repair-json' | 'act' | 'fallback'
+    repairTimedOut?: boolean
+    contractFailed?: boolean
   }
 }
 
@@ -57,6 +68,7 @@ export interface ContextMessage extends ContextUpdate<Record<string, unknown>, s
 export type ChatHistoryItem = (ChatMessage | ErrorMessage) & { context?: ContextMessage } & { createdAt?: number, id?: string }
 
 export interface ChatStreamEventContext {
+  sessionId?: string
   message: ChatHistoryItem
   contexts: Record<string, ContextMessage[]>
   composedMessage: Array<Message>

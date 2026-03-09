@@ -7,6 +7,7 @@ import { clearAliceBridge, setAliceBridge } from '@proj-airi/stage-ui/stores/ali
 import { useAliceEpoch1Store } from '@proj-airi/stage-ui/stores/alice-epoch1'
 import { useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
 import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/character'
+import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
 import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
 import { usePluginHostInspectorStore } from '@proj-airi/stage-ui/stores/devtools/plugin-host-debug'
 import { useDisplayModelsStore } from '@proj-airi/stage-ui/stores/display-models'
@@ -14,6 +15,7 @@ import { clearMcpToolBridge, setMcpToolBridge } from '@proj-airi/stage-ui/stores
 import { useModsServerChannelStore } from '@proj-airi/stage-ui/stores/mods/api/channel-server'
 import { useContextBridgeStore } from '@proj-airi/stage-ui/stores/mods/api/context-bridge'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
+import { useHearingSpeechInputPipeline } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { usePerfTracerBridgeStore } from '@proj-airi/stage-ui/stores/perf-tracer-bridge'
 import { listProvidersForPluginHost, shouldPublishPluginHostCapabilities } from '@proj-airi/stage-ui/stores/plugin-host-capabilities'
 import { useSettings } from '@proj-airi/stage-ui/stores/settings'
@@ -30,6 +32,7 @@ import {
   aliceKillSwitchStateChanged,
   aliceSoulChanged,
   electronAliceAppendAuditLog,
+  electronAliceAppendConversationTurn,
   electronAliceBootstrap,
   electronAliceGetMemoryStats,
   electronAliceGetSoul,
@@ -40,12 +43,14 @@ import {
   electronAliceMemoryImportLegacy,
   electronAliceMemoryRetrieveFacts,
   electronAliceMemoryUpsertFacts,
+  electronAliceRealtimeExecute,
   electronAliceRunMemoryPrune,
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
   electronGetServerChannelConfig,
   electronMcpCallTool,
+  electronMcpGetCapabilitiesSnapshot,
   electronMcpListTools,
   electronOpenSettings,
   electronPluginInspect,
@@ -73,6 +78,8 @@ const router = useRouter()
 const route = useRoute()
 const cardStore = useAiriCardStore()
 const chatSessionStore = useChatSessionStore()
+const chatOrchestratorStore = useChatOrchestratorStore()
+const hearingSpeechInputPipeline = useHearingSpeechInputPipeline()
 const serverChannelStore = useModsServerChannelStore()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
 const aliceEpoch1Store = useAliceEpoch1Store()
@@ -97,6 +104,7 @@ const startTrackingCursorPoint = useElectronEventaInvoke(electronStartTrackMouse
 const reportPluginCapability = useElectronEventaInvoke(electronPluginUpdateCapability)
 const listMcpTools = useElectronEventaInvoke(electronMcpListTools)
 const callMcpTool = useElectronEventaInvoke(electronMcpCallTool)
+const getMcpCapabilitiesSnapshot = useElectronEventaInvoke(electronMcpGetCapabilitiesSnapshot)
 const setLocale = useElectronEventaInvoke(i18nSetLocale)
 const aliceBootstrap = useElectronEventaInvoke(electronAliceBootstrap)
 const aliceGetSoul = useElectronEventaInvoke(electronAliceGetSoul)
@@ -112,7 +120,9 @@ const aliceUpsertMemoryFacts = useElectronEventaInvoke(electronAliceMemoryUpsert
 const aliceImportLegacyMemory = useElectronEventaInvoke(electronAliceMemoryImportLegacy)
 const aliceRunMemoryPrune = useElectronEventaInvoke(electronAliceRunMemoryPrune)
 const aliceUpdateMemoryStats = useElectronEventaInvoke(electronAliceUpdateMemoryStats)
+const aliceAppendConversationTurn = useElectronEventaInvoke(electronAliceAppendConversationTurn)
 const aliceAppendAuditLog = useElectronEventaInvoke(electronAliceAppendAuditLog)
+const aliceRealtimeExecute = useElectronEventaInvoke(electronAliceRealtimeExecute)
 
 const showGenesisDialog = computed(() => aliceNeedsGenesis.value)
 const hasGenesisConflictCandidate = computed(() => Boolean(genesisConflictCandidate.value))
@@ -133,6 +143,7 @@ const genesisForm = ref({
 })
 const genesisError = ref('')
 const genesisLoading = ref(false)
+let unregisterPipelineAborter: (() => void) | undefined
 
 function getSoulBodyFromContent(content: string) {
   if (!content.startsWith('---\n'))
@@ -251,6 +262,7 @@ pluginHostInspectorStore.setBridge({
 setMcpToolBridge({
   listTools: () => listMcpTools(),
   callTool: payload => callMcpTool(payload),
+  getCapabilitiesSnapshot: () => getMcpCapabilitiesSnapshot(),
 })
 
 setAliceBridge({
@@ -268,7 +280,9 @@ setAliceBridge({
   retrieveMemoryFacts: payload => aliceRetrieveMemoryFacts(payload),
   upsertMemoryFacts: payload => aliceUpsertMemoryFacts(payload),
   importLegacyMemory: payload => aliceImportLegacyMemory(payload),
+  appendConversationTurn: payload => aliceAppendConversationTurn(payload),
   appendAuditLog: payload => aliceAppendAuditLog(payload),
+  realtimeExecute: payload => aliceRealtimeExecute(payload),
 })
 
 function prefillGenesisFormFromSoul() {
@@ -390,6 +404,10 @@ onMounted(async () => {
   await aliceEpoch1Store.initialize()
   await startTrackingCursorPoint()
 
+  unregisterPipelineAborter = chatOrchestratorStore.registerPipelineAborter(async () => {
+    await hearingSpeechInputPipeline.stopStreamingTranscription(true).catch(() => {})
+  })
+
   // Expose stage provider definitions to plugin host APIs.
   defineInvokeHandler(context.value, pluginProtocolListProviders, async () => listProvidersForPluginHost())
 
@@ -411,6 +429,7 @@ onMounted(async () => {
   context.value.on(aliceKillSwitchStateChanged, (event: any) => {
     aliceEpoch1Store.setKillSwitchSnapshot(event.body)
     if (event.body.state === 'SUSPENDED') {
+      void chatOrchestratorStore.abortAllPipelines('kill-switch')
       characterOrchestratorStore.stopTicker()
     }
     else {
@@ -428,6 +447,8 @@ watch(themeColorsHueDynamic, () => {
 }, { immediate: true })
 
 onUnmounted(() => {
+  unregisterPipelineAborter?.()
+  unregisterPipelineAborter = undefined
   aliceEpoch1Store.dispose()
   contextBridgeStore.dispose()
   clearAliceBridge()
