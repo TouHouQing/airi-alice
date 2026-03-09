@@ -63,11 +63,20 @@ type ExternalPipelineAborter = (reason: AliceAbortReason) => Promise<void> | voi
 
 const assistantLeakFallbackReply = '我刚才的检索结果混入了内部调用片段，已自动过滤。请你再说一次你的问题，我会直接给你整理后的结果。'
 const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外部数据。请稍后重试，或在设置里检查 MCP 实时工具是否可用。'
+const assistantEpoch1StrictFallbackReply = '抱歉，当前是 Epoch 1 受限模式，我无法访问外部实时数据源。你可以继续和我进行本地对话、设定与记忆整理。'
 const assistantStructuredContractFallbackReply = '我刚才没有稳定产出结构化结果，这一轮先按安全模式回复。'
+const aliceEpoch1StrictModeEnabled = true
 const structuredRetrySystemPrompt = [
   'Return ONLY one strict JSON object with keys: thought, emotion, reply.',
   'No markdown fences, no prose, no tool calls, no extra keys.',
   'The "emotion" value must be a short lowercase label, and "reply" must be natural language.',
+].join(' ')
+const strictRealtimeRefusalSystemPrompt = [
+  '[System Lock]',
+  'User request requires realtime external access, but current runtime is locked in Epoch 1 strict mode.',
+  'You must not call tools and must not claim you are calling APIs now.',
+  'Explain this limitation naturally in your current personality, one-shot, without promising delayed follow-up.',
+  'Keep response in strict JSON contract: thought, emotion, reply.',
 ].join(' ')
 
 function createEmptyStreamingMessage(): StreamingAssistantMessage {
@@ -85,7 +94,34 @@ interface TurnToolEvidence {
   verifiedToolResult: boolean
 }
 
-type StructuredWithContract = StructuredOutputResult & { contractFailed?: boolean }
+type StructuredWithContract = StructuredOutputResult & {
+  contractFailed?: boolean
+  policyLocked?: StructuredPolicyLock
+}
+type StructuredPolicyLock = 'epoch1-strict-realtime'
+
+function insertSystemMessageBeforeLatestUser(messages: Message[], systemText: string): Message[] {
+  let lastUserIndex = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user') {
+      lastUserIndex = index
+      break
+    }
+  }
+
+  const systemMessage: Message = {
+    role: 'system',
+    content: systemText,
+  }
+  if (lastUserIndex < 0)
+    return [...messages, systemMessage]
+
+  return [
+    ...messages.slice(0, lastUserIndex),
+    systemMessage,
+    ...messages.slice(lastUserIndex),
+  ]
+}
 
 function parseKillSwitchDirective(message: string): 'suspend' | 'resume' | null {
   const normalized = message.trim()
@@ -442,9 +478,11 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       chatSession.persistSessionMessages(sessionId)
 
       const origin = options.origin ?? 'ui-user'
+      const strictEpoch1Mode = aliceEpoch1StrictModeEnabled && hasAliceBridge()
       const realtimeIntent = hasAliceBridge() && origin === 'ui-user'
         ? detectRealtimeQueryIntent(sendingMessage)
         : detectRealtimeQueryIntent('')
+      let policyLockedReason: StructuredPolicyLock | undefined
       const turnToolEvidence: TurnToolEvidence = {
         toolCallCount: 0,
         toolResultCount: 0,
@@ -608,10 +646,14 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         reasoning: string
         reply: string
         enforceContract?: boolean
+        policyLocked?: StructuredPolicyLock
       }) => {
         const structured = payload.enforceContract === false
           ? createStructuredFallback(payload.reply.trim() || payload.fullText.trim() || assistantStructuredContractFallbackReply)
           : await buildStructuredOutputWithGuard(payload)
+        if (payload.policyLocked) {
+          structured.policyLocked = payload.policyLocked
+        }
         const finalReply = structured.reply.trim() || payload.reply
 
         buildingMessage.categorization = {
@@ -629,13 +671,42 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         if (!hasAliceBridge())
           return
 
+        if (abortSignal.aborted || shouldAbort()) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'kill-switch',
+            action: 'turn-write-skipped-aborted',
+            message: 'Skipped conversation turn persistence because current turn was aborted.',
+            details: {
+              sessionId,
+              turnId,
+            },
+          })
+          return
+        }
+
         await getAliceBridge().appendConversationTurn({
+          turnId,
           sessionId,
           userText: sendingMessage,
           assistantText,
           structured: buildingMessage.structured ? { ...buildingMessage.structured } : undefined,
           createdAt: Date.now(),
         }).catch(async (error) => {
+          if (isAliceAbortError(error) || abortSignal.aborted || shouldAbort()) {
+            await appendAliceAuditLog({
+              level: 'notice',
+              category: 'kill-switch',
+              action: 'turn-write-skipped-aborted',
+              message: 'Dropped conversation turn persistence due to abort in runtime write queue.',
+              details: {
+                sessionId,
+                turnId,
+              },
+            })
+            return
+          }
+
           await appendAliceAuditLog({
             level: 'warning',
             category: 'conversation',
@@ -713,14 +784,21 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             verifiedToolResult: turnToolEvidence.verifiedToolResult,
           })
           const emptyAfterSanitize = !sanitizedOutput.cleanText.trim()
-          const realtimeFallbackApplied = realtimeIntent.needsRealtime && !turnToolEvidence.verifiedToolResult
+          const realtimeFallbackApplied = realtimeIntent.needsRealtime
+            && !turnToolEvidence.verifiedToolResult
+            && !policyLockedReason
           const leakFallbackApplied = sanitizedOutput.leakDetected && emptyAfterSanitize
           const emptyOutputFallbackApplied = !realtimeFallbackApplied && !leakFallbackApplied && emptyAfterSanitize
-          const finalSpeech = realtimeFallbackApplied
-            ? assistantRealtimeUnavailableReply
-            : (leakFallbackApplied || emptyOutputFallbackApplied)
-                ? assistantLeakFallbackReply
-                : sanitizedOutput.cleanText
+          const sanitizeFallbackReply = policyLockedReason
+            ? assistantEpoch1StrictFallbackReply
+            : assistantLeakFallbackReply
+          let finalSpeech = sanitizedOutput.cleanText
+          if (realtimeFallbackApplied) {
+            finalSpeech = assistantRealtimeUnavailableReply
+          }
+          else if (leakFallbackApplied || emptyOutputFallbackApplied) {
+            finalSpeech = sanitizeFallbackReply
+          }
 
           if (sanitizedOutput.fabricationDetected) {
             await appendAliceAuditLog({
@@ -784,6 +862,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             fullText,
             reasoning: finalCategorization.reasoning,
             reply: finalSpeech,
+            policyLocked: policyLockedReason,
           })
 
           if (buildingMessage.structured?.repairTimedOut) {
@@ -851,6 +930,34 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
         const budgeted = applyPromptBudget(newMessages as Message[])
         newMessages = budgeted.messages as any
+        if (budgeted.report.safeMode.activated) {
+          await appendAliceAuditLog({
+            level: 'critical',
+            category: 'alice.budget',
+            action: 'overflow_soul',
+            message: 'SOUL exceeded prompt budget and safe mode degradation was applied.',
+            details: {
+              totalBeforeTokens: budgeted.report.totalBeforeTokens,
+              totalAfterTokens: budgeted.report.totalAfterTokens,
+              soulTokensBefore: budgeted.report.safeMode.soulTokensBefore,
+              soulTokensAfter: budgeted.report.safeMode.soulTokensAfter,
+              reason: budgeted.report.safeMode.reason,
+            },
+          })
+        }
+
+        if (!budgeted.report.anchorPreserved) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'prompt-budget',
+            action: 'anchor-mutated',
+            message: 'SOUL anchor message changed during budget processing unexpectedly.',
+            details: {
+              sections: budgeted.report.sections,
+            },
+          })
+        }
+
         if (budgeted.report.truncated) {
           await appendAliceAuditLog({
             level: 'notice',
@@ -926,6 +1033,97 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
       if (shouldAbort())
         return
+
+      if (origin === 'ui-user' && hasAliceBridge() && strictEpoch1Mode && realtimeIntent.needsRealtime) {
+        policyLockedReason = 'epoch1-strict-realtime'
+        const strictRealtimeContext = [
+          strictRealtimeRefusalSystemPrompt,
+          realtimeIntent.categories.length > 0
+            ? `Detected intent categories: ${realtimeIntent.categories.join(', ')}.`
+            : '',
+        ].filter(Boolean).join('\n')
+        const refusalMessages = insertSystemMessageBeforeLatestUser(newMessages as Message[], strictRealtimeContext)
+        streamingMessageContext.composedMessage = refusalMessages
+
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'realtime-policy',
+          action: 'epoch1-strict-realtime-blocked',
+          message: 'Blocked realtime execution in strict Epoch1 mode and switched to personality refusal path.',
+          details: {
+            sessionId,
+            turnId,
+            categories: realtimeIntent.categories,
+          },
+        })
+
+        try {
+          await llmStore.stream(options.model, options.chatProvider, refusalMessages, {
+            headers,
+            supportsTools: false,
+            waitForTools: false,
+            tools: [],
+            abortSignal,
+            onStreamEvent: async (event: StreamEvent) => {
+              switch (event.type) {
+                case 'text-delta':
+                  fullText += event.text
+                  await parser.consume(event.text)
+                  break
+                case 'tool-call':
+                case 'tool-result':
+                case 'finish':
+                  break
+                case 'error':
+                  throw event.error ?? new Error('Strict refusal stream error')
+              }
+            },
+          })
+
+          await parser.end()
+        }
+        catch (error) {
+          if (isAliceAbortError(error) || abortSignal.aborted) {
+            throw error
+          }
+
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'realtime-policy',
+            action: 'epoch1-strict-realtime-refusal-failed',
+            message: 'Strict realtime refusal LLM path failed, applied fixed fallback reply.',
+            details: {
+              sessionId,
+              turnId,
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          })
+
+          const fallbackReply = assistantEpoch1StrictFallbackReply
+          await applyAssistantResult({
+            fullText: fallbackReply,
+            reasoning: '',
+            reply: fallbackReply,
+            enforceContract: false,
+            policyLocked: policyLockedReason,
+          })
+        }
+
+        persistBuiltAssistantMessage()
+
+        const assistantOutputText = finalAssistantDisplayText
+          || buildingMessage.structured?.reply
+          || stringifyAssistantContent(buildingMessage.content)
+          || assistantEpoch1StrictFallbackReply
+
+        await appendConversationTurnRecord(assistantOutputText)
+        await emitAssistantTurnHooks(assistantOutputText)
+
+        if (isForegroundSession()) {
+          streamingMessage.value = createEmptyStreamingMessage()
+        }
+        return
+      }
 
       if (origin === 'ui-user' && hasAliceBridge()) {
         const realtimeExecution = await executionEngine.executeRealtimeQueryTurn({

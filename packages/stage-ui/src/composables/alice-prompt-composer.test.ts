@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { composeAlicePromptMessages } from './alice-prompt-composer'
 
 describe('alice prompt composer', () => {
-  it('strips legacy system messages and keeps a single system layer', () => {
+  it('strips legacy system messages and keeps dual system layers', () => {
     const inputMessages: Message[] = [
       { role: 'system', content: 'legacy-system' },
       { role: 'user', content: 'hello' },
@@ -20,13 +20,14 @@ describe('alice prompt composer', () => {
     })
 
     expect(result.messages[0]?.role).toBe('system')
-    expect(result.messages.filter(message => message.role === 'system')).toHaveLength(1)
+    expect(result.messages.filter(message => message.role === 'system')).toHaveLength(2)
     expect(String(result.messages[0]?.content)).toContain('# SOUL')
-    expect(String(result.messages[0]?.content)).toContain('AliceHost')
+    expect(String(result.messages[1]?.content)).toContain('AliceHost')
     expect(String(result.messages[0]?.content)).not.toContain('legacy-system')
+    expect(String(result.messages[1]?.content)).not.toContain('legacy-system')
   })
 
-  it('merges datetime and memory context into system layer', () => {
+  it('merges datetime and memory context into runtime system layer', () => {
     const result = composeAlicePromptMessages({
       messages: [{ role: 'user', content: 'ping' }],
       soulContent: '# SOUL',
@@ -56,9 +57,10 @@ describe('alice prompt composer', () => {
       },
     })
 
-    expect(result.messages.filter(message => message.role === 'system')).toHaveLength(1)
-    expect(String(result.messages[0]?.content)).toContain('Relevant memory facts:')
-    expect(String(result.messages[0]?.content)).toContain('Current datetime:')
+    expect(result.messages.filter(message => message.role === 'system')).toHaveLength(2)
+    expect(String(result.messages[0]?.content)).toContain('# SOUL')
+    expect(String(result.messages[1]?.content)).toContain('Relevant memory facts:')
+    expect(String(result.messages[1]?.content)).toContain('Current datetime:')
     expect(result.messages.at(-1)?.role).toBe('user')
   })
 })

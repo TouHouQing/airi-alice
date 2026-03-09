@@ -121,6 +121,7 @@ export interface AliceMemoryMigrationResult {
 }
 
 export interface AliceConversationTurnInput {
+  turnId?: string
   sessionId: string
   userText?: string
   assistantText?: string

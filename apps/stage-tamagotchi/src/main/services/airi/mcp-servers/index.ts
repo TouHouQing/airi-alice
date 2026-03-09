@@ -14,10 +14,12 @@ import type {
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { env } from 'node:process'
 
 import { useLogg } from '@guiiai/logg'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import { defineInvokeHandler } from '@moeru/eventa'
 import { app, shell } from 'electron'
 import { z } from 'zod'
@@ -77,6 +79,40 @@ function stringifyError(error: unknown) {
   return String(error)
 }
 
+export function isFallbackEligibleMcpError(error: unknown) {
+  if (error instanceof McpError) {
+    return error.code === ErrorCode.MethodNotFound || error.code === ErrorCode.InvalidParams
+  }
+
+  if (!error || typeof error !== 'object')
+    return false
+
+  const payload = error as { code?: unknown, message?: unknown, name?: unknown }
+  const code = typeof payload.code === 'number' ? payload.code : Number.NaN
+  if (code === ErrorCode.RequestTimeout || code === ErrorCode.ConnectionClosed || code === ErrorCode.InternalError) {
+    return false
+  }
+
+  if (code === ErrorCode.MethodNotFound || code === ErrorCode.InvalidParams) {
+    return true
+  }
+
+  const message = stringifyError(error)
+  if (!message)
+    return false
+
+  if (/\b(?:timeout|timed out|connection closed|network|unauthorized|forbidden|authentication|econn|enotfound)\b/i.test(message)) {
+    return false
+  }
+
+  return (
+    /\btool\b[\s\S]{1,120}\bnot\s+found\b/i.test(message)
+    || /\bmethod\s+not\s+found\b/i.test(message)
+    || /\binvalid\s+(?:params?|arguments?)\b/i.test(message)
+    || /\binput\s+validation\s+error\b/i.test(message)
+  )
+}
+
 function getConfigPath() {
   return join(app.getPath('userData'), 'mcp.json')
 }
@@ -108,35 +144,31 @@ function extractToolErrorMessage(content: Array<Record<string, unknown>> | undef
   return undefined
 }
 
-async function withTimeout<T>(task: Promise<T>, timeoutMsec: number, timeoutMessage: string): Promise<T> {
-  let timeoutId: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      task,
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMsec)
-      }),
-    ])
-  }
-  finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId)
-    }
+function createSpawnEnv(overrides?: Record<string, string>): Record<string, string> {
+  const baseEnv = Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  )
+  if (!overrides)
+    return baseEnv
+  return {
+    ...baseEnv,
+    ...overrides,
   }
 }
 
-function createSpawnEnv(overrides?: Record<string, string>): Record<string, string> {
-  const baseEnv = Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
-  if (!overrides) {
-    return baseEnv
-  }
-
-  const lastSeparatorIndex = toolName.lastIndexOf(toolNameSeparator)
-  if (lastSeparatorIndex <= 0 || lastSeparatorIndex === toolName.length - toolNameSeparator.length) {
+function resolveFallbackToolName(toolName: string) {
+  if (!toolName.trim())
     return undefined
-  }
 
-  return toolName.slice(lastSeparatorIndex + toolNameSeparator.length)
+  const normalizedToUnderscore = toolName.replace(/-/g, '_')
+  if (normalizedToUnderscore !== toolName)
+    return normalizedToUnderscore
+
+  const normalizedToHyphen = toolName.replace(/_/g, '-')
+  if (normalizedToHyphen !== toolName)
+    return normalizedToHyphen
+
+  return undefined
 }
 
 async function closeSession(session: McpServerSession) {
@@ -211,7 +243,7 @@ export function createMcpStdioManager(): McpStdioManager {
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args ?? [],
-      env: config.env,
+      env: createSpawnEnv(config.env),
       cwd: config.cwd,
       stderr: 'pipe',
     })
@@ -323,29 +355,8 @@ export function createMcpStdioManager(): McpStdioManager {
       throw new Error('A.L.I.C.E kill switch is suspended; MCP tool execution is disabled.')
     }
 
-    const normalizedRequestId = payload.requestId?.trim()
-    if (normalizedRequestId) {
-      pruneCompletedToolCalls()
-
-      const cached = completedToolCallsByRequestId.get(normalizedRequestId)
-      if (cached && cached.expiresAt > Date.now()) {
-        return cached.result
-      }
-
-      const inFlight = inFlightToolCallsByRequestId.get(normalizedRequestId)
-      if (inFlight) {
-        return inFlight
-      }
-    }
-
-    const executeCall = async (): Promise<ElectronMcpCallToolResult> => {
+    const executeCall = async (session: McpServerSession, toolName: string): Promise<ElectronMcpCallToolResult> => {
       const startedAt = Date.now()
-      const { serverName, toolName } = parseQualifiedToolName(payload.name)
-      const session = sessions.get(serverName)
-      if (!session) {
-        throw new Error(`mcp server is not running: ${serverName}`)
-      }
-
       const result = await session.client.callTool({
         name: toolName,
         arguments: payload.arguments ?? {},
@@ -358,8 +369,13 @@ export function createMcpStdioManager(): McpStdioManager {
       if ('content' in result && Array.isArray(result.content)) {
         normalized.content = result.content as Array<Record<string, unknown>>
       }
-      if ('structuredContent' in result) {
-        normalized.structuredContent = result.structuredContent
+      if (
+        'structuredContent' in result
+        && result.structuredContent != null
+        && typeof result.structuredContent === 'object'
+        && !Array.isArray(result.structuredContent)
+      ) {
+        normalized.structuredContent = result.structuredContent as Record<string, unknown>
       }
       if ('isError' in result && typeof result.isError === 'boolean') {
         normalized.isError = result.isError
@@ -374,9 +390,29 @@ export function createMcpStdioManager(): McpStdioManager {
 
       return normalized
     }
+
+    const { serverName, toolName } = parseQualifiedToolName(payload.name)
+    const session = sessions.get(serverName)
+    if (!session) {
+      throw new Error(`mcp server is not running: ${serverName}`)
+    }
+
+    try {
+      return await executeCall(session, toolName)
+    }
     catch (error) {
+      if (!isFallbackEligibleMcpError(error)) {
+        throw error
+      }
+
       const fallbackToolName = resolveFallbackToolName(toolName)
       if (!fallbackToolName || fallbackToolName === toolName) {
+        log.withFields({
+          serverName,
+          requestedToolName: toolName,
+          fallbackEligible: true,
+          fallbackAttempted: false,
+        }).warn('mcp tool call failed and no eligible fallback tool name could be resolved')
         throw error
       }
 
@@ -386,30 +422,24 @@ export function createMcpStdioManager(): McpStdioManager {
         fallbackToolName,
       }).warn('retrying mcp tool call with normalized tool name')
 
-      result = await session.client.callTool({
-        name: fallbackToolName,
-        arguments: payload.arguments ?? {},
-      }, undefined, {
-        timeout: mcpRequestTimeoutMsec,
-        maxTotalTimeout: mcpRequestMaxTotalTimeoutMsec,
-      })
+      try {
+        const fallbackResult = await executeCall(session, fallbackToolName)
+        log.withFields({
+          serverName,
+          requestedToolName: toolName,
+          fallbackToolName,
+        }).warn('mcp tool fallback call succeeded')
+        return fallbackResult
+      }
+      catch (fallbackError) {
+        log.withFields({
+          serverName,
+          requestedToolName: toolName,
+          fallbackToolName,
+        }).withError(fallbackError).warn('mcp tool fallback call failed')
+        throw fallbackError
+      }
     }
-
-    const normalized: ElectronMcpCallToolResult = {}
-    if ('content' in result && Array.isArray(result.content)) {
-      normalized.content = result.content as Array<Record<string, unknown>>
-    }
-    if ('structuredContent' in result && result.structuredContent && typeof result.structuredContent === 'object' && !Array.isArray(result.structuredContent)) {
-      normalized.structuredContent = result.structuredContent as Record<string, unknown>
-    }
-    if ('isError' in result && typeof result.isError === 'boolean') {
-      normalized.isError = result.isError
-    }
-    if ('toolResult' in result) {
-      normalized.toolResult = result.toolResult
-    }
-
-    return normalized
   }
 
   const getRuntimeStatus = (): ElectronMcpStdioRuntimeStatus => {

@@ -789,8 +789,23 @@ async function executeBuiltinRealtimeQuery(payload: AliceRealtimeExecutePayload)
   }
 }
 
-export async function setupAliceRuntime() {
-  const userDataPath = app.getPath('userData')
+function createAbortError(reason?: string) {
+  return new DOMException(`A.L.I.C.E runtime aborted: ${reason ?? 'unknown'}`, 'AbortError')
+}
+
+function isAbortError(error: unknown) {
+  return typeof error === 'object'
+    && error != null
+    && 'name' in error
+    && (error as { name?: unknown }).name === 'AbortError'
+}
+
+interface AliceRuntimeSetupOptions {
+  userDataPathOverride?: string
+}
+
+export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
+  const userDataPath = options?.userDataPathOverride ?? app.getPath('userData')
   const soulRoot = join(userDataPath, 'alice')
   const soulPath = join(soulRoot, 'SOUL.md')
   const legacyPromptProfilePath = join(soulRoot, 'prompt-profile.json')
@@ -807,6 +822,7 @@ export async function setupAliceRuntime() {
   let soulWatcher: import('node:fs').FSWatcher | undefined
   let pruneTimer: ReturnType<typeof setInterval> | undefined
   let muteWatchUntil = 0
+  const turnWriteAbortControllers = new Map<string, AbortController>()
 
   const emitSoulChanged = (snapshot: AliceSoulSnapshot) => {
     context.emit(aliceSoulChanged, snapshot)
@@ -823,6 +839,49 @@ export async function setupAliceRuntime() {
     catch (error) {
       console.warn('[alice-runtime] failed to append audit log:', error)
     }
+  }
+
+  function createTurnWriteAbortSignal(turnId?: string) {
+    const normalizedTurnId = turnId?.trim()
+    if (!normalizedTurnId)
+      return undefined
+
+    const existing = turnWriteAbortControllers.get(normalizedTurnId)
+    if (existing)
+      return existing.signal
+
+    const controller = new AbortController()
+    turnWriteAbortControllers.set(normalizedTurnId, controller)
+    return controller.signal
+  }
+
+  function releaseTurnWriteAbortController(turnId?: string) {
+    const normalizedTurnId = turnId?.trim()
+    if (!normalizedTurnId)
+      return
+    turnWriteAbortControllers.delete(normalizedTurnId)
+  }
+
+  async function abortAllTurnWrites(reason: string) {
+    let aborted = 0
+    for (const controller of turnWriteAbortControllers.values()) {
+      if (controller.signal.aborted)
+        continue
+      controller.abort(createAbortError(reason))
+      aborted += 1
+    }
+    turnWriteAbortControllers.clear()
+
+    await appendAuditLog({
+      level: 'notice',
+      category: 'kill-switch',
+      action: 'kill-switch-abort-broadcast',
+      message: 'Broadcasted kill switch abort to pending runtime turn writes.',
+      payload: {
+        reason,
+        aborted,
+      },
+    })
   }
 
   function sleep(ms: number) {
@@ -1219,6 +1278,7 @@ export async function setupAliceRuntime() {
 
   async function suspendKillSwitch(reason?: string) {
     const snapshot = setAliceKillSwitchState('SUSPENDED', reason)
+    await abortAllTurnWrites(reason ?? 'manual')
     emitKillSwitchChanged()
     await appendAuditLog({
       level: 'notice',
@@ -1305,7 +1365,61 @@ export async function setupAliceRuntime() {
   defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit))
   defineInvokeHandler(context, electronAliceMemoryUpsertFacts, async payload => await aliceDb.upsertMemoryFacts(payload.facts, payload.source))
   defineInvokeHandler(context, electronAliceMemoryImportLegacy, async payload => await aliceDb.importLegacyMemory(payload))
-  defineInvokeHandler(context, electronAliceAppendConversationTurn, async payload => await aliceDb.appendConversationTurn(payload))
+  defineInvokeHandler(context, electronAliceAppendConversationTurn, async (payload) => {
+    if (getAliceKillSwitchSnapshot().state === 'SUSPENDED') {
+      await appendAuditLog({
+        level: 'notice',
+        category: 'kill-switch',
+        action: 'turn-write-skipped-aborted',
+        message: 'Skipped conversation turn persistence because kill switch is suspended.',
+        payload: {
+          sessionId: payload.sessionId,
+          turnId: payload.turnId,
+        },
+      })
+      return
+    }
+
+    const signal = createTurnWriteAbortSignal(payload.turnId)
+    if (signal?.aborted) {
+      releaseTurnWriteAbortController(payload.turnId)
+      await appendAuditLog({
+        level: 'notice',
+        category: 'kill-switch',
+        action: 'turn-write-skipped-aborted',
+        message: 'Skipped conversation turn persistence because turn write signal was already aborted.',
+        payload: {
+          sessionId: payload.sessionId,
+          turnId: payload.turnId,
+        },
+      })
+      return
+    }
+
+    try {
+      await aliceDb.appendConversationTurn(payload, { signal })
+    }
+    catch (error) {
+      if (isAbortError(error) || signal?.aborted) {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-write-skipped-aborted',
+          message: 'Dropped conversation turn persistence due to abort before SQL execution.',
+          payload: {
+            sessionId: payload.sessionId,
+            turnId: payload.turnId,
+          },
+        })
+        return
+      }
+
+      throw error
+    }
+    finally {
+      releaseTurnWriteAbortController(payload.turnId)
+    }
+  })
   defineInvokeHandler(context, electronAliceAppendAuditLog, async payload => await aliceDb.appendAuditLog(payload))
   defineInvokeHandler(context, electronAliceRealtimeExecute, async (payload) => {
     const result = await executeBuiltinRealtimeQuery(payload)
@@ -1350,6 +1464,7 @@ export async function setupAliceRuntime() {
 
   onAppBeforeQuit(() => {
     stopWatch()
+    turnWriteAbortControllers.clear()
     if (pruneTimer) {
       clearInterval(pruneTimer)
       pruneTimer = undefined

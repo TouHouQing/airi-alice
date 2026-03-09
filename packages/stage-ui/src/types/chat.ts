@@ -48,6 +48,7 @@ export interface ChatAssistantMessage extends AssistantMessage {
     parsePath?: 'json' | 'repair-json' | 'act' | 'fallback'
     repairTimedOut?: boolean
     contractFailed?: boolean
+    policyLocked?: 'epoch1-strict-realtime'
   }
 }
 

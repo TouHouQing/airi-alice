@@ -3,6 +3,7 @@ import type { Message } from '@xsai/shared-chat'
 import { describe, expect, it } from 'vitest'
 
 import { applyPromptBudget, sanitizeAssistantOutputForDisplay, sanitizeForRemoteModel } from './alice-guardrails'
+import { composeAlicePromptMessages } from './alice-prompt-composer'
 
 describe('alice guardrails', () => {
   it('redacts sensitive values before outbound model call', () => {
@@ -85,10 +86,67 @@ describe('alice guardrails', () => {
 
     expect(report.truncated).toBe(true)
     expect(report.totalAfterTokens).toBeLessThanOrEqual(600)
+    expect(report.safeMode.activated).toBe(true)
+    expect(String(nextMessages[0]?.content)).toContain('# A.L.I.C.E. SOUL (SAFE MODE)')
 
     const currentTurn = nextMessages.at(-1)
     expect(currentTurn?.role).toBe('user')
     expect(typeof currentTurn?.content === 'string' ? currentTurn.content : JSON.stringify(currentTurn?.content)).toContain('修复登录流程')
+  })
+
+  it('keeps system[0] soul anchor unchanged across 10k budget rounds', () => {
+    const soul = [
+      '---',
+      JSON.stringify({
+        schemaVersion: 1,
+        initialized: true,
+        profile: {
+          ownerName: '主人',
+          hostName: '主人',
+          aliceName: 'A.L.I.C.E.',
+        },
+      }),
+      '---',
+      '# SOUL',
+      '你是 A.L.I.C.E.，始终保持温柔、克制、诚实。',
+    ].join('\n')
+
+    for (let round = 0; round < 10_000; round += 1) {
+      const composed = composeAlicePromptMessages({
+        messages: [
+          { role: 'assistant', content: '历史对话'.repeat(120) },
+          { role: 'user', content: `第 ${round} 轮：请记住我喜欢咖啡。` },
+        ],
+        soulContent: soul,
+        hostName: '主人',
+        contextsSnapshot: {},
+      })
+      const budgeted = applyPromptBudget(composed.messages, {
+        totalTokens: 1024,
+      })
+
+      expect(budgeted.messages[0]?.role).toBe('system')
+      expect(String(budgeted.messages[0]?.content)).toBe(soul)
+      expect(budgeted.report.anchorPreserved).toBe(true)
+      expect(budgeted.report.totalAfterTokens).toBeLessThanOrEqual(1024)
+    }
+  })
+
+  it('keeps soul anchor untouched when under budget and truncates history first', () => {
+    const soul = '---\n{"profile":{"aliceName":"A.L.I.C.E."}}\n---\n# SOUL\n核心人格设定'
+    const messages: Message[] = [
+      { role: 'system', content: soul },
+      { role: 'system', content: 'runtime constraints' },
+      { role: 'assistant', content: 'history'.repeat(1200) },
+      { role: 'user', content: '保留当前需求：修复登录 token 刷新' },
+    ]
+
+    const { messages: nextMessages, report } = applyPromptBudget(messages, { totalTokens: 900 })
+
+    expect(report.safeMode.activated).toBe(false)
+    expect(report.anchorPreserved).toBe(true)
+    expect(String(nextMessages[0]?.content)).toBe(soul)
+    expect(report.totalAfterTokens).toBeLessThanOrEqual(900)
   })
 
   it('removes leaked mcp tool payload text from assistant output', () => {

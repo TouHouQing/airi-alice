@@ -50,6 +50,10 @@ interface DbMemoryFactRow {
   access_count: number
 }
 
+interface DbWriteOptions {
+  signal?: AbortSignal
+}
+
 function clamp01(value: number) {
   if (Number.isNaN(value))
     return 0
@@ -116,6 +120,20 @@ function mapFactRow(row: DbMemoryFactRow): AliceMemoryFact {
 
 function now() {
   return Date.now()
+}
+
+function createAbortError(reason?: unknown) {
+  if (reason instanceof DOMException && reason.name === 'AbortError')
+    return reason
+  if (reason instanceof Error && reason.name === 'AbortError')
+    return reason
+  return new DOMException('Aborted before SQLite write execution', 'AbortError')
+}
+
+function assertWriteNotAborted(options?: DbWriteOptions) {
+  if (!options?.signal?.aborted)
+    return
+  throw createAbortError(options.signal.reason)
 }
 
 function openDatabase(filepath: string) {
@@ -215,7 +233,7 @@ export interface AliceDbService {
   dbPath: string
   close: () => Promise<void>
   appendAuditLog: (input: AliceAuditLogInput) => Promise<void>
-  appendConversationTurn: (input: AliceConversationTurnInput) => Promise<void>
+  appendConversationTurn: (input: AliceConversationTurnInput, options?: DbWriteOptions) => Promise<void>
   getMemoryStats: () => Promise<AliceMemoryStats>
   upsertMemoryFacts: (facts: AliceMemoryFactInput[], source: AliceMemorySource) => Promise<void>
   retrieveMemoryFacts: (query: string, limit?: number) => Promise<AliceMemoryFact[]>
@@ -234,8 +252,13 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
 
   let writeQueue = Promise.resolve<unknown>(undefined)
 
-  const enqueueWrite = async <T>(task: () => Promise<T>) => {
-    const next = writeQueue.then(task, task)
+  const enqueueWrite = async <T>(task: () => Promise<T>, options?: DbWriteOptions) => {
+    assertWriteNotAborted(options)
+    const guardedTask = async () => {
+      assertWriteNotAborted(options)
+      return await task()
+    }
+    const next = writeQueue.then(guardedTask, guardedTask)
     writeQueue = next.then(() => undefined, () => undefined)
     return await next
   }
@@ -288,6 +311,7 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
     await run(database, `
       CREATE TABLE IF NOT EXISTS conversation_turns (
         id TEXT PRIMARY KEY,
+        turn_id TEXT,
         session_id TEXT NOT NULL,
         user_text TEXT,
         assistant_text TEXT,
@@ -296,6 +320,8 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
       )
     `)
 
+    await run(database, 'ALTER TABLE conversation_turns ADD COLUMN turn_id TEXT').catch(() => {})
+    await run(database, 'CREATE INDEX IF NOT EXISTS idx_conversation_turns_turn_id ON conversation_turns(turn_id)')
     await run(database, 'CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_created_at ON conversation_turns(session_id, created_at DESC)')
 
     await run(database, `
@@ -393,31 +419,38 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
     })
   }
 
-  async function appendConversationTurn(input: AliceConversationTurnInput) {
+  async function appendConversationTurn(input: AliceConversationTurnInput, options?: DbWriteOptions) {
     const sessionId = input.sessionId.trim()
     if (!sessionId)
       throw new Error('sessionId is required')
 
+    assertWriteNotAborted(options)
     const createdAt = Number.isFinite(input.createdAt) ? Number(input.createdAt) : now()
+    const turnId = typeof input.turnId === 'string' && input.turnId.trim()
+      ? input.turnId.trim()
+      : null
     const userText = typeof input.userText === 'string' ? input.userText : null
     const assistantText = typeof input.assistantText === 'string' ? input.assistantText : null
     const structuredJson = input.structured ? JSON.stringify(input.structured) : null
 
     await enqueueWrite(async () => {
+      assertWriteNotAborted(options)
       await run(
         database,
         `
         INSERT INTO conversation_turns (
           id,
+          turn_id,
           session_id,
           user_text,
           assistant_text,
           structured_json,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         `,
         [
           randomUUID(),
+          turnId,
           sessionId,
           userText,
           assistantText,
@@ -425,7 +458,7 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
           createdAt,
         ],
       )
-    })
+    }, options)
   }
 
   async function upsertMemoryFacts(facts: AliceMemoryFactInput[], source: AliceMemorySource) {
