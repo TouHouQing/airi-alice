@@ -1,9 +1,20 @@
 import type { AliceMemoryLegacySnapshot } from '../../../shared/eventa'
 
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const runCalls: string[] = []
 const metaState = new Map<string, string>()
+const sandboxDirs: string[] = []
+
+async function createSandboxUserDataPath() {
+  const dir = await mkdtemp(join(tmpdir(), 'airi-alice-db-test-'))
+  sandboxDirs.push(dir)
+  return dir
+}
 
 class FakeSqliteDatabase {
   constructor(_path: string, callback: (error?: Error | null) => void) {
@@ -82,11 +93,20 @@ vi.mock('sqlite3', () => {
 const { setupAliceDb } = await import('./db')
 
 describe('alice sqlite dao', () => {
+  afterEach(async () => {
+    while (sandboxDirs.length > 0) {
+      const dir = sandboxDirs.pop()
+      if (!dir)
+        continue
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('initializes sqlite pragmas with WAL', async () => {
     runCalls.length = 0
     metaState.clear()
 
-    const db = await setupAliceDb('/tmp/airi-alice-test')
+    const db = await setupAliceDb(await createSandboxUserDataPath())
     expect(runCalls.some(sql => sql.includes('PRAGMA journal_mode = WAL'))).toBe(true)
     expect(runCalls.some(sql => sql.includes('PRAGMA busy_timeout = 2000'))).toBe(true)
     expect(await db.getJournalMode()).toBe('wal')
@@ -97,7 +117,7 @@ describe('alice sqlite dao', () => {
     runCalls.length = 0
     metaState.clear()
 
-    const db = await setupAliceDb('/tmp/airi-alice-test')
+    const db = await setupAliceDb(await createSandboxUserDataPath())
     const snapshot: AliceMemoryLegacySnapshot = {
       facts: [],
       archive: [],
@@ -111,6 +131,27 @@ describe('alice sqlite dao', () => {
     expect(second.migrated).toBe(false)
     expect(metaState.has('legacy_memory_migrated_v1')).toBe(true)
 
+    await db.close()
+  })
+
+  it('skips conversation turn write when signal is already aborted', async () => {
+    runCalls.length = 0
+    metaState.clear()
+
+    const db = await setupAliceDb(await createSandboxUserDataPath())
+    const controller = new AbortController()
+    controller.abort(new DOMException('Aborted for test', 'AbortError'))
+
+    await expect(db.appendConversationTurn({
+      turnId: 'chat:test:1',
+      sessionId: 'session-1',
+      userText: 'hello',
+      assistantText: 'world',
+    }, {
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: 'AbortError' })
+
+    expect(runCalls.some(sql => sql.includes('INSERT INTO conversation_turns'))).toBe(false)
     await db.close()
   })
 })

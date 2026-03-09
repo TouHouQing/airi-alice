@@ -31,6 +31,26 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
 }
 
+function normalizeBooleanEnv(value: unknown) {
+  if (typeof value !== 'string')
+    return false
+  return /^(?:1|true|yes|on)$/i.test(value.trim())
+}
+
+function isAliceDebugAuditEnabled() {
+  const envValue = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.ALICE_DEBUG_AUDIT
+  return normalizeBooleanEnv(envValue)
+}
+
+function createThoughtDigest(input: string) {
+  let hash = 2166136261
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 interface ExtractedAsyncFact {
   turnId?: string
   subject: string
@@ -396,6 +416,21 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
     pendingAsyncExtractionTurns.clear()
 
     try {
+      if (killSwitch.value.state === 'SUSPENDED') {
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'memory',
+          action: 'async-extractor-skipped',
+          message: 'Async memory extractor skipped because kill switch is suspended.',
+          details: {
+            batchSize: batch.length,
+            reason,
+            killSwitchState: killSwitch.value.state,
+          },
+        })
+        return
+      }
+
       if (asyncExtractionProvider === 'off') {
         await appendAliceAuditLog({
           level: 'notice',
@@ -632,6 +667,28 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
         const userText = parseUserText(context.message.content)
         const replyText = output.structured?.reply ?? parseUserText(output.content)
         const structured = output.structured
+        const turnId = output.id ?? context.message.id ?? nanoid()
+        const debugAuditEnabled = isAliceDebugAuditEnabled()
+
+        await appendAliceAuditLog({
+          level: 'info',
+          category: 'emotion',
+          action: 'assistant-turn-emotion',
+          message: 'Recorded assistant turn emotion telemetry.',
+          details: {
+            sessionId: context.sessionId,
+            turnId,
+            emotion: structured?.emotion ?? 'neutral',
+            parsePath: structured?.parsePath ?? 'fallback',
+            contractFailed: Boolean(structured?.contractFailed),
+            policyLocked: structured?.policyLocked ?? null,
+            format: structured?.format ?? 'fallback-v1',
+            thoughtDigest: structured?.thought ? createThoughtDigest(structured.thought) : undefined,
+            thought: debugAuditEnabled && structured?.thought
+              ? structured.thought
+              : undefined,
+          },
+        })
 
         if (structured?.contractFailed) {
           await appendAliceAuditLog({
@@ -641,8 +698,25 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
             message: 'Skipped personality drift and async memory extraction because contract failed.',
             details: {
               sessionId: context.sessionId,
+              turnId,
               parsePath: structured.parsePath,
               format: structured.format,
+            },
+          })
+          lastAssistantEmotion = structured.emotion || lastAssistantEmotion
+          return
+        }
+
+        if (structured?.policyLocked) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'policy-lock',
+            action: 'policy-locked-skip-learning',
+            message: 'Skipped personality drift and async memory extraction for policy-locked turn.',
+            details: {
+              sessionId: context.sessionId,
+              turnId,
+              policyLocked: structured.policyLocked,
             },
           })
           lastAssistantEmotion = structured.emotion || lastAssistantEmotion
@@ -673,7 +747,6 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
         }))
         await upsertFacts(extracted, 'rule')
 
-        const turnId = context.message.id ?? nanoid()
         enqueueAsyncExtractionTurn({
           sessionId: context.sessionId ?? 'unknown',
           turnId,

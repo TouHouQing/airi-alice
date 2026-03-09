@@ -143,7 +143,7 @@ const genesisForm = ref({
 })
 const genesisError = ref('')
 const genesisLoading = ref(false)
-let unregisterPipelineAborter: (() => void) | undefined
+const unregisterPipelineAborters: Array<() => void> = []
 
 function getSoulBodyFromContent(content: string) {
   if (!content.startsWith('---\n'))
@@ -404,9 +404,12 @@ onMounted(async () => {
   await aliceEpoch1Store.initialize()
   await startTrackingCursorPoint()
 
-  unregisterPipelineAborter = chatOrchestratorStore.registerPipelineAborter(async () => {
+  unregisterPipelineAborters.push(chatOrchestratorStore.registerPipelineAborter(async () => {
     await hearingSpeechInputPipeline.stopStreamingTranscription(true).catch(() => {})
-  })
+  }))
+  unregisterPipelineAborters.push(chatOrchestratorStore.registerPipelineAborter(async (reason) => {
+    await characterOrchestratorStore.abortAllPipelines(reason)
+  }))
 
   // Expose stage provider definitions to plugin host APIs.
   defineInvokeHandler(context.value, pluginProtocolListProviders, async () => listProvidersForPluginHost())
@@ -447,8 +450,9 @@ watch(themeColorsHueDynamic, () => {
 }, { immediate: true })
 
 onUnmounted(() => {
-  unregisterPipelineAborter?.()
-  unregisterPipelineAborter = undefined
+  while (unregisterPipelineAborters.length > 0) {
+    unregisterPipelineAborters.pop()?.()
+  }
   aliceEpoch1Store.dispose()
   contextBridgeStore.dispose()
   clearAliceBridge()

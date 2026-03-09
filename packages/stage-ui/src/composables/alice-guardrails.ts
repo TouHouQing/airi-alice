@@ -12,11 +12,20 @@ interface PromptBudgetSectionStats {
   afterTokens: number
 }
 
+interface PromptBudgetSafeModeReport {
+  activated: boolean
+  reason?: 'soul-overflow'
+  soulTokensBefore?: number
+  soulTokensAfter?: number
+}
+
 export interface PromptBudgetReport {
   truncated: boolean
   totalBeforeTokens: number
   totalAfterTokens: number
   droppedMessageCount: number
+  anchorPreserved: boolean
+  safeMode: PromptBudgetSafeModeReport
   sections: {
     soul: PromptBudgetSectionStats
     memory: PromptBudgetSectionStats
@@ -238,6 +247,99 @@ function getLastUserIndex(messages: Message[]) {
   return -1
 }
 
+function parseSoulFrontmatter(content: string) {
+  if (!content.startsWith('---\n'))
+    return null
+
+  const secondMarkerIndex = content.indexOf('\n---\n', 4)
+  if (secondMarkerIndex < 0)
+    return null
+
+  const frontmatterRaw = content.slice(4, secondMarkerIndex).trim()
+  if (!frontmatterRaw)
+    return null
+
+  try {
+    const parsed = JSON.parse(frontmatterRaw) as Record<string, unknown>
+    return parsed
+  }
+  catch {
+    return null
+  }
+}
+
+function readNestedString(payload: Record<string, unknown> | null, path: string[], fallback = '') {
+  if (!payload)
+    return fallback
+
+  let current: unknown = payload
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current))
+      return fallback
+    current = (current as Record<string, unknown>)[key]
+  }
+
+  return typeof current === 'string' ? current.trim() : fallback
+}
+
+function readNestedNumber(payload: Record<string, unknown> | null, path: string[], fallback = 0) {
+  if (!payload)
+    return fallback
+
+  let current: unknown = payload
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current))
+      return fallback
+    current = (current as Record<string, unknown>)[key]
+  }
+
+  if (typeof current === 'number' && Number.isFinite(current))
+    return current
+  if (typeof current === 'string' && current.trim()) {
+    const parsed = Number.parseFloat(current)
+    if (Number.isFinite(parsed))
+      return parsed
+  }
+
+  return fallback
+}
+
+function formatSafeModePercent(value: number) {
+  return Math.min(1, Math.max(0, value)).toFixed(2)
+}
+
+function buildSafeModeSoulAnchor(content: string) {
+  const frontmatter = parseSoulFrontmatter(content)
+  const ownerName = readNestedString(frontmatter, ['profile', 'ownerName'], '主人')
+  const hostName = readNestedString(frontmatter, ['profile', 'hostName'], ownerName || '主人')
+  const aliceName = readNestedString(frontmatter, ['profile', 'aliceName'], 'A.L.I.C.E.')
+  const relationship = readNestedString(frontmatter, ['profile', 'relationship'], '数字共生体')
+  const gender = readNestedString(frontmatter, ['profile', 'gender'], 'neutral')
+  const mindAge = readNestedNumber(frontmatter, ['profile', 'mindAge'], 15)
+  const obedience = readNestedNumber(frontmatter, ['personality', 'obedience'], 0.5)
+  const liveliness = readNestedNumber(frontmatter, ['personality', 'liveliness'], 0.5)
+  const sensibility = readNestedNumber(frontmatter, ['personality', 'sensibility'], 0.5)
+
+  return [
+    '# A.L.I.C.E. SOUL (SAFE MODE)',
+    '',
+    '[SYSTEM WARNING] SOUL context overflow detected. Current turn is running in safety degradation mode.',
+    '',
+    'Identity skeleton:',
+    `- Name: ${aliceName}`,
+    `- Host: ${hostName}`,
+    `- Relationship: ${relationship}`,
+    `- Gender: ${gender}`,
+    `- Mind age: ${Math.max(1, Math.floor(mindAge))}`,
+    `- Personality: obedience=${formatSafeModePercent(obedience)}, liveliness=${formatSafeModePercent(liveliness)}, sensibility=${formatSafeModePercent(sensibility)}`,
+    '',
+    'Output contract:',
+    '- Return one strict JSON object with keys: thought, emotion, reply.',
+    '- Never expose tool names, tool parameters JSON, function calls, or secrets.',
+    '- If realtime tool evidence is unavailable in current turn, state unavailability once and do not promise waiting.',
+  ].join('\n')
+}
+
 export function applyPromptBudget(messages: Message[], options?: PromptBudgetOptions): PromptBudgetResult {
   const cfg = {
     ...defaultPromptBudget,
@@ -245,14 +347,19 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
   }
 
   const totalBudget = Math.max(512, Math.floor(cfg.totalTokens))
-  const soulBudget = Math.floor(totalBudget * cfg.soulRatio)
+  const soulBudget = Math.max(256, Math.floor(totalBudget * cfg.soulRatio))
   const memoryBudget = Math.floor(totalBudget * cfg.memoryRatio)
   const currentTurnBudget = Math.max(256, totalBudget - soulBudget - memoryBudget)
+  const safeModeSoulThreshold = Math.max(256, totalBudget - currentTurnBudget)
 
   const result = cloneMessages(messages)
   const soulIndex = result.findIndex(message => message.role === 'system')
   const currentTurnIndex = getLastUserIndex(result)
-  const memoryIndex = result.findIndex(message => isMemoryMessage(message))
+  const memoryIndex = result.findIndex((message, index) => index !== soulIndex && isMemoryMessage(message))
+  let anchorPreserved = true
+  let safeMode: PromptBudgetSafeModeReport = {
+    activated: false,
+  }
 
   const sectionBefore = {
     soul: soulIndex >= 0 ? estimateMessageTokens(result[soulIndex]!) : 0,
@@ -260,10 +367,64 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     currentTurn: currentTurnIndex >= 0 ? estimateMessageTokens(result[currentTurnIndex]!) : 0,
   }
 
-  if (soulIndex >= 0) {
+  if (soulIndex >= 0 && sectionBefore.soul > safeModeSoulThreshold) {
     const soulText = readMessageText(result[soulIndex]!)
-    const nextSoulText = trimTextToTokenBudget(soulText, soulBudget, 'middle')
+    const nextSoulText = buildSafeModeSoulAnchor(soulText)
     result[soulIndex] = writeMessageText(result[soulIndex]!, nextSoulText)
+    safeMode = {
+      activated: true,
+      reason: 'soul-overflow',
+      soulTokensBefore: sectionBefore.soul,
+      soulTokensAfter: estimateTokens(nextSoulText),
+    }
+  }
+
+  if (safeMode.activated) {
+    const minimalMessages: Message[] = []
+    if (soulIndex >= 0 && result[soulIndex]) {
+      minimalMessages.push(result[soulIndex]!)
+    }
+    minimalMessages.push({
+      role: 'system',
+      content: '[SYSTEM NOTICE] Memory and history are skipped for this turn due to SOUL overflow safe mode.',
+    })
+
+    if (currentTurnIndex >= 0 && result[currentTurnIndex]) {
+      const currentText = readMessageText(result[currentTurnIndex]!)
+      const nextCurrentText = trimTextToTokenBudget(currentText, currentTurnBudget, 'tail')
+      minimalMessages.push(writeMessageText(result[currentTurnIndex]!, nextCurrentText))
+    }
+
+    const totalBefore = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0)
+    const totalAfter = minimalMessages.reduce((sum, message) => sum + estimateMessageTokens(message), 0)
+
+    return {
+      messages: minimalMessages,
+      report: {
+        truncated: totalAfter !== totalBefore,
+        totalBeforeTokens: totalBefore,
+        totalAfterTokens: totalAfter,
+        droppedMessageCount: Math.max(0, messages.length - minimalMessages.length),
+        anchorPreserved,
+        safeMode,
+        sections: {
+          soul: {
+            beforeTokens: sectionBefore.soul,
+            afterTokens: estimateMessageTokens(minimalMessages[0]!),
+          },
+          memory: {
+            beforeTokens: sectionBefore.memory,
+            afterTokens: 0,
+          },
+          currentTurn: {
+            beforeTokens: sectionBefore.currentTurn,
+            afterTokens: currentTurnIndex >= 0
+              ? estimateMessageTokens(minimalMessages[minimalMessages.length - 1]!)
+              : 0,
+          },
+        },
+      },
+    }
   }
 
   if (memoryIndex >= 0) {
@@ -276,6 +437,17 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     const currentText = readMessageText(result[currentTurnIndex]!)
     const nextCurrentText = trimTextToTokenBudget(currentText, currentTurnBudget, 'tail')
     result[currentTurnIndex] = writeMessageText(result[currentTurnIndex]!, nextCurrentText)
+  }
+
+  if (memoryIndex >= 0) {
+    const protectedSoulTokens = soulIndex >= 0 ? estimateMessageTokens(result[soulIndex]!) : 0
+    const protectedCurrentTokens = currentTurnIndex >= 0 ? estimateMessageTokens(result[currentTurnIndex]!) : 0
+    const maxMemoryTokens = Math.max(0, totalBudget - protectedSoulTokens - protectedCurrentTokens)
+    const currentMemoryText = readMessageText(result[memoryIndex]!)
+    if (estimateTokens(currentMemoryText) > maxMemoryTokens) {
+      const minimizedMemory = trimMemoryByConfidence(currentMemoryText, maxMemoryTokens)
+      result[memoryIndex] = writeMessageText(result[memoryIndex]!, minimizedMemory)
+    }
   }
 
   const isProtectedIndex = (index: number) => [soulIndex, memoryIndex, currentTurnIndex].includes(index)
@@ -299,6 +471,12 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     totalAfter -= removedTokens
   }
 
+  if (soulIndex >= 0 && result[soulIndex]) {
+    const anchorTextAfter = readMessageText(result[soulIndex]!)
+    const anchorTextBefore = readMessageText(messages[soulIndex]!)
+    anchorPreserved = anchorTextAfter === anchorTextBefore
+  }
+
   const sectionAfter = {
     soul: soulIndex >= 0 && result[soulIndex] ? estimateMessageTokens(result[soulIndex]!) : 0,
     memory: memoryIndex >= 0 && result[memoryIndex] ? estimateMessageTokens(result[memoryIndex]!) : 0,
@@ -319,6 +497,8 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
       totalBeforeTokens: totalBefore,
       totalAfterTokens: compacted.reduce((sum, message) => sum + estimateMessageTokens(message), 0),
       droppedMessageCount,
+      anchorPreserved,
+      safeMode,
       sections: {
         soul: {
           beforeTokens: sectionBefore.soul,

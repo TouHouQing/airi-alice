@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sparkCommandSchema, useCharacterOrchestratorStore } from '.'
 import { useCharacterStore } from '..'
+import { clearAliceBridge, setAliceBridge } from '../../alice-bridge'
 import { useLLM } from '../../llm'
 import { useAiriCardStore, useConsciousnessStore } from '../../modules'
 import { useProvidersStore } from '../../providers'
@@ -88,6 +89,29 @@ function getArraySchema(schema?: Record<string, any>) {
   return candidates.find((candidate: Record<string, any>) => candidate?.type === 'array')
 }
 
+function createAliceBridgeStub(overrides?: Record<string, unknown>) {
+  return {
+    bootstrap: vi.fn().mockResolvedValue(undefined),
+    getSoul: vi.fn().mockResolvedValue(undefined),
+    initializeGenesis: vi.fn().mockResolvedValue(undefined),
+    updateSoul: vi.fn().mockResolvedValue(undefined),
+    updatePersonality: vi.fn().mockResolvedValue(undefined),
+    getKillSwitchState: vi.fn().mockResolvedValue({ state: 'ACTIVE', updatedAt: Date.now() }),
+    suspendKillSwitch: vi.fn().mockResolvedValue(undefined),
+    resumeKillSwitch: vi.fn().mockResolvedValue(undefined),
+    getMemoryStats: vi.fn().mockResolvedValue(undefined),
+    runMemoryPrune: vi.fn().mockResolvedValue(undefined),
+    updateMemoryStats: vi.fn().mockResolvedValue(undefined),
+    retrieveMemoryFacts: vi.fn().mockResolvedValue(undefined),
+    upsertMemoryFacts: vi.fn().mockResolvedValue(undefined),
+    importLegacyMemory: vi.fn().mockResolvedValue(undefined),
+    appendConversationTurn: vi.fn().mockResolvedValue(undefined),
+    appendAuditLog: vi.fn().mockResolvedValue(undefined),
+    realtimeExecute: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  } as any
+}
+
 describe('sparkCommandSchema', () => {
   it('emits strict objects in the json schema', async () => {
     const sparkTool = await tool({
@@ -116,6 +140,7 @@ describe('sparkCommandSchema', () => {
 
 describe('store character-orchestrator', () => {
   beforeEach(() => {
+    clearAliceBridge()
     const pinia = createTestingPinia({ createSpy: vi.fn, stubActions: false })
     setActivePinia(pinia)
 
@@ -208,5 +233,38 @@ describe('store character-orchestrator', () => {
 
     expect(mockOnSparkNotifyReactionStreamEvent).toBeCalledWith(event.data.id, 'Ahhh, got hit by zombie!')
     expect(mockOnSparkNotifyReactionStreamEnd).toBeCalledTimes(1)
+  })
+
+  it('drops spark:notify immediately while kill switch is suspended', async () => {
+    const mockStream = vi.fn()
+    mockedStore(useLLM).stream = mockStream
+
+    setAliceBridge(createAliceBridgeStub({
+      getKillSwitchState: vi.fn().mockResolvedValue({
+        state: 'SUSPENDED',
+        reason: 'test',
+        updatedAt: Date.now(),
+      }),
+    }))
+
+    const store = useCharacterOrchestratorStore()
+    const event: WebSocketEventOf<'spark:notify'> = {
+      type: 'spark:notify',
+      source: 'minecraft',
+      data: {
+        id: nanoid(),
+        eventId: nanoid(),
+        kind: 'alarm',
+        urgency: 'immediate',
+        headline: 'Hit by zombie',
+        destinations: ['character'],
+      },
+    }
+
+    const result = await store.handleSparkNotify(event)
+    expect(result).toBeUndefined()
+    expect(mockStream).toBeCalledTimes(0)
+    expect(store.pendingNotifies).toHaveLength(0)
+    expect(store.scheduledNotifies).toHaveLength(0)
   })
 })

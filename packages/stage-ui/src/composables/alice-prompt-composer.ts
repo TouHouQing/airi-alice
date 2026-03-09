@@ -89,19 +89,20 @@ export function composeAlicePromptMessages(input: {
   contextsSnapshot?: Record<string, ContextMessage[]>
 }) {
   const nextMessages = stripLegacySystemMessages(input.messages)
-  const systemSections: string[] = []
+  const anchorSystemSections: string[] = []
+  const runtimeSystemSections: string[] = []
   const soulContent = input.soulContent?.trim()
   const hostName = input.hostName?.trim()
 
   if (soulContent)
-    systemSections.push(soulContent)
+    anchorSystemSections.push(soulContent)
 
   if (aliceFixedCoreSystemInstruction.trim()) {
-    systemSections.push(aliceFixedCoreSystemInstruction.trim())
+    runtimeSystemSections.push(aliceFixedCoreSystemInstruction.trim())
   }
 
   if (hostName) {
-    systemSections.push(renderAlicePromptTemplate(aliceFixedHostNameDirectiveTemplate, {
+    runtimeSystemSections.push(renderAlicePromptTemplate(aliceFixedHostNameDirectiveTemplate, {
       hostName,
       source: 'host',
       content: '',
@@ -112,14 +113,21 @@ export function composeAlicePromptMessages(input: {
 
   const contextSections = buildAliceContextSections(input.contextsSnapshot ?? {})
   if (contextSections.length > 0) {
-    systemSections.push(contextSections.join('\n\n'))
+    runtimeSystemSections.push(contextSections.join('\n\n'))
   }
 
   const finalMessages: Message[] = []
-  if (systemSections.length > 0) {
+  if (anchorSystemSections.length > 0) {
     finalMessages.push({
       role: 'system',
-      content: systemSections.join('\n\n'),
+      content: anchorSystemSections.join('\n\n'),
+    })
+  }
+
+  if (runtimeSystemSections.length > 0) {
+    finalMessages.push({
+      role: 'system',
+      content: runtimeSystemSections.join('\n\n'),
     })
   }
 

@@ -40,7 +40,9 @@ function sanitizeMessages(messages: unknown[]): Message[] {
 }
 
 function streamOptionsToolsCompatibilityOk(model: string, chatProvider: ChatProvider, _: Message[], options?: StreamOptions): boolean {
-  return !!(options?.supportsTools || options?.toolsCompatibility?.get(`${chatProvider.chat(model).baseURL}-${model}`))
+  if (typeof options?.supportsTools === 'boolean')
+    return options.supportsTools
+  return Boolean(options?.toolsCompatibility?.get(`${chatProvider.chat(model).baseURL}-${model}`))
 }
 
 async function streamFrom(model: string, chatProvider: ChatProvider, messages: Message[], options?: StreamOptions) {

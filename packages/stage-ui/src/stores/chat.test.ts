@@ -1,0 +1,307 @@
+import { createTestingPinia } from '@pinia/testing'
+import { setActivePinia } from 'pinia'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ref } from 'vue'
+
+import { clearAliceBridge, setAliceBridge } from './alice-bridge'
+import { useChatOrchestratorStore } from './chat'
+
+const streamMock = vi.fn()
+const executeRealtimeQueryTurnMock = vi.fn()
+const appendConversationTurnMock = vi.fn()
+const appendAuditLogMock = vi.fn()
+
+const activeSessionId = ref('session-test')
+const streamingMessage = ref({
+  role: 'assistant',
+  content: '',
+  slices: [],
+  tool_results: [],
+})
+const sessionMessagesMap = new Map<string, any[]>()
+
+function ensureSessionMessages(sessionId: string) {
+  if (!sessionMessagesMap.has(sessionId))
+    sessionMessagesMap.set(sessionId, [])
+  return sessionMessagesMap.get(sessionId)!
+}
+
+vi.mock('../composables', () => ({
+  useAnalytics: () => ({
+    trackFirstMessage: vi.fn(),
+  }),
+}))
+
+vi.mock('./llm', () => ({
+  useLLM: () => ({
+    stream: streamMock,
+    discoverToolsCompatibility: vi.fn(),
+  }),
+}))
+
+vi.mock('./alice-execution-engine', () => ({
+  useAliceExecutionEngineStore: () => ({
+    executeRealtimeQueryTurn: executeRealtimeQueryTurnMock,
+  }),
+}))
+
+vi.mock('./chat/session-store', () => ({
+  useChatSessionStore: () => ({
+    activeSessionId,
+    ensureSession: (sessionId: string) => {
+      ensureSessionMessages(sessionId)
+    },
+    getSessionMessages: (sessionId: string) => ensureSessionMessages(sessionId),
+    persistSessionMessages: vi.fn(),
+    getSessionGeneration: vi.fn().mockReturnValue(0),
+    forkSession: vi.fn().mockResolvedValue('session-test-fork'),
+  }),
+}))
+
+vi.mock('./chat/stream-store', () => ({
+  useChatStreamStore: () => ({
+    streamingMessage,
+  }),
+}))
+
+vi.mock('./chat/context-store', () => ({
+  useChatContextStore: () => ({
+    ingestContextMessage: vi.fn(),
+    getContextsSnapshot: () => ({}),
+  }),
+}))
+
+vi.mock('./chat/context-providers', () => ({
+  createDatetimeContext: () => ({
+    id: 'ctx-datetime',
+    contextId: 'system:datetime',
+    strategy: 'replace-self',
+    text: '{}',
+    createdAt: Date.now(),
+  }),
+}))
+
+vi.mock('./modules/consciousness', () => ({
+  useConsciousnessStore: () => ({
+    activeProvider: ref('mock-provider'),
+  }),
+}))
+
+vi.mock('./chat/hooks', () => ({
+  createChatHooks: () => {
+    const noopAsync = async () => {}
+    const noopDispose = () => () => {}
+    return {
+      clearHooks: vi.fn(),
+      emitBeforeMessageComposedHooks: noopAsync,
+      emitAfterMessageComposedHooks: noopAsync,
+      emitBeforeSendHooks: noopAsync,
+      emitAfterSendHooks: noopAsync,
+      emitTokenLiteralHooks: noopAsync,
+      emitTokenSpecialHooks: noopAsync,
+      emitStreamEndHooks: noopAsync,
+      emitAssistantResponseEndHooks: noopAsync,
+      emitAssistantMessageHooks: noopAsync,
+      emitChatTurnCompleteHooks: noopAsync,
+      onBeforeMessageComposed: noopDispose(),
+      onAfterMessageComposed: noopDispose(),
+      onBeforeSend: noopDispose(),
+      onAfterSend: noopDispose(),
+      onTokenLiteral: noopDispose(),
+      onTokenSpecial: noopDispose(),
+      onStreamEnd: noopDispose(),
+      onAssistantResponseEnd: noopDispose(),
+      onAssistantMessage: noopDispose(),
+      onChatTurnComplete: noopDispose(),
+    }
+  },
+}))
+
+vi.mock('../composables/alice-prompt-composer', () => ({
+  composeAlicePromptMessages: ({ messages, soulContent }: { messages: any[], soulContent?: string | null }) => ({
+    messages: [
+      {
+        role: 'system',
+        content: soulContent || '# SOUL',
+      },
+      ...messages.filter(message => message.role !== 'system'),
+    ],
+  }),
+}))
+
+vi.mock('../composables/alice-guardrails', () => ({
+  applyPromptBudget: (messages: any[]) => ({
+    messages,
+    report: {
+      truncated: false,
+      totalBeforeTokens: 0,
+      totalAfterTokens: 0,
+      droppedMessageCount: 0,
+      anchorPreserved: true,
+      safeMode: {
+        activated: false,
+      },
+      sections: {
+        soul: { beforeTokens: 0, afterTokens: 0 },
+        memory: { beforeTokens: 0, afterTokens: 0 },
+        currentTurn: { beforeTokens: 0, afterTokens: 0 },
+      },
+    },
+  }),
+  sanitizeAssistantOutputForDisplay: (text: string) => ({
+    cleanText: text,
+    leakDetected: false,
+    fabricationDetected: false,
+    removedCount: 0,
+    fabricationRemovedCount: 0,
+    redactedSecrets: 0,
+  }),
+  sanitizeForRemoteModel: (messages: any[]) => ({
+    blocked: false,
+    messages,
+    redactions: 0,
+    elapsedMs: 0,
+  }),
+}))
+
+vi.mock('../composables/response-categoriser', () => ({
+  createStreamingCategorizer: () => ({
+    consume: vi.fn(),
+    filterToSpeech: (text: string) => text,
+  }),
+  categorizeResponse: (fullText: string) => ({
+    speech: fullText,
+    reasoning: '',
+  }),
+}))
+
+vi.mock('../composables/llm-marker-parser', () => ({
+  useLlmmarkerParser: (handlers: {
+    onLiteral: (literal: string) => Promise<void>
+    onEnd: (fullText: string) => Promise<void>
+  }) => {
+    let accumulated = ''
+    return {
+      consume: async (text: string) => {
+        accumulated += text
+        await handlers.onLiteral(text)
+      },
+      end: async () => {
+        await handlers.onEnd(accumulated)
+      },
+    }
+  },
+}))
+
+function createChatProviderStub() {
+  return {
+    chat: () => ({
+      baseURL: 'https://example.test',
+    }),
+  } as any
+}
+
+function installAliceBridge() {
+  appendConversationTurnMock.mockResolvedValue(undefined)
+  appendAuditLogMock.mockResolvedValue(undefined)
+  setAliceBridge({
+    bootstrap: vi.fn(),
+    getSoul: vi.fn().mockResolvedValue({
+      content: '# SOUL\nA.L.I.C.E',
+      frontmatter: {
+        profile: {
+          hostName: '主人',
+        },
+      },
+    }),
+    initializeGenesis: vi.fn(),
+    updateSoul: vi.fn(),
+    updatePersonality: vi.fn(),
+    getKillSwitchState: vi.fn().mockResolvedValue({
+      state: 'ACTIVE',
+      updatedAt: Date.now(),
+    }),
+    suspendKillSwitch: vi.fn(),
+    resumeKillSwitch: vi.fn(),
+    getMemoryStats: vi.fn(),
+    runMemoryPrune: vi.fn(),
+    updateMemoryStats: vi.fn(),
+    retrieveMemoryFacts: vi.fn(),
+    upsertMemoryFacts: vi.fn(),
+    importLegacyMemory: vi.fn(),
+    appendConversationTurn: appendConversationTurnMock,
+    appendAuditLog: appendAuditLogMock,
+    realtimeExecute: vi.fn(),
+  } as any)
+}
+
+describe('chat orchestrator (alice epoch1 strict)', () => {
+  beforeEach(() => {
+    const pinia = createTestingPinia({ createSpy: vi.fn, stubActions: false })
+    setActivePinia(pinia)
+    clearAliceBridge()
+    installAliceBridge()
+
+    streamMock.mockReset()
+    executeRealtimeQueryTurnMock.mockReset()
+    appendConversationTurnMock.mockReset()
+    appendAuditLogMock.mockReset()
+    appendConversationTurnMock.mockResolvedValue(undefined)
+    appendAuditLogMock.mockResolvedValue(undefined)
+    executeRealtimeQueryTurnMock.mockResolvedValue({ handled: false })
+    sessionMessagesMap.clear()
+    ensureSessionMessages(activeSessionId.value)
+  })
+
+  it('uses strict personality-refusal path for realtime queries without execution engine', async () => {
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      expect(options.supportsTools).toBe(false)
+      expect(options.waitForTools).toBe(false)
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"当前权限受限","emotion":"neutral","reply":"抱歉，我在 Epoch 1 阶段无法访问实时外部数据。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+    executeRealtimeQueryTurnMock.mockResolvedValue({ handled: false })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('请帮我查一下今天美国天气', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(executeRealtimeQueryTurnMock).toBeCalledTimes(0)
+    expect(streamMock).toBeCalledTimes(1)
+    expect(appendConversationTurnMock).toBeCalledTimes(1)
+    const payload = appendConversationTurnMock.mock.calls[0]?.[0]
+    expect(payload?.structured?.policyLocked).toBe('epoch1-strict-realtime')
+    expect(payload?.assistantText).toContain('Epoch 1')
+  })
+
+  it('drops in-flight turn persistence after kill-switch abort', async () => {
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      await new Promise<void>((resolve, reject) => {
+        options.abortSignal?.addEventListener('abort', () => {
+          reject(options.abortSignal.reason ?? new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    })
+
+    const store = useChatOrchestratorStore()
+    const pending = store.ingest('你好，帮我总结一下今天计划', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    await vi.waitFor(() => {
+      expect(streamMock).toBeCalledTimes(1)
+    })
+    await store.abortAllPipelines('kill-switch').catch(() => {})
+    await expect(pending).rejects.toThrow('A.L.I.C.E turn aborted')
+
+    expect(appendConversationTurnMock).toBeCalledTimes(0)
+  })
+})

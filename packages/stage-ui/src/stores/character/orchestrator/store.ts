@@ -4,7 +4,8 @@ import { defineStore, storeToRefs } from 'pinia'
 import { ref } from 'vue'
 
 import { useCharacterNotebookStore, useCharacterStore } from '../'
-import { completeAliceTurnAbort, isAliceAbortError, registerAliceTurnAbort } from '../../../composables/alice-turn-abort'
+import { abortAliceTurns, completeAliceTurnAbort, isAliceAbortError, registerAliceTurnAbort } from '../../../composables/alice-turn-abort'
+import { getAliceBridge, hasAliceBridge } from '../../alice-bridge'
 import { useLLM } from '../../llm'
 import { useModsServerChannelStore } from '../../mods/api/channel-server'
 import { useConsciousnessStore } from '../../modules/consciousness'
@@ -52,6 +53,46 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
     getPending: () => pendingNotifies.value,
     setPending: next => pendingNotifies.value = next,
   })
+
+  async function appendAliceAuditLog(payload: {
+    level: 'info' | 'notice' | 'warning' | 'critical'
+    category: string
+    action: string
+    message: string
+    details?: Record<string, unknown>
+  }) {
+    if (!hasAliceBridge())
+      return
+
+    await getAliceBridge().appendAuditLog({
+      level: payload.level,
+      category: payload.category,
+      action: payload.action,
+      message: payload.message,
+      payload: payload.details,
+    }).catch(() => {})
+  }
+
+  async function isKillSwitchSuspended() {
+    if (!hasAliceBridge())
+      return false
+    const state = await getAliceBridge().getKillSwitchState().catch(() => null)
+    return state?.state === 'SUSPENDED'
+  }
+
+  async function dropSparkNotifyBecauseSuspended(event: WebSocketEventOf<'spark:notify'>, source: 'incoming' | 'tick') {
+    await appendAliceAuditLog({
+      level: 'notice',
+      category: 'kill-switch',
+      action: 'spark-notify-dropped-suspended',
+      message: 'Dropped spark:notify because kill switch is suspended.',
+      details: {
+        source,
+        eventId: event.data.id,
+        urgency: event.data.urgency,
+      },
+    })
+  }
 
   function computeNextRunAt(event: WebSocketEventOf<'spark:notify'>, attempts: number) {
     const now = Date.now()
@@ -116,6 +157,11 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
   }
 
   async function handleIncomingSparkNotify(event: WebSocketEventOf<'spark:notify'>) {
+    if (await isKillSwitchSuspended()) {
+      await dropSparkNotifyBecauseSuspended(event, 'incoming')
+      return undefined
+    }
+
     if (event.data.urgency === 'immediate' && !processing.value) {
       return await processSparkNotify(event)
     }
@@ -168,6 +214,11 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
     const [next] = scheduledNotifies.value.splice(nextIndex, 1)
     removePending(next.event.data.id)
 
+    if (await isKillSwitchSuspended()) {
+      await dropSparkNotifyBecauseSuspended(next.event, 'tick')
+      return
+    }
+
     try {
       await processSparkNotify(next.event)
     }
@@ -204,6 +255,34 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
 
     clearInterval(tickTimer)
     tickTimer = undefined
+  }
+
+  async function abortAllPipelines(reason: 'kill-switch' | 'session-reset' | 'manual' | 'shutdown' | 'unknown' = 'kill-switch') {
+    const result = abortAliceTurns({ reason, scope: 'spark' })
+
+    const droppedPending = pendingNotifies.value.length
+    const droppedScheduled = scheduledNotifies.value.length
+    pendingNotifies.value = []
+    scheduledNotifies.value = []
+
+    await appendAliceAuditLog({
+      level: 'notice',
+      category: 'kill-switch',
+      action: 'spark-pipelines-aborted',
+      message: 'Aborted spark pipelines and dropped queued spark:notify tasks.',
+      details: {
+        reason,
+        aborted: result.aborted,
+        droppedPending,
+        droppedScheduled,
+      },
+    })
+
+    return {
+      aborted: result.aborted,
+      droppedPending,
+      droppedScheduled,
+    }
   }
 
   async function handleSparkEmit(_: WebSocketBaseEvent<'spark:emit', WebSocketEvents['spark:emit']>) {
@@ -245,5 +324,6 @@ export const useCharacterOrchestratorStore = defineStore('character-orchestrator
 
     handleSparkNotify: handleIncomingSparkNotify,
     handleSparkEmit,
+    abortAllPipelines,
   }
 })
