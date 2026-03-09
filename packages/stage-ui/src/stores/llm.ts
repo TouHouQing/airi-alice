@@ -1,5 +1,5 @@
 import type { ChatProvider } from '@xsai-ext/providers/utils'
-import type { CommonContentPart, CompletionToolCall, Message, Tool } from '@xsai/shared-chat'
+import type { CompletionToolCall, Message, Tool } from '@xsai/shared-chat'
 
 import { listModels } from '@xsai/model'
 import { XSAIError } from '@xsai/shared'
@@ -13,7 +13,7 @@ export type StreamEvent
   = | { type: 'text-delta', text: string }
     | ({ type: 'finish' } & any)
     | ({ type: 'tool-call' } & CompletionToolCall)
-    | { type: 'tool-result', toolCallId: string, result?: string | CommonContentPart[] }
+    | { type: 'tool-result', toolCallId: string, result?: unknown }
     | { type: 'error', error: any }
 
 export interface StreamOptions {
@@ -23,6 +23,7 @@ export interface StreamOptions {
   supportsTools?: boolean
   waitForTools?: boolean // when true,won't resolve on finishReason=='tool_calls';
   tools?: Tool[] | (() => Promise<Tool[] | undefined>)
+  abortSignal?: AbortSignal
 }
 
 function createToolsCompatibilityKey(model: string, chatProvider: ChatProvider): string {
@@ -136,6 +137,7 @@ async function streamFrom(model: string, chatProvider: ChatProvider, messages: M
         parallelToolCalls: false,
         messages: sanitized,
         headers,
+        abortSignal: options?.abortSignal,
         // TODO: we need Automatic tools discovery
         tools,
         onEvent,

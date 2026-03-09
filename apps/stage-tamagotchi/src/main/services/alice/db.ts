@@ -1,5 +1,6 @@
 import type {
   AliceAuditLogInput,
+  AliceConversationTurnInput,
   AliceMemoryFact,
   AliceMemoryFactInput,
   AliceMemoryLegacySnapshot,
@@ -214,6 +215,7 @@ export interface AliceDbService {
   dbPath: string
   close: () => Promise<void>
   appendAuditLog: (input: AliceAuditLogInput) => Promise<void>
+  appendConversationTurn: (input: AliceConversationTurnInput) => Promise<void>
   getMemoryStats: () => Promise<AliceMemoryStats>
   upsertMemoryFacts: (facts: AliceMemoryFactInput[], source: AliceMemorySource) => Promise<void>
   retrieveMemoryFacts: (query: string, limit?: number) => Promise<AliceMemoryFact[]>
@@ -385,6 +387,41 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
           input.action,
           input.message,
           payloadJson,
+          createdAt,
+        ],
+      )
+    })
+  }
+
+  async function appendConversationTurn(input: AliceConversationTurnInput) {
+    const sessionId = input.sessionId.trim()
+    if (!sessionId)
+      throw new Error('sessionId is required')
+
+    const createdAt = Number.isFinite(input.createdAt) ? Number(input.createdAt) : now()
+    const userText = typeof input.userText === 'string' ? input.userText : null
+    const assistantText = typeof input.assistantText === 'string' ? input.assistantText : null
+    const structuredJson = input.structured ? JSON.stringify(input.structured) : null
+
+    await enqueueWrite(async () => {
+      await run(
+        database,
+        `
+        INSERT INTO conversation_turns (
+          id,
+          session_id,
+          user_text,
+          assistant_text,
+          structured_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        `,
+        [
+          randomUUID(),
+          sessionId,
+          userText,
+          assistantText,
+          structuredJson,
           createdAt,
         ],
       )
@@ -765,6 +802,7 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
     dbPath,
     close: async () => await close(database),
     appendAuditLog,
+    appendConversationTurn,
     getMemoryStats,
     upsertMemoryFacts,
     retrieveMemoryFacts,

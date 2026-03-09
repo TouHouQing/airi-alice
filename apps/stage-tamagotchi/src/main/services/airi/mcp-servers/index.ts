@@ -3,6 +3,7 @@ import type { createContext } from '@moeru/eventa/adapters/electron/main'
 import type {
   ElectronMcpCallToolPayload,
   ElectronMcpCallToolResult,
+  ElectronMcpCapabilitiesSnapshot,
   ElectronMcpStdioApplyResult,
   ElectronMcpStdioConfigFile,
   ElectronMcpStdioRuntimeStatus,
@@ -25,6 +26,7 @@ import { z } from 'zod'
 import {
   electronMcpApplyAndRestart,
   electronMcpCallTool,
+  electronMcpGetCapabilitiesSnapshot,
   electronMcpGetRuntimeStatus,
   electronMcpListTools,
   electronMcpOpenConfigFile,
@@ -46,6 +48,7 @@ export interface McpStdioManager {
   callTool: (payload: ElectronMcpCallToolPayload) => Promise<ElectronMcpCallToolResult>
   stopAll: () => Promise<void>
   getRuntimeStatus: () => ElectronMcpStdioRuntimeStatus
+  getCapabilitiesSnapshot: () => Promise<ElectronMcpCapabilitiesSnapshot>
 }
 
 const mcpServerConfigSchema = z.object({
@@ -92,6 +95,21 @@ function parseQualifiedToolName(name: string) {
     serverName: name.slice(0, separatorIndex),
     toolName: name.slice(separatorIndex + toolNameSeparator.length),
   }
+}
+
+function extractToolErrorMessage(content: Array<Record<string, unknown>> | undefined) {
+  if (!Array.isArray(content))
+    return undefined
+
+  for (const item of content) {
+    if (!item || typeof item !== 'object')
+      continue
+    if ('text' in item && typeof item.text === 'string' && item.text.trim()) {
+      return item.text.trim()
+    }
+  }
+
+  return undefined
 }
 
 async function withTimeout<T>(task: Promise<T>, timeoutMsec: number, timeoutMessage: string): Promise<T> {
@@ -349,6 +367,7 @@ export function createMcpStdioManager(): McpStdioManager {
     }
 
     const executeCall = async (): Promise<ElectronMcpCallToolResult> => {
+      const startedAt = Date.now()
       const { serverName, toolName } = parseQualifiedToolName(payload.name)
       const session = sessions.get(serverName)
       if (!session) {
@@ -376,6 +395,10 @@ export function createMcpStdioManager(): McpStdioManager {
       if ('toolResult' in result) {
         normalized.toolResult = result.toolResult
       }
+      normalized.ok = normalized.isError !== true
+      normalized.errorCode = normalized.isError ? 'MCP_TOOL_ERROR' : undefined
+      normalized.errorMessage = normalized.isError ? extractToolErrorMessage(normalized.content) : undefined
+      normalized.durationMs = Date.now() - startedAt
 
       return normalized
     }
@@ -410,6 +433,18 @@ export function createMcpStdioManager(): McpStdioManager {
     }
   }
 
+  const getCapabilitiesSnapshot = async (): Promise<ElectronMcpCapabilitiesSnapshot> => {
+    const tools = await listTools()
+    const servers = [...runtimeStatuses.values()].sort((left, right) => left.name.localeCompare(right.name))
+    return {
+      path: getConfigPath(),
+      updatedAt: Date.now(),
+      servers,
+      tools,
+      healthyServers: servers.filter(server => server.state === 'running').length,
+    }
+  }
+
   return {
     ensureConfigFile,
     openConfigFile,
@@ -418,6 +453,7 @@ export function createMcpStdioManager(): McpStdioManager {
     callTool,
     stopAll,
     getRuntimeStatus,
+    getCapabilitiesSnapshot,
   }
 }
 
@@ -462,5 +498,9 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
 
   defineInvokeHandler(params.context, electronMcpCallTool, async (payload) => {
     return params.manager.callTool(payload)
+  })
+
+  defineInvokeHandler(params.context, electronMcpGetCapabilitiesSnapshot, async () => {
+    return params.manager.getCapabilitiesSnapshot()
   })
 }

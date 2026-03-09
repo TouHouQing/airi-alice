@@ -110,7 +110,8 @@ interface AliceEvent<TPayload = unknown> {
 
 - 输入：用户消息 + 短期记忆 + 人格向量。
 - 输出：`emotion` 标签（如 `neutral`, `concerned`, `happy`, `tired`）。
-- 失败策略：解析失败回退 `emotion = neutral`、`reply = rawText`，并记录审计事件。
+- 失败策略：非 JSON 合约先重采样一次；仍失败时回退 `emotion = neutral`、`reply = rawText`，并记录 `contractFailed` 审计事件。
+- `contractFailed=true` 的轮次禁止触发人格漂移与异步记忆抽取。
 - 系统提示注入策略：`SOUL.md + 固定系统模板 + 上下文片段`，不开放 Prompt/Spark 模板运行时配置。
 
 ### 5.3 Kill Switch 状态

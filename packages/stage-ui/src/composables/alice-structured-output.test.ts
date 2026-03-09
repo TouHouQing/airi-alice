@@ -8,6 +8,53 @@ describe('alice structured output', () => {
     expect(emotion).toBe('sad')
   })
 
+  it('prefers strict json payload when available', () => {
+    const result = normalizeStructuredOutput({
+      fullText: JSON.stringify({
+        thought: 'internal-json',
+        emotion: 'happy',
+        reply: 'json reply',
+        userSentimentScore: 0.65,
+        sentimentConfidenceRaw: 0.88,
+      }),
+      thought: 'fallback-thought',
+      reply: 'fallback-reply',
+    })
+
+    expect(result.parsePath).toBe('json')
+    expect(result.thought).toBe('internal-json')
+    expect(result.reply).toBe('json reply')
+    expect(result.emotion).toBe('happy')
+    expect(result.format).toBe('epoch1-v1')
+  })
+
+  it('uses linear repair path for noisy wrapped json', () => {
+    const result = normalizeStructuredOutput({
+      fullText: 'prefix noise >>> {"thought":"repair","emotion":"curious","reply":"ok"} <<< suffix noise',
+      thought: 'fallback-thought',
+      reply: 'fallback-reply',
+    })
+
+    expect(result.parsePath).toBe('repair-json')
+    expect(result.reply).toBe('ok')
+    expect(result.emotion).toBe('curious')
+    expect(result.repairTimedOut).toBe(false)
+  })
+
+  it('falls back safely for oversized malformed text', () => {
+    const oversized = `{${'x'.repeat(40_000)}}`
+    const result = normalizeStructuredOutput({
+      fullText: oversized,
+      thought: 'fallback-thought',
+      reply: 'fallback-reply',
+    })
+
+    expect(result.parsePath).toBe('fallback')
+    expect(result.format).toBe('fallback-v1')
+    expect(result.reply).toBe('fallback-reply')
+    expect(result.repairTimedOut).toBe(true)
+  })
+
   it('calibrates confidence with heuristic cap', () => {
     const result = normalizeStructuredOutput({
       fullText: '<|ACT:{"emotion":"happy"}|>Thanks a lot!',

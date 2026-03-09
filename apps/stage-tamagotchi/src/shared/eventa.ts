@@ -181,6 +181,18 @@ export interface ElectronMcpCallToolResult {
   structuredContent?: unknown
   toolResult?: unknown
   isError?: boolean
+  ok?: boolean
+  errorCode?: string
+  errorMessage?: string
+  durationMs?: number
+}
+
+export interface ElectronMcpCapabilitiesSnapshot {
+  path: string
+  updatedAt: number
+  servers: ElectronMcpStdioServerRuntimeStatus[]
+  tools: ElectronMcpToolDescriptor[]
+  healthyServers: number
 }
 
 export const electronMcpOpenConfigFile = defineInvokeEventa<{ path: string }>('eventa:invoke:electron:mcp:open-config-file')
@@ -188,6 +200,7 @@ export const electronMcpApplyAndRestart = defineInvokeEventa<ElectronMcpStdioApp
 export const electronMcpGetRuntimeStatus = defineInvokeEventa<ElectronMcpStdioRuntimeStatus>('eventa:invoke:electron:mcp:get-runtime-status')
 export const electronMcpListTools = defineInvokeEventa<ElectronMcpToolDescriptor[]>('eventa:invoke:electron:mcp:list-tools')
 export const electronMcpCallTool = defineInvokeEventa<ElectronMcpCallToolResult, ElectronMcpCallToolPayload>('eventa:invoke:electron:mcp:call-tool')
+export const electronMcpGetCapabilitiesSnapshot = defineInvokeEventa<ElectronMcpCapabilitiesSnapshot>('eventa:invoke:electron:mcp:get-capabilities-snapshot')
 
 export const widgetsOpenWindow = defineInvokeEventa<void, { id?: string }>('eventa:invoke:electron:windows:widgets:open')
 export const widgetsAdd = defineInvokeEventa<string | undefined, WidgetsAddPayload>('eventa:invoke:electron:windows:widgets:add')
@@ -331,6 +344,14 @@ export interface AliceMemoryMigrationResult {
   marker: string
 }
 
+export interface AliceConversationTurnInput {
+  sessionId: string
+  userText?: string
+  assistantText?: string
+  structured?: Record<string, unknown>
+  createdAt?: number
+}
+
 export type AliceAuditLogLevel = 'info' | 'notice' | 'warning' | 'critical'
 
 export interface AliceAuditLogInput {
@@ -340,6 +361,26 @@ export interface AliceAuditLogInput {
   message: string
   payload?: Record<string, unknown>
   createdAt?: number
+}
+
+export type AliceRealtimeCategory = 'weather' | 'news' | 'finance' | 'sports'
+
+export interface AliceRealtimeExecutePayload {
+  category: AliceRealtimeCategory
+  query: string
+  locale?: string
+  now?: number
+}
+
+export interface AliceRealtimeExecuteResult {
+  category: AliceRealtimeCategory
+  source: 'builtin'
+  ok: boolean
+  summary?: string
+  data?: Record<string, unknown>
+  errorCode?: string
+  errorMessage?: string
+  durationMs: number
 }
 
 export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
@@ -356,7 +397,9 @@ export const electronAliceUpdateMemoryStats = defineInvokeEventa<AliceMemoryStat
 export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFact[], { query: string, limit?: number }>('eventa:invoke:electron:alice:memory:retrieve-facts')
 export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
 export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
+export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
 export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
+export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
 
 export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
 export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')

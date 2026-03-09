@@ -120,6 +120,14 @@ export interface AliceMemoryMigrationResult {
   marker: string
 }
 
+export interface AliceConversationTurnInput {
+  sessionId: string
+  userText?: string
+  assistantText?: string
+  structured?: Record<string, unknown>
+  createdAt?: number
+}
+
 export type AliceAuditLogLevel = 'info' | 'notice' | 'warning' | 'critical'
 
 export interface AliceAuditLogInput {
@@ -129,6 +137,26 @@ export interface AliceAuditLogInput {
   message: string
   payload?: Record<string, unknown>
   createdAt?: number
+}
+
+export type AliceRealtimeCategory = 'weather' | 'news' | 'finance' | 'sports'
+
+export interface AliceRealtimeExecutePayload {
+  category: AliceRealtimeCategory
+  query: string
+  locale?: string
+  now?: number
+}
+
+export interface AliceRealtimeExecuteResult {
+  category: AliceRealtimeCategory
+  source: 'builtin'
+  ok: boolean
+  summary?: string
+  data?: Record<string, unknown>
+  errorCode?: string
+  errorMessage?: string
+  durationMs: number
 }
 
 interface AliceBridge {
@@ -146,7 +174,9 @@ interface AliceBridge {
   retrieveMemoryFacts: (payload: { query: string, limit?: number }) => Promise<AliceMemoryFact[]>
   upsertMemoryFacts: (payload: { facts: AliceMemoryFactInput[], source: AliceMemorySource }) => Promise<void>
   importLegacyMemory: (payload: AliceMemoryLegacySnapshot) => Promise<AliceMemoryMigrationResult>
+  appendConversationTurn: (payload: AliceConversationTurnInput) => Promise<void>
   appendAuditLog: (payload: AliceAuditLogInput) => Promise<void>
+  realtimeExecute: (payload: AliceRealtimeExecutePayload) => Promise<AliceRealtimeExecuteResult>
 }
 
 let bridge: AliceBridge | undefined
