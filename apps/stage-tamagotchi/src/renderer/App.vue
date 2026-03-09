@@ -36,6 +36,7 @@ import {
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
   electronAliceGetMemoryStats,
+  electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
   electronAliceInitializeGenesis,
   electronAliceKillSwitchGetState,
@@ -117,6 +118,7 @@ const aliceGetKillSwitchState = useElectronEventaInvoke(electronAliceKillSwitchG
 const aliceSuspendKillSwitch = useElectronEventaInvoke(electronAliceKillSwitchSuspend)
 const aliceResumeKillSwitch = useElectronEventaInvoke(electronAliceKillSwitchResume)
 const aliceGetMemoryStats = useElectronEventaInvoke(electronAliceGetMemoryStats)
+const aliceGetSensorySnapshot = useElectronEventaInvoke(electronAliceGetSensorySnapshot)
 const aliceRetrieveMemoryFacts = useElectronEventaInvoke(electronAliceMemoryRetrieveFacts)
 const aliceUpsertMemoryFacts = useElectronEventaInvoke(electronAliceMemoryUpsertFacts)
 const aliceImportLegacyMemory = useElectronEventaInvoke(electronAliceMemoryImportLegacy)
@@ -285,6 +287,7 @@ setAliceBridge({
   appendConversationTurn: payload => aliceAppendConversationTurn(payload),
   appendAuditLog: payload => aliceAppendAuditLog(payload),
   realtimeExecute: payload => aliceRealtimeExecute(payload),
+  getSensorySnapshot: () => aliceGetSensorySnapshot(),
 })
 
 function prefillGenesisFormFromSoul() {

@@ -30,6 +30,7 @@ export interface PromptBudgetReport {
     soul: PromptBudgetSectionStats
     memory: PromptBudgetSectionStats
     currentTurn: PromptBudgetSectionStats
+    sensory: PromptBudgetSectionStats
   }
 }
 
@@ -71,6 +72,9 @@ const defaultPromptBudget: Required<PromptBudgetOptions> = {
   memoryRatio: 0.25,
   currentTurnRatio: 0.5,
 }
+
+const runtimeSensoryHeader = 'Current sensory state:'
+const runtimeContractAnchorHeader = 'Output contract (must-follow, highest priority):'
 
 const defaultSanitizeOptions: Required<SanitizeOptions> = {
   timeBudgetMs: 50,
@@ -239,6 +243,39 @@ function isMemoryMessage(message: Message) {
   return /Relevant memory facts:/i.test(text) || /confidence\s*=/i.test(text)
 }
 
+function estimateSensoryTokens(text: string) {
+  const headerIndex = text.indexOf(runtimeSensoryHeader)
+  if (headerIndex < 0)
+    return 0
+
+  const contractIndex = text.indexOf(runtimeContractAnchorHeader, headerIndex)
+  const sensorySegment = contractIndex > headerIndex
+    ? text.slice(headerIndex, contractIndex)
+    : text.slice(headerIndex)
+  return estimateTokens(sensorySegment)
+}
+
+function compactRuntimeSensorySegment(text: string, budgetTokens = 48) {
+  const headerIndex = text.indexOf(runtimeSensoryHeader)
+  if (headerIndex < 0)
+    return text
+
+  const contractIndex = text.indexOf(runtimeContractAnchorHeader, headerIndex)
+  const sensorySegment = contractIndex > headerIndex
+    ? text.slice(headerIndex, contractIndex)
+    : text.slice(headerIndex)
+
+  if (estimateTokens(sensorySegment) <= budgetTokens)
+    return text
+
+  const compactedSegment = `${runtimeSensoryHeader}\n[System Context: Sensory], telemetry=degraded-for-budget\n\n`
+  if (contractIndex > headerIndex) {
+    return `${text.slice(0, headerIndex)}${compactedSegment}${text.slice(contractIndex)}`
+  }
+
+  return `${text.slice(0, headerIndex)}${compactedSegment}`.trim()
+}
+
 function getLastUserIndex(messages: Message[]) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.role === 'user')
@@ -354,6 +391,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
 
   const result = cloneMessages(messages)
   const soulIndex = result.findIndex(message => message.role === 'system')
+  const runtimeIndex = result.findIndex((message, index) => index !== soulIndex && message.role === 'system')
   const currentTurnIndex = getLastUserIndex(result)
   const memoryIndex = result.findIndex((message, index) => index !== soulIndex && isMemoryMessage(message))
   let anchorPreserved = true
@@ -365,6 +403,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     soul: soulIndex >= 0 ? estimateMessageTokens(result[soulIndex]!) : 0,
     memory: memoryIndex >= 0 ? estimateMessageTokens(result[memoryIndex]!) : 0,
     currentTurn: currentTurnIndex >= 0 ? estimateMessageTokens(result[currentTurnIndex]!) : 0,
+    sensory: runtimeIndex >= 0 ? estimateSensoryTokens(readMessageText(result[runtimeIndex]!)) : 0,
   }
 
   if (soulIndex >= 0 && sectionBefore.soul > safeModeSoulThreshold) {
@@ -422,12 +461,22 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
               ? estimateMessageTokens(minimalMessages[minimalMessages.length - 1]!)
               : 0,
           },
+          sensory: {
+            beforeTokens: sectionBefore.sensory,
+            afterTokens: 0,
+          },
         },
       },
     }
   }
 
-  if (memoryIndex >= 0) {
+  if (runtimeIndex >= 0) {
+    const runtimeText = readMessageText(result[runtimeIndex]!)
+    const nextRuntimeText = compactRuntimeSensorySegment(runtimeText)
+    result[runtimeIndex] = writeMessageText(result[runtimeIndex]!, nextRuntimeText)
+  }
+
+  if (memoryIndex >= 0 && memoryIndex !== runtimeIndex) {
     const memoryText = readMessageText(result[memoryIndex]!)
     const nextMemoryText = trimMemoryByConfidence(memoryText, memoryBudget)
     result[memoryIndex] = writeMessageText(result[memoryIndex]!, nextMemoryText)
@@ -439,7 +488,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     result[currentTurnIndex] = writeMessageText(result[currentTurnIndex]!, nextCurrentText)
   }
 
-  if (memoryIndex >= 0) {
+  if (memoryIndex >= 0 && memoryIndex !== runtimeIndex) {
     const protectedSoulTokens = soulIndex >= 0 ? estimateMessageTokens(result[soulIndex]!) : 0
     const protectedCurrentTokens = currentTurnIndex >= 0 ? estimateMessageTokens(result[currentTurnIndex]!) : 0
     const maxMemoryTokens = Math.max(0, totalBudget - protectedSoulTokens - protectedCurrentTokens)
@@ -481,6 +530,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     soul: soulIndex >= 0 && result[soulIndex] ? estimateMessageTokens(result[soulIndex]!) : 0,
     memory: memoryIndex >= 0 && result[memoryIndex] ? estimateMessageTokens(result[memoryIndex]!) : 0,
     currentTurn: currentTurnIndex >= 0 && result[currentTurnIndex] ? estimateMessageTokens(result[currentTurnIndex]!) : 0,
+    sensory: runtimeIndex >= 0 && result[runtimeIndex] ? estimateSensoryTokens(readMessageText(result[runtimeIndex]!)) : 0,
   }
 
   const compacted = result.filter((message, index) => {
@@ -511,6 +561,10 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
         currentTurn: {
           beforeTokens: sectionBefore.currentTurn,
           afterTokens: sectionAfter.currentTurn,
+        },
+        sensory: {
+          beforeTokens: sectionBefore.sensory,
+          afterTokens: sectionAfter.sensory,
         },
       },
     },

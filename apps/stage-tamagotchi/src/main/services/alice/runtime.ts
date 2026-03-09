@@ -27,6 +27,7 @@ import {
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
   electronAliceGetMemoryStats,
+  electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
   electronAliceInitializeGenesis,
   electronAliceKillSwitchGetState,
@@ -43,6 +44,7 @@ import {
 } from '../../../shared/eventa'
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
 import { setupAliceDb } from './db'
+import { createAliceSensoryBus } from './sensory-bus'
 import { getAliceKillSwitchSnapshot, setAliceKillSwitchState } from './state'
 
 const currentSoulSchemaVersion = 2
@@ -841,6 +843,13 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     }
   }
 
+  const sensoryBus = createAliceSensoryBus({
+    tickMs: 60_000,
+    staleMs: 90_000,
+    cpuWindowMs: 1_000,
+    appendAuditLog,
+  })
+
   function createTurnWriteAbortSignal(turnId?: string) {
     const normalizedTurnId = turnId?.trim()
     if (!normalizedTurnId)
@@ -1278,6 +1287,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   async function suspendKillSwitch(reason?: string) {
     const snapshot = setAliceKillSwitchState('SUSPENDED', reason)
+    sensoryBus.stop('kill-switch')
     await abortAllTurnWrites(reason ?? 'manual')
     emitKillSwitchChanged()
     await appendAuditLog({
@@ -1294,6 +1304,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   async function resumeKillSwitch(reason?: string) {
     const snapshot = setAliceKillSwitchState('ACTIVE', reason)
+    sensoryBus.start()
     emitKillSwitchChanged()
     await appendAuditLog({
       level: 'notice',
@@ -1360,6 +1371,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   defineInvokeHandler(context, electronAliceKillSwitchResume, async payload => await resumeKillSwitch(payload?.reason ?? 'manual'))
 
   defineInvokeHandler(context, electronAliceGetMemoryStats, async () => await aliceDb.getMemoryStats())
+  defineInvokeHandler(context, electronAliceGetSensorySnapshot, async () => sensoryBus.getSnapshot())
   defineInvokeHandler(context, electronAliceUpdateMemoryStats, async payload => await aliceDb.overrideMemoryStats(payload))
   defineInvokeHandler(context, electronAliceRunMemoryPrune, async () => await aliceDb.runMemoryPrune())
   defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit))
@@ -1464,6 +1476,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   onAppBeforeQuit(() => {
     stopWatch()
+    sensoryBus.stop('shutdown')
     turnWriteAbortControllers.clear()
     if (pruneTimer) {
       clearInterval(pruneTimer)
@@ -1479,6 +1492,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   // Sync initial snapshots for listeners.
   await bootstrap()
+  if (getAliceKillSwitchSnapshot().state !== 'SUSPENDED')
+    sensoryBus.start()
   await aliceDb.runMemoryPrune().catch(async (error) => {
     await appendAuditLog({
       level: 'warning',

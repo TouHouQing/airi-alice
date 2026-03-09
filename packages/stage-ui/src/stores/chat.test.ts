@@ -145,6 +145,7 @@ vi.mock('../composables/alice-guardrails', () => ({
         soul: { beforeTokens: 0, afterTokens: 0 },
         memory: { beforeTokens: 0, afterTokens: 0 },
         currentTurn: { beforeTokens: 0, afterTokens: 0 },
+        sensory: { beforeTokens: 0, afterTokens: 0 },
       },
     },
   }),
@@ -232,6 +233,22 @@ function installAliceBridge() {
     appendConversationTurn: appendConversationTurnMock,
     appendAuditLog: appendAuditLogMock,
     realtimeExecute: vi.fn(),
+    getSensorySnapshot: vi.fn().mockResolvedValue({
+      sample: {
+        collectedAt: Date.now(),
+        time: {
+          iso: '2026-03-09T00:00:00.000Z',
+          local: '2026/3/9 08:00:00',
+          timezone: 'Asia/Shanghai',
+        },
+        cpu: { usagePercent: 12, windowMs: 1000 },
+        memory: { freeMB: 4096, totalMB: 8192, usagePercent: 50 },
+      },
+      stale: false,
+      ageMs: 0,
+      nextTickAt: Date.now() + 60_000,
+      running: true,
+    }),
   } as any)
 }
 

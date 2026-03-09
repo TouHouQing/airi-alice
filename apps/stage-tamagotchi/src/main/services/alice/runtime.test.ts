@@ -7,8 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   electronAliceBootstrap,
+  electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
   electronAliceInitializeGenesis,
+  electronAliceKillSwitchResume,
+  electronAliceKillSwitchSuspend,
 } from '../../../shared/eventa'
 
 const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
@@ -147,5 +150,31 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(afterGenesis.soulPath.startsWith(sandboxPath)).toBe(true)
     expect(afterGenesis.needsGenesis).toBe(false)
     expect(afterGenesis.watching).toBe(true)
+  })
+
+  it('stops and resumes sensory polling with kill switch state', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const getSensorySnapshot = invokeHandlers.get(electronAliceGetSensorySnapshot)
+    const suspend = invokeHandlers.get(electronAliceKillSwitchSuspend)
+    const resume = invokeHandlers.get(electronAliceKillSwitchResume)
+
+    expect(getSensorySnapshot).toBeTypeOf('function')
+    expect(suspend).toBeTypeOf('function')
+    expect(resume).toBeTypeOf('function')
+
+    const activeSnapshot = await getSensorySnapshot!()
+    expect(activeSnapshot.running).toBe(true)
+
+    await suspend!({ reason: 'test' })
+    const suspendedSnapshot = await getSensorySnapshot!()
+    expect(suspendedSnapshot.running).toBe(false)
+
+    await resume!({ reason: 'test' })
+    const resumedSnapshot = await getSensorySnapshot!()
+    expect(resumedSnapshot.running).toBe(true)
   })
 })
