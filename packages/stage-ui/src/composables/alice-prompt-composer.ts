@@ -8,6 +8,8 @@ import {
   aliceFixedGenericContextTemplate,
   aliceFixedHostNameDirectiveTemplate,
   aliceFixedMemoryContextTemplate,
+  aliceFixedSensoryContextTemplate,
+  aliceFixedStructuredContractAnchor,
   renderAlicePromptTemplate,
 } from '@proj-airi/stage-shared/alice-prompting'
 
@@ -32,6 +34,7 @@ export function stripLegacySystemMessages(messages: Message[]) {
 
 function buildAliceContextSections(contextsSnapshot: Record<string, ContextMessage[]>) {
   const sections: string[] = []
+  const sensorySections: string[] = []
 
   for (const [source, contexts] of Object.entries(contextsSnapshot)) {
     for (const context of contexts) {
@@ -70,6 +73,16 @@ function buildAliceContextSections(contextsSnapshot: Record<string, ContextMessa
         continue
       }
 
+      if (context.contextId === 'alice:sensory') {
+        sensorySections.push(renderAlicePromptTemplate(aliceFixedSensoryContextTemplate, {
+          source,
+          content,
+          iso: '',
+          local: '',
+        }))
+        continue
+      }
+
       sections.push(renderAlicePromptTemplate(aliceFixedGenericContextTemplate, {
         source,
         content,
@@ -79,7 +92,10 @@ function buildAliceContextSections(contextsSnapshot: Record<string, ContextMessa
     }
   }
 
-  return sections
+  return {
+    sections,
+    sensorySections,
+  }
 }
 
 export function composeAlicePromptMessages(input: {
@@ -111,10 +127,17 @@ export function composeAlicePromptMessages(input: {
     }).trim())
   }
 
-  const contextSections = buildAliceContextSections(input.contextsSnapshot ?? {})
+  const { sections: contextSections, sensorySections } = buildAliceContextSections(input.contextsSnapshot ?? {})
   if (contextSections.length > 0) {
     runtimeSystemSections.push(contextSections.join('\n\n'))
   }
+
+  if (sensorySections.length > 0) {
+    runtimeSystemSections.push(sensorySections.join('\n\n'))
+  }
+
+  if (aliceFixedStructuredContractAnchor.trim())
+    runtimeSystemSections.push(aliceFixedStructuredContractAnchor.trim())
 
   const finalMessages: Message[] = []
   if (anchorSystemSections.length > 0) {

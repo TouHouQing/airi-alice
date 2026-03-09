@@ -160,6 +160,43 @@ export interface AliceRealtimeExecuteResult {
   durationMs: number
 }
 
+export type AliceSystemProbeDegradeReason
+  = | 'battery-unavailable'
+    | 'cpu-unavailable'
+    | 'memory-unavailable'
+
+export interface AliceSystemProbeSample {
+  collectedAt: number
+  time: {
+    iso: string
+    local: string
+    timezone: string
+  }
+  battery?: {
+    percent: number
+    charging: boolean
+    source: 'native' | 'fallback'
+  }
+  cpu: {
+    usagePercent: number
+    windowMs: number
+  }
+  memory: {
+    freeMB: number
+    totalMB: number
+    usagePercent: number
+  }
+  degraded?: AliceSystemProbeDegradeReason[]
+}
+
+export interface AliceSensoryCacheSnapshot {
+  sample: AliceSystemProbeSample
+  stale: boolean
+  ageMs: number
+  nextTickAt: number | null
+  running: boolean
+}
+
 interface AliceBridge {
   bootstrap: () => Promise<AliceSoulSnapshot>
   getSoul: () => Promise<AliceSoulSnapshot>
@@ -178,6 +215,7 @@ interface AliceBridge {
   appendConversationTurn: (payload: AliceConversationTurnInput) => Promise<void>
   appendAuditLog: (payload: AliceAuditLogInput) => Promise<void>
   realtimeExecute: (payload: AliceRealtimeExecutePayload) => Promise<AliceRealtimeExecuteResult>
+  getSensorySnapshot: () => Promise<AliceSensoryCacheSnapshot>
 }
 
 let bridge: AliceBridge | undefined

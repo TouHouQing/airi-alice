@@ -385,6 +385,43 @@ export interface AliceRealtimeExecuteResult {
   durationMs: number
 }
 
+export type AliceSystemProbeDegradeReason
+  = | 'battery-unavailable'
+    | 'cpu-unavailable'
+    | 'memory-unavailable'
+
+export interface AliceSystemProbeSample {
+  collectedAt: number
+  time: {
+    iso: string
+    local: string
+    timezone: string
+  }
+  battery?: {
+    percent: number
+    charging: boolean
+    source: 'native' | 'fallback'
+  }
+  cpu: {
+    usagePercent: number
+    windowMs: number
+  }
+  memory: {
+    freeMB: number
+    totalMB: number
+    usagePercent: number
+  }
+  degraded?: AliceSystemProbeDegradeReason[]
+}
+
+export interface AliceSensoryCacheSnapshot {
+  sample: AliceSystemProbeSample
+  stale: boolean
+  ageMs: number
+  nextTickAt: number | null
+  running: boolean
+}
+
 export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
 export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:get-soul')
 export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
@@ -402,6 +439,7 @@ export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMig
 export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
 export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
 export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
+export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot>('eventa:invoke:electron:alice:sensory:get-snapshot')
 
 export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
 export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')

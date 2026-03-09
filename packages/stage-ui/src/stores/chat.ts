@@ -22,7 +22,7 @@ import { useLlmmarkerParser } from '../composables/llm-marker-parser'
 import { categorizeResponse, createStreamingCategorizer } from '../composables/response-categoriser'
 import { getAliceBridge, hasAliceBridge } from './alice-bridge'
 import { useAliceExecutionEngineStore } from './alice-execution-engine'
-import { createDatetimeContext } from './chat/context-providers'
+import { createDatetimeContext, createSensoryContext } from './chat/context-providers'
 import { useChatContextStore } from './chat/context-store'
 import { createChatHooks } from './chat/hooks'
 import { useChatSessionStore } from './chat/session-store'
@@ -66,6 +66,7 @@ const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外�
 const assistantEpoch1StrictFallbackReply = '抱歉，当前是 Epoch 1 受限模式，我无法访问外部实时数据源。你可以继续和我进行本地对话、设定与记忆整理。'
 const assistantStructuredContractFallbackReply = '我刚才没有稳定产出结构化结果，这一轮先按安全模式回复。'
 const aliceEpoch1StrictModeEnabled = true
+const runtimeContractAnchorHeader = 'Output contract (must-follow, highest priority):'
 const structuredRetrySystemPrompt = [
   'Return ONLY one strict JSON object with keys: thought, emotion, reply.',
   'No markdown fences, no prose, no tool calls, no extra keys.',
@@ -357,6 +358,59 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
     // Inject current datetime context before composing the message
     chatContext.ingestContextMessage(createDatetimeContext())
+    if (hasAliceBridge()) {
+      try {
+        const sensorySnapshot = await getAliceBridge().getSensorySnapshot()
+        chatContext.ingestContextMessage(createSensoryContext(sensorySnapshot))
+
+        if (sensorySnapshot.sample.degraded?.length) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'alice.sensory',
+            action: 'degraded',
+            message: 'Sensory probe sample contains degraded fields.',
+            details: {
+              reasons: sensorySnapshot.sample.degraded,
+            },
+          })
+        }
+
+        if (sensorySnapshot.stale) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'alice.sensory',
+            action: 'stale',
+            message: 'Sensory probe snapshot is stale before prompt injection.',
+            details: {
+              ageMs: sensorySnapshot.ageMs,
+            },
+          })
+        }
+
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'alice.sensory',
+          action: 'injected',
+          message: 'Injected sensory context into runtime prompt section.',
+          details: {
+            stale: sensorySnapshot.stale,
+            ageMs: sensorySnapshot.ageMs,
+            running: sensorySnapshot.running,
+          },
+        })
+      }
+      catch (error) {
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'alice.sensory',
+          action: 'inject-failed',
+          message: 'Failed to inject sensory context before compose.',
+          details: {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+    }
 
     const sendingCreatedAt = Date.now()
     const streamingMessageContext: ChatStreamEventContext = {
@@ -972,6 +1026,22 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             },
           })
         }
+
+        const runtimeSystemMessage = budgeted.messages.find((message, index) => index !== 0 && message.role === 'system')
+        const runtimeContractAnchorPreserved = typeof runtimeSystemMessage?.content === 'string'
+          ? runtimeSystemMessage.content.includes(runtimeContractAnchorHeader)
+          : JSON.stringify(runtimeSystemMessage?.content ?? '').includes(runtimeContractAnchorHeader)
+
+        await appendAliceAuditLog({
+          level: runtimeContractAnchorPreserved ? 'notice' : 'warning',
+          category: 'alice.prompt',
+          action: runtimeContractAnchorPreserved
+            ? 'runtime-contract-anchor-preserved'
+            : 'runtime-contract-anchor-missing',
+          message: runtimeContractAnchorPreserved
+            ? 'Runtime structured contract anchor is preserved after prompt budgeting.'
+            : 'Runtime structured contract anchor is missing after prompt budgeting.',
+        })
 
         const sanitized = sanitizeForRemoteModel(newMessages as Message[], { timeBudgetMs: 50, chunkSize: 2048 })
         if (sanitized.blocked) {

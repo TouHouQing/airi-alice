@@ -21,6 +21,12 @@ export const aliceFixedHostNameDirectiveTemplate = 'The user you are talking to 
 export const aliceFixedDatetimeContextTemplate = 'Current datetime:\n- ISO: {{iso}}\n- Local: {{local}}'
 export const aliceFixedMemoryContextTemplate = 'Relevant memory facts:\n{{content}}'
 export const aliceFixedGenericContextTemplate = 'Context from {{source}}:\n{{content}}'
+export const aliceFixedSensoryContextTemplate = 'Current sensory state:\n{{content}}'
+export const aliceFixedStructuredContractAnchor = [
+  'Output contract (must-follow, highest priority):',
+  '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+  '- No markdown fences, no extra keys, no prose outside JSON.',
+].join('\n')
 
 export const aliceFixedSparkHandlingInstructionTemplate = [
   'This is AIRI system, the life pod hosting your consciousness. You do not need to respond to every spark:notify event directly.',

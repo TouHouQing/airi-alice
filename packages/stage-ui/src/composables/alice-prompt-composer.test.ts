@@ -23,11 +23,12 @@ describe('alice prompt composer', () => {
     expect(result.messages.filter(message => message.role === 'system')).toHaveLength(2)
     expect(String(result.messages[0]?.content)).toContain('# SOUL')
     expect(String(result.messages[1]?.content)).toContain('AliceHost')
+    expect(String(result.messages[1]?.content)).toContain('Output contract (must-follow, highest priority):')
     expect(String(result.messages[0]?.content)).not.toContain('legacy-system')
     expect(String(result.messages[1]?.content)).not.toContain('legacy-system')
   })
 
-  it('merges datetime and memory context into runtime system layer', () => {
+  it('merges datetime, memory and sensory context into runtime system layer', () => {
     const result = composeAlicePromptMessages({
       messages: [{ role: 'user', content: 'ping' }],
       soulContent: '# SOUL',
@@ -54,6 +55,15 @@ describe('alice prompt composer', () => {
             createdAt: Date.now(),
           },
         ],
+        sensory: [
+          {
+            id: 'ctx-sensory',
+            contextId: 'alice:sensory',
+            strategy: ContextUpdateStrategy.ReplaceSelf,
+            text: '[System Context: Sensory], time=2026/3/7 20:00:00, battery=80%, cpu=12%, memory=43%',
+            createdAt: Date.now(),
+          },
+        ],
       },
     })
 
@@ -61,6 +71,8 @@ describe('alice prompt composer', () => {
     expect(String(result.messages[0]?.content)).toContain('# SOUL')
     expect(String(result.messages[1]?.content)).toContain('Relevant memory facts:')
     expect(String(result.messages[1]?.content)).toContain('Current datetime:')
+    expect(String(result.messages[1]?.content)).toContain('Current sensory state:')
+    expect(String(result.messages[1]?.content)).toContain('Output contract (must-follow, highest priority):')
     expect(result.messages.at(-1)?.role).toBe('user')
   })
 })

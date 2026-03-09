@@ -108,6 +108,18 @@ function createAliceBridgeStub(overrides?: Record<string, unknown>) {
     appendConversationTurn: vi.fn().mockResolvedValue(undefined),
     appendAuditLog: vi.fn().mockResolvedValue(undefined),
     realtimeExecute: vi.fn().mockResolvedValue(undefined),
+    getSensorySnapshot: vi.fn().mockResolvedValue({
+      sample: {
+        collectedAt: Date.now(),
+        time: { iso: '', local: '', timezone: 'UTC' },
+        cpu: { usagePercent: 0, windowMs: 1000 },
+        memory: { freeMB: 0, totalMB: 0, usagePercent: 0 },
+      },
+      stale: false,
+      ageMs: 0,
+      nextTickAt: null,
+      running: true,
+    }),
     ...overrides,
   } as any
 }

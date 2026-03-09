@@ -149,6 +149,31 @@ describe('alice guardrails', () => {
     expect(report.totalAfterTokens).toBeLessThanOrEqual(900)
   })
 
+  it('compacts runtime sensory section without removing structured contract anchor', () => {
+    const messages: Message[] = [
+      { role: 'system', content: '# SOUL' },
+      {
+        role: 'system',
+        content: [
+          'Current sensory state:',
+          '[System Context: Sensory], '.concat('battery=20%,cpu=35%,memory=66%,'.repeat(120)),
+          '',
+          'Output contract (must-follow, highest priority):',
+          '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+          '- No markdown fences, no extra keys, no prose outside JSON.',
+        ].join('\n'),
+      },
+      { role: 'user', content: '继续' },
+    ]
+
+    const { messages: nextMessages, report } = applyPromptBudget(messages, { totalTokens: 900 })
+    const runtimeSystem = String(nextMessages[1]?.content ?? '')
+
+    expect(report.sections.sensory.beforeTokens).toBeGreaterThan(0)
+    expect(report.sections.sensory.afterTokens).toBeLessThanOrEqual(report.sections.sensory.beforeTokens)
+    expect(runtimeSystem).toContain('Output contract (must-follow, highest priority):')
+  })
+
   it('removes leaked mcp tool payload text from assistant output', () => {
     const leaked = [
       '{"name":"mcp_call_tool","arguments":{"name":"weather::get_weather","parameters":[{"name":"location","value":"United States"}],"toolbench_rapidapi_key":"secret-key"}}',
