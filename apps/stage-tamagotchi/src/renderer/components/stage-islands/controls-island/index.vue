@@ -19,6 +19,7 @@ import {
   electronOpenSettings,
   electronStartDraggingWindow,
   electronWindowClose,
+  electronWindowSetAlwaysOnTop,
 } from '../../../../shared/eventa'
 
 const { isDark, toggleDark } = useTheme()
@@ -28,13 +29,26 @@ const settingsAudioDeviceStore = useSettingsAudioDevice()
 const settingsStore = useSettings()
 const context = useElectronEventaContext()
 const { enabled } = storeToRefs(settingsAudioDeviceStore)
-const { controlsIslandIconSize } = storeToRefs(settingsStore)
+const { alwaysOnTop, controlsIslandIconSize } = storeToRefs(settingsStore)
 const openSettings = useElectronEventaInvoke(electronOpenSettings)
 const openChat = useElectronEventaInvoke(electronOpenChat)
 const isLinux = useElectronEventaInvoke(electron.app.isLinux)
 const closeWindow = useElectronEventaInvoke(electronWindowClose)
+const setAlwaysOnTop = useElectronEventaInvoke(electronWindowSetAlwaysOnTop)
 
 const expanded = ref(false)
+// Expose whether hearing dialog is open so parent can disable click-through
+const hearingDialogOpen = ref(false)
+defineExpose({ hearingDialogOpen })
+
+// Apply alwaysOnTop on mount and when it changes
+watch(alwaysOnTop, (val) => {
+  setAlwaysOnTop(val)
+}, { immediate: true })
+
+function toggleAlwaysOnTop() {
+  alwaysOnTop.value = !alwaysOnTop.value
+}
 
 // Grouped classes for icon / border / padding and combined style class
 const adjustStyleClasses = computed(() => {
@@ -70,10 +84,6 @@ const adjustStyleClasses = computed(() => {
  */
 const startDraggingWindow = !isLinux() ? defineInvoke(context.value, electronStartDraggingWindow) : undefined
 
-// Expose whether hearing dialog is open so parent can disable click-through
-const hearingDialogOpen = ref(false)
-defineExpose({ hearingDialogOpen })
-
 function refreshWindow() {
   window.location.reload()
 }
@@ -91,7 +101,7 @@ function refreshWindow() {
       >
         <div v-if="expanded" border="1 neutral-200 dark:neutral-800" mb-2 flex flex-col gap-1 rounded-2xl p-2 backdrop-blur-xl class="bg-neutral-100/80 shadow-2xl shadow-black/20 dark:bg-neutral-900/80">
           <div grid grid-cols-3 gap-2>
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlButton :button-style="adjustStyleClasses.button" @click="openSettings">
                 <div i-solar:settings-minimalistic-outline :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
@@ -100,7 +110,7 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlButton :button-style="adjustStyleClasses.button" @click="openChat">
                 <div i-solar:chat-line-line-duotone :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
@@ -109,7 +119,7 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlButton :button-style="adjustStyleClasses.button" @click="refreshWindow">
                 <div i-solar:refresh-linear :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
@@ -118,7 +128,7 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlButton :button-style="adjustStyleClasses.button" @click="toggleDark()">
                 <Transition name="fade" mode="out-in">
                   <div v-if="isDark" i-solar:moon-outline :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
@@ -130,7 +140,7 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlsIslandHearingConfig v-model:show="hearingDialogOpen">
                 <div class="relative">
                   <ControlButton :button-style="adjustStyleClasses.button">
@@ -146,9 +156,19 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
+            <ControlButtonTooltip disable-hoverable-content>
+              <ControlButton :button-style="adjustStyleClasses.button" @click="toggleAlwaysOnTop()">
+                <div v-if="alwaysOnTop" i-solar:pin-bold :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
+                <div v-else i-solar:pin-linear :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300 opacity-50" />
+              </ControlButton>
+              <template #tooltip>
+                {{ alwaysOnTop ? t('tamagotchi.stage.controls-island.unpin-from-top') : t('tamagotchi.stage.controls-island.pin-on-top') }}
+              </template>
+            </ControlButtonTooltip>
+
             <ControlsIslandFadeOnHover :icon-class="adjustStyleClasses.icon" :button-style="adjustStyleClasses.button" />
 
-            <ControlButtonTooltip>
+            <ControlButtonTooltip disable-hoverable-content>
               <ControlButton :button-style="adjustStyleClasses.button" hover:bg-red-500 hover:text-white @click="closeWindow()">
                 <div i-solar:close-circle-outline :class="adjustStyleClasses.icon" />
               </ControlButton>

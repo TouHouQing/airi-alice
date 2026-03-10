@@ -3,9 +3,9 @@ import type { BrowserWindow } from 'electron'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import { bounds, startLoopGetBounds } from '@proj-airi/electron-eventa'
-import { createRendererLoop } from '@proj-airi/electron-vueuse/main'
+import { createRendererLoop, safeClose } from '@proj-airi/electron-vueuse/main'
 
-import { electron, electronWindowClose } from '../../../shared/eventa'
+import { electron, electronWindowClose, electronWindowSetAlwaysOnTop } from '../../../shared/eventa'
 import { onAppBeforeQuit, onAppWindowAllClosed } from '../../libs/bootkit/lifecycle'
 import { resizeWindowByDelta } from '../../windows/shared/window'
 
@@ -46,6 +46,17 @@ export function createWindowService(params: { context: ReturnType<typeof createC
     }
   })
 
+  defineInvokeHandler(params.context, electronWindowSetAlwaysOnTop, (flag, options) => {
+    if (params.window.webContents.id === options?.raw.ipcMainEvent.sender.id) {
+      if (flag) {
+        params.window.setAlwaysOnTop(true, 'screen-saver', 1)
+      }
+      else {
+        params.window.setAlwaysOnTop(false)
+      }
+    }
+  })
+
   defineInvokeHandler(params.context, electron.window.setVibrancy, (vibrancy, options) => {
     if (vibrancy && params.window.webContents.id === options?.raw.ipcMainEvent.sender.id) {
       params.window.setVibrancy(vibrancy[0])
@@ -73,7 +84,7 @@ export function createWindowService(params: { context: ReturnType<typeof createC
 
   defineInvokeHandler(params.context, electronWindowClose, (_, options) => {
     if (params.window.webContents.id === options?.raw.ipcMainEvent.sender.id) {
-      params.window.close()
+      safeClose(params.window)
     }
   })
 }
