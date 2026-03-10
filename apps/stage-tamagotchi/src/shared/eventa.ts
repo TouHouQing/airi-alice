@@ -422,6 +422,81 @@ export interface AliceSensoryCacheSnapshot {
   running: boolean
 }
 
+export const aliceEmotionWhitelist = [
+  'neutral',
+  'happy',
+  'sad',
+  'angry',
+  'concerned',
+  'tired',
+  'apologetic',
+  'processing',
+] as const
+
+export type AliceEmotion = typeof aliceEmotionWhitelist[number]
+
+export function normalizeAliceEmotion(raw: unknown): { emotion: AliceEmotion, rawEmotion?: string, downgraded: boolean } {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if ((aliceEmotionWhitelist as readonly string[]).includes(value)) {
+    return {
+      emotion: value as AliceEmotion,
+      downgraded: false,
+    }
+  }
+
+  return {
+    emotion: 'neutral',
+    rawEmotion: value || undefined,
+    downgraded: Boolean(value),
+  }
+}
+
+export interface AliceDialogueStructuredPayload {
+  thought: string
+  emotion: AliceEmotion
+  reply: string
+  policyLocked?: string
+  rawEmotion?: string
+}
+
+export interface AliceDialogueRespondedPayload {
+  turnId: string
+  sessionId: string
+  structured: AliceDialogueStructuredPayload
+  isFallback: boolean
+  createdAt: number
+}
+
+export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
+export type AliceToolActionCategory = 'read' | 'write' | 'delete' | 'execute' | 'network' | 'unknown'
+
+export interface AliceSafetyPermissionRequest {
+  requestId: string
+  token: string
+  riskLevel: AliceToolRiskLevel
+  actionCategory: AliceToolActionCategory
+  serverName: string
+  toolName: string
+  reason: string
+  resourceLabel?: string
+  timeoutMs: number
+  createdAt: number
+  supportsRememberSession: boolean
+}
+
+export interface AliceSafetyPermissionDecision {
+  token: string
+  requestId: string
+  allow: boolean
+  rememberSession?: boolean
+  reason?: string
+}
+
+export interface AliceSafetyPermissionDecisionResult {
+  accepted: boolean
+  reason?: string
+}
+
 export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
 export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:get-soul')
 export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
@@ -440,9 +515,12 @@ export const electronAliceAppendConversationTurn = defineInvokeEventa<void, Alic
 export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
 export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
 export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot>('eventa:invoke:electron:alice:sensory:get-snapshot')
+export const electronAliceSafetyResolvePermission = defineInvokeEventa<AliceSafetyPermissionDecisionResult, AliceSafetyPermissionDecision>('eventa:invoke:electron:alice:safety:resolve-permission')
 
 export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
 export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')
+export const aliceDialogueResponded = defineEventa<AliceDialogueRespondedPayload>('eventa:event:electron:alice:dialogue:responded')
+export const aliceSafetyPermissionRequested = defineEventa<AliceSafetyPermissionRequest>('eventa:event:electron:alice:safety:permission-requested')
 
 export { electron } from '@proj-airi/electron-eventa'
 export * from '@proj-airi/electron-eventa/electron-updater'

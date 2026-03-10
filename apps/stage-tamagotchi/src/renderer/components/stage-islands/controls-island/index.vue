@@ -4,7 +4,7 @@ import { useElectronEventaContext, useElectronEventaInvoke } from '@proj-airi/el
 import { useSettings, useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
 import { useTheme } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import ControlButtonTooltip from './control-button-tooltip.vue'
@@ -42,7 +42,7 @@ const hearingDialogOpen = ref(false)
 defineExpose({ hearingDialogOpen })
 
 // Apply alwaysOnTop on mount and when it changes
-watch(alwaysOnTop, (val) => {
+watch(alwaysOnTop, (val: boolean) => {
   setAlwaysOnTop(val)
 }, { immediate: true })
 

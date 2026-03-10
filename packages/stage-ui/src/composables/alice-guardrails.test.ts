@@ -174,6 +174,30 @@ describe('alice guardrails', () => {
     expect(runtimeSystem).toContain('Output contract (must-follow, highest priority):')
   })
 
+  it('keeps SOUL anchor untouched under sensory-heavy runtime pressure', () => {
+    const soul = '---\n{"profile":{"aliceName":"A.L.I.C.E."}}\n---\n# SOUL\n人格锚点'
+    const runtime = [
+      'Current sensory state:',
+      '[System Context: Sensory], '.concat('battery=19%,cpu=88%,memory=91%,'.repeat(220)),
+      '',
+      'Output contract (must-follow, highest priority):',
+      '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+      '- No markdown fences, no extra keys, no prose outside JSON.',
+    ].join('\n')
+
+    const { messages: nextMessages, report } = applyPromptBudget([
+      { role: 'system', content: soul },
+      { role: 'system', content: runtime },
+      { role: 'user', content: '继续' },
+    ], { totalTokens: 700 })
+
+    expect(report.safeMode.activated).toBe(false)
+    expect(report.anchorPreserved).toBe(true)
+    expect(String(nextMessages[0]?.content)).toBe(soul)
+    expect(String(nextMessages[1]?.content)).toContain('Output contract (must-follow, highest priority):')
+    expect(report.sections.sensory.afterTokens).toBeLessThanOrEqual(report.sections.sensory.beforeTokens)
+  })
+
   it('removes leaked mcp tool payload text from assistant output', () => {
     const leaked = [
       '{"name":"mcp_call_tool","arguments":{"name":"weather::get_weather","parameters":[{"name":"location","value":"United States"}],"toolbench_rapidapi_key":"secret-key"}}',

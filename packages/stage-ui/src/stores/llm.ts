@@ -42,7 +42,10 @@ function sanitizeMessages(messages: unknown[]): Message[] {
 function streamOptionsToolsCompatibilityOk(model: string, chatProvider: ChatProvider, _: Message[], options?: StreamOptions): boolean {
   if (typeof options?.supportsTools === 'boolean')
     return options.supportsTools
-  return Boolean(options?.toolsCompatibility?.get(`${chatProvider.chat(model).baseURL}-${model}`))
+  const discovered = options?.toolsCompatibility?.get(`${chatProvider.chat(model).baseURL}-${model}`)
+  if (typeof discovered === 'boolean')
+    return discovered
+  return true
 }
 
 async function streamFrom(model: string, chatProvider: ChatProvider, messages: Message[], options?: StreamOptions) {
@@ -190,6 +193,15 @@ export async function attemptForToolsCompatibilityDiscovery(model: string, chatP
 export const useLLM = defineStore('llm', () => {
   const toolsCompatibility = ref<Map<string, boolean>>(new Map())
 
+  function isToolUnsupportedError(error: unknown) {
+    const message = String(error ?? '').toLowerCase()
+    return message.includes('does not support tools')
+      || message.includes('no endpoints found that support tool use')
+      || message.includes('function calling is not supported')
+      || message.includes('tool use is not supported')
+      || message.includes('unsupported tool')
+  }
+
   async function discoverToolsCompatibility(model: string, chatProvider: ChatProvider, _: Message[], options?: Omit<StreamOptions, 'supportsTools'>) {
     // Cached, no need to discover again
     if (toolsCompatibility.value.has(`${chatProvider.chat(model).baseURL}-${model}`)) {
@@ -200,8 +212,24 @@ export const useLLM = defineStore('llm', () => {
     toolsCompatibility.value.set(`${chatProvider.chat(model).baseURL}-${model}`, res)
   }
 
-  function stream(model: string, chatProvider: ChatProvider, messages: Message[], options?: StreamOptions) {
-    return streamFrom(model, chatProvider, messages, { ...options, toolsCompatibility: toolsCompatibility.value })
+  async function stream(model: string, chatProvider: ChatProvider, messages: Message[], options?: StreamOptions) {
+    const key = `${chatProvider.chat(model).baseURL}-${model}`
+    const streamOptions = { ...options, toolsCompatibility: toolsCompatibility.value }
+    try {
+      await streamFrom(model, chatProvider, messages, streamOptions)
+    }
+    catch (error) {
+      if (typeof options?.supportsTools === 'boolean')
+        throw error
+      if (!isToolUnsupportedError(error))
+        throw error
+
+      toolsCompatibility.value.set(key, false)
+      await streamFrom(model, chatProvider, messages, {
+        ...streamOptions,
+        supportsTools: false,
+      })
+    }
   }
 
   async function models(apiUrl: string, apiKey: string) {

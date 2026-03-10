@@ -197,6 +197,67 @@ export interface AliceSensoryCacheSnapshot {
   running: boolean
 }
 
+export const aliceEmotionWhitelist = [
+  'neutral',
+  'happy',
+  'sad',
+  'angry',
+  'concerned',
+  'tired',
+  'apologetic',
+  'processing',
+] as const
+
+export type AliceEmotion = typeof aliceEmotionWhitelist[number]
+
+export function normalizeAliceEmotion(raw: unknown): { emotion: AliceEmotion, rawEmotion?: string, downgraded: boolean } {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if ((aliceEmotionWhitelist as readonly string[]).includes(value)) {
+    return {
+      emotion: value as AliceEmotion,
+      downgraded: false,
+    }
+  }
+
+  return {
+    emotion: 'neutral',
+    rawEmotion: value || undefined,
+    downgraded: Boolean(value),
+  }
+}
+
+export interface AliceDialogueStructuredPayload {
+  thought: string
+  emotion: AliceEmotion
+  reply: string
+  policyLocked?: string
+  rawEmotion?: string
+}
+
+export interface AliceDialogueRespondedPayload {
+  turnId: string
+  sessionId: string
+  structured: AliceDialogueStructuredPayload
+  isFallback: boolean
+  createdAt: number
+}
+
+export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
+
+export interface AliceSafetyPermissionRequest {
+  requestId: string
+  token: string
+  riskLevel: AliceToolRiskLevel
+  actionCategory: 'read' | 'write' | 'delete' | 'execute' | 'network' | 'unknown'
+  serverName: string
+  toolName: string
+  reason: string
+  resourceLabel?: string
+  timeoutMs: number
+  createdAt: number
+  supportsRememberSession: boolean
+}
+
 interface AliceBridge {
   bootstrap: () => Promise<AliceSoulSnapshot>
   getSoul: () => Promise<AliceSoulSnapshot>

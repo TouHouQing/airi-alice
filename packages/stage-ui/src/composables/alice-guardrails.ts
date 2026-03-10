@@ -1,5 +1,10 @@
 import type { Message } from '@xsai/shared-chat'
 
+import {
+  aliceFixedSensoryContextHeader,
+  aliceFixedStructuredContractHeader,
+} from '@proj-airi/stage-shared/alice-prompting'
+
 interface PromptBudgetOptions {
   totalTokens?: number
   soulRatio?: number
@@ -73,8 +78,8 @@ const defaultPromptBudget: Required<PromptBudgetOptions> = {
   currentTurnRatio: 0.5,
 }
 
-const runtimeSensoryHeader = 'Current sensory state:'
-const runtimeContractAnchorHeader = 'Output contract (must-follow, highest priority):'
+const runtimeSensoryHeader = aliceFixedSensoryContextHeader
+const runtimeContractAnchorHeader = aliceFixedStructuredContractHeader
 
 const defaultSanitizeOptions: Required<SanitizeOptions> = {
   timeBudgetMs: 50,

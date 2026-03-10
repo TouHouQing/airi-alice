@@ -1,6 +1,11 @@
 import type { createContext } from '@moeru/eventa/adapters/electron/main'
 
 import type {
+  AliceAuditLogInput,
+  AliceSafetyPermissionDecision,
+  AliceSafetyPermissionRequest,
+  AliceToolActionCategory,
+  AliceToolRiskLevel,
   ElectronMcpCallToolPayload,
   ElectronMcpCallToolResult,
   ElectronMcpCapabilitiesSnapshot,
@@ -12,9 +17,11 @@ import type {
   ElectronMcpToolDescriptor,
 } from '../../../../shared/eventa'
 
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
-import { env } from 'node:process'
+import { homedir } from 'node:os'
+import { isAbsolute, join, normalize, relative, resolve } from 'node:path'
+import { env, platform } from 'node:process'
 
 import { useLogg } from '@guiiai/logg'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -25,6 +32,8 @@ import { app, shell } from 'electron'
 import { z } from 'zod'
 
 import {
+  aliceSafetyPermissionRequested,
+  electronAliceSafetyResolvePermission,
   electronMcpApplyAndRestart,
   electronMcpCallTool,
   electronMcpGetCapabilitiesSnapshot,
@@ -33,7 +42,7 @@ import {
   electronMcpOpenConfigFile,
 } from '../../../../shared/eventa'
 import { onAppBeforeQuit } from '../../../libs/bootkit/lifecycle'
-import { isAliceKillSwitchSuspended } from '../../alice/state'
+import { appendAliceRuntimeAuditLog, isAliceKillSwitchSuspended, onAliceKillSwitchChanged } from '../../alice/state'
 
 interface McpServerSession {
   client: Client
@@ -70,6 +79,108 @@ const defaultMcpConfig: ElectronMcpStdioConfigFile = {
 const toolNameSeparator = '::'
 const mcpRequestTimeoutMsec = 10_000
 const mcpRequestMaxTotalTimeoutMsec = 15_000
+const permissionRequestTimeoutMsec = 60_000
+const mcpWorkspaceDirectoryName = 'Alice_Workspace'
+
+interface ToolPermissionEvaluation {
+  decision: 'allow' | 'deny' | 'prompt'
+  riskLevel: AliceToolRiskLevel
+  actionCategory: AliceToolActionCategory
+  reason: string
+  resourcePath?: string
+  allowBy?: 'workspace' | 'session-whitelist'
+}
+
+interface PendingPermissionRequest {
+  request: AliceSafetyPermissionRequest
+  resolve: (decision: AliceSafetyPermissionDecision) => void
+  timeout: ReturnType<typeof setTimeout>
+  resourcePath?: string
+  argumentsSummary?: ReturnType<typeof summarizeToolArguments>
+}
+
+function normalizeFsPath(value: string) {
+  if (!value.trim())
+    return ''
+
+  if (value.startsWith('~')) {
+    return resolve(join(homedir(), value.slice(1)))
+  }
+
+  return resolve(normalize(value))
+}
+
+function isPathWithin(basePath: string, targetPath: string) {
+  const rel = relative(basePath, targetPath)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+function maskPath(value?: string) {
+  if (!value)
+    return undefined
+
+  const normalized = normalizeFsPath(value)
+  const segments = normalized.split(/[\\/]/).filter(Boolean)
+  if (segments.length <= 2)
+    return normalized
+  return `${segments.slice(0, 2).join('/')}/.../${segments.at(-1)}`
+}
+
+function summarizeToolArguments(input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {
+      kind: Array.isArray(input) ? 'array' : typeof input,
+    }
+  }
+
+  const entries = Object.entries(input as Record<string, unknown>)
+  return {
+    kind: 'object',
+    keyCount: entries.length,
+    keys: entries.slice(0, 8).map(([key]) => key),
+  }
+}
+
+function looksLikePathString(value: string) {
+  return value.includes('/') || value.includes('\\') || /^~/.test(value) || /^[a-z]:[\\/]/i.test(value) || value.startsWith('.')
+}
+
+function collectPathCandidates(input: unknown, keyHint = '', depth = 0): string[] {
+  if (depth > 5)
+    return []
+
+  if (typeof input === 'string') {
+    if (/path|file|dir|cwd|root|target|source|output|input/i.test(keyHint) || looksLikePathString(input))
+      return [input]
+    return []
+  }
+
+  if (Array.isArray(input)) {
+    return input.flatMap(item => collectPathCandidates(item, keyHint, depth + 1))
+  }
+
+  if (input && typeof input === 'object') {
+    return Object.entries(input as Record<string, unknown>).flatMap(([key, value]) =>
+      collectPathCandidates(value, key, depth + 1),
+    )
+  }
+
+  return []
+}
+
+function inferActionCategory(toolName: string): AliceToolActionCategory {
+  if (/write|append|update|set_|put_|create|mkdir|touch|copy|move|rename/i.test(toolName))
+    return 'write'
+  if (/delete|remove|unlink|rmdir|truncate|purge/i.test(toolName))
+    return 'delete'
+  if (/exec|shell|command|terminal|run|spawn/i.test(toolName))
+    return 'execute'
+  if (/http|request|fetch|curl|post|upload|send|mail|email|webhook/i.test(toolName))
+    return 'network'
+  if (/read|cat|list|ls|dir|open|stat|search|find|glob/i.test(toolName))
+    return 'read'
+  return 'unknown'
+}
 
 function stringifyError(error: unknown) {
   if (error instanceof Error) {
@@ -77,6 +188,40 @@ function stringifyError(error: unknown) {
   }
 
   return String(error)
+}
+
+function createToolErrorResult(errorCode: string, errorMessage: string, durationMs = 0): ElectronMcpCallToolResult {
+  return {
+    isError: true,
+    ok: false,
+    errorCode,
+    errorMessage,
+    durationMs,
+    content: [
+      {
+        type: 'text',
+        text: errorMessage,
+      },
+    ],
+  }
+}
+
+function createPermissionDeniedResult(reason?: string) {
+  if (reason === 'kill-switch-suspended') {
+    return createToolErrorResult('ALICE_TOOL_ABORTED', 'Tool execution was aborted because kill switch is suspended.')
+  }
+  if (reason === 'timeout') {
+    return createToolErrorResult('ALICE_TOOL_DENIED', 'Permission request timed out. Operation was not executed.')
+  }
+  if (reason === 'user-denied') {
+    return createToolErrorResult('ALICE_TOOL_DENIED', 'User explicitly denied the requested tool operation.')
+  }
+
+  return createToolErrorResult('ALICE_TOOL_DENIED', 'Tool operation was denied by safety policy.')
+}
+
+function uniqueNormalizedPaths(paths: string[]) {
+  return [...new Set(paths.map(item => normalizeFsPath(item)).filter(Boolean))]
 }
 
 export function isFallbackEligibleMcpError(error: unknown) {
@@ -478,11 +623,42 @@ export async function setupMcpStdioManager() {
   const log = useLogg('main/mcp-stdio').useGlobalConfig()
   const manager = createMcpStdioManager()
 
+  const removeKillSwitchMcpLifecycleListener = onAliceKillSwitchChanged((snapshot) => {
+    if (snapshot.state === 'SUSPENDED') {
+      void manager.stopAll()
+        .then(() => appendAliceRuntimeAuditLog({
+          level: 'notice',
+          category: 'alice.tool.aborted.kill-switch',
+          action: 'kill-switch-stop-all',
+          message: 'Stopped all MCP sessions after kill switch suspension.',
+          payload: {
+            reason: snapshot.reason,
+          },
+        }))
+        .catch(error => log.withError(error).warn('failed to stop mcp sessions after kill switch suspension'))
+      return
+    }
+
+    void manager.applyAndRestart()
+      .then(() => appendAliceRuntimeAuditLog({
+        level: 'notice',
+        category: 'alice.tool.aborted.kill-switch',
+        action: 'kill-switch-resume-restart',
+        message: 'Re-applied MCP stdio config after kill switch resumed.',
+      }))
+      .catch(error => log.withError(error).warn('failed to restart mcp sessions after kill switch resumed'))
+  })
+
   onAppBeforeQuit(async () => {
+    removeKillSwitchMcpLifecycleListener()
     await manager.stopAll()
   })
 
   await manager.ensureConfigFile()
+  if (isAliceKillSwitchSuspended()) {
+    await manager.stopAll().catch(error => log.withError(error).warn('failed to stop mcp sessions while kill switch is suspended during startup'))
+    return manager
+  }
 
   try {
     await manager.applyAndRestart()
@@ -495,6 +671,234 @@ export async function setupMcpStdioManager() {
 }
 
 export function createMcpServersService(params: { context: ReturnType<typeof createContext>['context'], manager: McpStdioManager }) {
+  const log = useLogg('main/mcp-safety').useGlobalConfig()
+  const pendingPermissionRequests = new Map<string, PendingPermissionRequest>()
+  const sessionReadWhitelist = new Set<string>()
+  const aliceRootPath = normalizeFsPath(join(app.getPath('userData'), 'alice'))
+  const workspaceRootPath = normalizeFsPath(join(app.getPath('documents'), mcpWorkspaceDirectoryName))
+  const absolutePathBlacklist = new Set<string>([
+    aliceRootPath,
+    normalizeFsPath(join(homedir(), '.ssh')),
+    normalizeFsPath(join(homedir(), '.aws')),
+    platform === 'win32' ? normalizeFsPath('C:\\Windows\\System32') : normalizeFsPath('/etc/shadow'),
+  ])
+  const ensureWorkspaceReady = mkdir(workspaceRootPath, { recursive: true }).catch((error) => {
+    log.withError(error).warn('failed to prepare Alice workspace directory')
+  })
+
+  function isPathDeniedByBlacklist(targetPath: string) {
+    for (const deniedPath of absolutePathBlacklist) {
+      if (targetPath === deniedPath || isPathWithin(deniedPath, targetPath))
+        return true
+    }
+    return false
+  }
+
+  function isPathAllowedBySessionWhitelist(targetPath: string) {
+    for (const allowedPath of sessionReadWhitelist) {
+      if (targetPath === allowedPath || isPathWithin(allowedPath, targetPath))
+        return true
+    }
+    return false
+  }
+
+  async function appendSafetyAudit(input: AliceAuditLogInput) {
+    await appendAliceRuntimeAuditLog(input)
+  }
+
+  function evaluateToolPermission(payload: ElectronMcpCallToolPayload): ToolPermissionEvaluation {
+    const parsed = parseQualifiedToolName(payload.name)
+    const actionCategory = inferActionCategory(parsed.toolName)
+    const pathCandidates = uniqueNormalizedPaths(collectPathCandidates(payload.arguments ?? {}))
+    const resourcePath = pathCandidates[0]
+
+    const blacklistedPath = pathCandidates.find(item => isPathDeniedByBlacklist(item))
+    if (blacklistedPath) {
+      return {
+        decision: 'deny',
+        riskLevel: 'danger',
+        actionCategory,
+        reason: 'Access denied by absolute path blacklist policy.',
+        resourcePath: blacklistedPath,
+      }
+    }
+
+    if (actionCategory === 'read') {
+      if (pathCandidates.length > 0 && pathCandidates.every(item => isPathWithin(workspaceRootPath, item))) {
+        return {
+          decision: 'allow',
+          riskLevel: 'safe',
+          actionCategory,
+          reason: 'Read path is inside Alice workspace sandbox.',
+          resourcePath,
+          allowBy: 'workspace',
+        }
+      }
+
+      if (pathCandidates.length > 0 && pathCandidates.every(item => isPathAllowedBySessionWhitelist(item) || isPathWithin(workspaceRootPath, item))) {
+        return {
+          decision: 'allow',
+          riskLevel: 'safe',
+          actionCategory,
+          reason: 'Read path is allowed by in-memory session whitelist.',
+          resourcePath,
+          allowBy: 'session-whitelist',
+        }
+      }
+
+      return {
+        decision: 'prompt',
+        riskLevel: 'sensitive',
+        actionCategory,
+        reason: resourcePath
+          ? 'Read path is outside sandbox and requires one-time confirmation.'
+          : 'Read operation has no explicit path and requires one-time confirmation.',
+        resourcePath,
+      }
+    }
+
+    if (actionCategory === 'write' || actionCategory === 'delete' || actionCategory === 'execute' || actionCategory === 'network') {
+      return {
+        decision: 'prompt',
+        riskLevel: 'danger',
+        actionCategory,
+        reason: 'Dangerous tool action requires one-time human confirmation.',
+        resourcePath,
+      }
+    }
+
+    return {
+      decision: 'prompt',
+      riskLevel: 'sensitive',
+      actionCategory,
+      reason: 'Tool action cannot be confidently classified and requires one-time confirmation.',
+      resourcePath,
+    }
+  }
+
+  async function waitForPermissionDecision(
+    request: AliceSafetyPermissionRequest,
+    options?: {
+      resourcePath?: string
+      argumentsSummary?: ReturnType<typeof summarizeToolArguments>
+    },
+  ) {
+    const resourcePath = options?.resourcePath
+    const argumentsSummary = options?.argumentsSummary
+    return await new Promise<AliceSafetyPermissionDecision>((resolve) => {
+      const timeout = setTimeout(async () => {
+        pendingPermissionRequests.delete(request.token)
+        await appendSafetyAudit({
+          level: 'warning',
+          category: 'alice.safety.permission',
+          action: 'alice.safety.permission.timeout',
+          message: 'Tool permission request timed out.',
+          payload: {
+            requestId: request.requestId,
+            riskLevel: request.riskLevel,
+            toolName: request.toolName,
+            path: maskPath(resourcePath),
+            argumentsSummary,
+          },
+        })
+        resolve({
+          token: request.token,
+          requestId: request.requestId,
+          allow: false,
+          reason: 'timeout',
+        })
+      }, request.timeoutMs)
+
+      pendingPermissionRequests.set(request.token, {
+        request,
+        resolve,
+        timeout,
+        resourcePath,
+        argumentsSummary,
+      })
+    })
+  }
+
+  function resolvePendingPermission(decision: AliceSafetyPermissionDecision, reason?: string): { accepted: boolean, reason?: string } {
+    const pending = pendingPermissionRequests.get(decision.token)
+    if (!pending)
+      return { accepted: false, reason: reason ?? 'not-found' }
+
+    clearTimeout(pending.timeout)
+    pendingPermissionRequests.delete(decision.token)
+    pending.resolve(decision)
+    return { accepted: true }
+  }
+
+  async function denyAllPendingPermissionsOnKillSwitch() {
+    if (pendingPermissionRequests.size <= 0)
+      return
+
+    for (const [token, pending] of [...pendingPermissionRequests.entries()]) {
+      clearTimeout(pending.timeout)
+      pendingPermissionRequests.delete(token)
+      await appendSafetyAudit({
+        level: 'notice',
+        category: 'alice.safety.permission',
+        action: 'alice.safety.permission.denied',
+        message: 'Tool permission request was denied because kill switch is suspended.',
+        payload: {
+          requestId: pending.request.requestId,
+          riskLevel: pending.request.riskLevel,
+          toolName: pending.request.toolName,
+          reason: 'kill-switch-suspended',
+          path: maskPath(pending.resourcePath),
+          argumentsSummary: pending.argumentsSummary,
+        },
+      })
+      pending.resolve({
+        token,
+        requestId: pending.request.requestId,
+        allow: false,
+        reason: 'kill-switch-suspended',
+      })
+    }
+  }
+
+  async function runToolCallWithKillSwitchGuard(payload: ElectronMcpCallToolPayload) {
+    if (isAliceKillSwitchSuspended()) {
+      return createToolErrorResult('ALICE_TOOL_ABORTED', 'A.L.I.C.E kill switch is suspended; tool execution was aborted.')
+    }
+
+    return await new Promise<ElectronMcpCallToolResult>((resolve) => {
+      const detach = onAliceKillSwitchChanged((snapshot) => {
+        if (snapshot.state !== 'SUSPENDED')
+          return
+        detach()
+        resolve(createToolErrorResult('ALICE_TOOL_ABORTED', 'A.L.I.C.E kill switch is suspended; tool execution was aborted.'))
+      })
+
+      params.manager.callTool(payload)
+        .then((result) => {
+          detach()
+          resolve(result)
+        })
+        .catch((error) => {
+          detach()
+          resolve(createToolErrorResult('MCP_CALL_FAILED', stringifyError(error)))
+        })
+    })
+  }
+
+  const removeKillSwitchListener = onAliceKillSwitchChanged((snapshot) => {
+    if (snapshot.state !== 'SUSPENDED')
+      return
+    void denyAllPendingPermissionsOnKillSwitch()
+  })
+  onAppBeforeQuit(() => {
+    removeKillSwitchListener()
+    for (const pending of pendingPermissionRequests.values()) {
+      clearTimeout(pending.timeout)
+    }
+    pendingPermissionRequests.clear()
+    sessionReadWhitelist.clear()
+  })
+
   defineInvokeHandler(params.context, electronMcpOpenConfigFile, async () => {
     return params.manager.openConfigFile()
   })
@@ -511,8 +915,178 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
     return params.manager.listTools()
   })
 
+  defineInvokeHandler(params.context, electronAliceSafetyResolvePermission, async (payload) => {
+    if (typeof payload?.token !== 'string' || !payload.token.trim())
+      return { accepted: false, reason: 'invalid-token' }
+
+    const pending = pendingPermissionRequests.get(payload.token)
+    if (!pending)
+      return { accepted: false, reason: 'not-found' }
+
+    if (typeof payload.requestId !== 'string' || payload.requestId.trim() !== pending.request.requestId) {
+      return { accepted: false, reason: 'context-mismatch' }
+    }
+
+    const normalizedDecision: AliceSafetyPermissionDecision = {
+      ...payload,
+      reason: payload.reason ?? (payload.allow ? 'user-approved' : 'user-denied'),
+    }
+
+    const result = resolvePendingPermission(normalizedDecision, 'resolved')
+    if (!result.accepted)
+      return result
+
+    if (payload.allow && payload.rememberSession && pending.request.actionCategory === 'read' && pending.resourcePath) {
+      sessionReadWhitelist.add(pending.resourcePath)
+      await appendSafetyAudit({
+        level: 'notice',
+        category: 'alice.tool.allowed.session-whitelist',
+        action: 'added',
+        message: 'Added read path into session whitelist after user approval.',
+        payload: {
+          requestId: pending.request.requestId,
+          path: maskPath(pending.resourcePath),
+          toolName: pending.request.toolName,
+        },
+      })
+    }
+
+    await appendSafetyAudit({
+      level: payload.allow ? 'notice' : 'warning',
+      category: 'alice.safety.permission',
+      action: payload.allow ? 'alice.safety.permission.approved' : 'alice.safety.permission.denied',
+      message: payload.allow ? 'Tool permission approved by user.' : 'Tool permission denied by user.',
+      payload: {
+        requestId: pending.request.requestId,
+        riskLevel: pending.request.riskLevel,
+        toolName: pending.request.toolName,
+        reason: normalizedDecision.reason,
+        path: maskPath(pending.resourcePath),
+        argumentsSummary: pending.argumentsSummary,
+      },
+    })
+    return { accepted: true }
+  })
+
   defineInvokeHandler(params.context, electronMcpCallTool, async (payload) => {
-    return params.manager.callTool(payload)
+    await ensureWorkspaceReady
+
+    if (isAliceKillSwitchSuspended()) {
+      return createToolErrorResult('ALICE_TOOL_ABORTED', 'A.L.I.C.E kill switch is suspended; MCP tool execution is disabled.')
+    }
+
+    let parsedName: { serverName: string, toolName: string }
+    try {
+      parsedName = parseQualifiedToolName(payload.name)
+    }
+    catch (error) {
+      return createToolErrorResult('INVALID_TOOL_NAME', stringifyError(error))
+    }
+
+    const permission = evaluateToolPermission(payload)
+    const argumentsSummary = summarizeToolArguments(payload.arguments)
+    if (permission.decision === 'deny') {
+      await appendSafetyAudit({
+        level: 'critical',
+        category: 'alice.tool.blocked.blacklist',
+        action: 'deny',
+        message: 'Blocked MCP tool execution due to absolute blacklist path policy.',
+        payload: {
+          toolName: parsedName.toolName,
+          serverName: parsedName.serverName,
+          actionCategory: permission.actionCategory,
+          path: maskPath(permission.resourcePath),
+          argumentsSummary,
+        },
+      })
+      return createToolErrorResult('ALICE_TOOL_DENIED', 'Access denied. Internal system state cannot be accessed via generic I/O tools.')
+    }
+
+    if (permission.allowBy === 'workspace') {
+      await appendSafetyAudit({
+        level: 'notice',
+        category: 'alice.tool.allowed.workspace',
+        action: 'allow',
+        message: 'Allowed MCP tool read operation inside sandbox workspace.',
+        payload: {
+          toolName: parsedName.toolName,
+          serverName: parsedName.serverName,
+          path: maskPath(permission.resourcePath),
+        },
+      })
+    }
+    else if (permission.allowBy === 'session-whitelist') {
+      await appendSafetyAudit({
+        level: 'notice',
+        category: 'alice.tool.allowed.session-whitelist',
+        action: 'allow',
+        message: 'Allowed MCP tool read operation by session whitelist.',
+        payload: {
+          toolName: parsedName.toolName,
+          serverName: parsedName.serverName,
+          path: maskPath(permission.resourcePath),
+        },
+      })
+    }
+
+    if (permission.decision === 'prompt') {
+      const request: AliceSafetyPermissionRequest = {
+        requestId: randomUUID(),
+        token: randomUUID(),
+        riskLevel: permission.riskLevel,
+        actionCategory: permission.actionCategory,
+        serverName: parsedName.serverName,
+        toolName: parsedName.toolName,
+        reason: permission.reason,
+        resourceLabel: maskPath(permission.resourcePath),
+        timeoutMs: permissionRequestTimeoutMsec,
+        createdAt: Date.now(),
+        supportsRememberSession: permission.actionCategory === 'read',
+      }
+
+      await appendSafetyAudit({
+        level: 'notice',
+        category: 'alice.safety.permission',
+        action: 'alice.safety.permission.requested',
+        message: 'Requested human permission before executing risky MCP tool.',
+        payload: {
+          requestId: request.requestId,
+          riskLevel: request.riskLevel,
+          actionCategory: request.actionCategory,
+          toolName: request.toolName,
+          serverName: request.serverName,
+          path: request.resourceLabel,
+          argumentsSummary,
+        },
+      })
+
+      params.context.emit(aliceSafetyPermissionRequested, request)
+      const decision = await waitForPermissionDecision(request, {
+        resourcePath: permission.resourcePath,
+        argumentsSummary,
+      })
+      if (!decision.allow) {
+        return createPermissionDeniedResult(decision.reason)
+      }
+    }
+
+    const result = await runToolCallWithKillSwitchGuard(payload)
+    if (result.isError) {
+      await appendSafetyAudit({
+        level: result.errorCode === 'ALICE_TOOL_ABORTED' ? 'notice' : 'warning',
+        category: result.errorCode === 'ALICE_TOOL_ABORTED' ? 'alice.tool.aborted.kill-switch' : 'alice.tool.execution',
+        action: result.errorCode === 'ALICE_TOOL_ABORTED' ? 'aborted' : 'failed',
+        message: result.errorCode === 'ALICE_TOOL_ABORTED'
+          ? 'MCP tool execution aborted due to kill switch state.'
+          : 'MCP tool execution failed.',
+        payload: {
+          toolName: parsedName.toolName,
+          serverName: parsedName.serverName,
+          errorCode: result.errorCode,
+        },
+      })
+    }
+    return result
   })
 
   defineInvokeHandler(params.context, electronMcpGetCapabilitiesSnapshot, async () => {
