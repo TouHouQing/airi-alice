@@ -347,7 +347,7 @@ async function fetchWithTimeout(url: string, timeoutMs = realtimeRequestTimeoutM
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'user-agent': 'AIRI-ALICE/1.0',
+        'user-agent': 'ALICIZATION/1.0',
       },
     })
   }

@@ -1,8 +1,8 @@
 <p align="center">
-  <img width="220" src="./docs/content/public/alice-logo.png" alt="AIRI-ALICE logo" />
+  <img width="220" src="./docs/content/public/alice-logo.png" alt="ALICIZATION logo" />
 </p>
 
-<h1 align="center">Project AIRI-ALICE</h1>
+<h1 align="center">Project ALICIZATION</h1>
 
 <p align="center">Artificial Labile Intelligent Cybernated Existence (A.L.I.C.E.), a local-first digital companion and super assistant system.</p>
 
@@ -130,7 +130,7 @@ With the power of modern large language models like [ChatGPT](https://chatgpt.co
 
 Perhaps you know [Neuro-sama](https://www.youtube.com/@Neurosama) already. She is currently the best virtual streamer capable of playing games, chatting, and interacting with you and the participants. Some also call this kind of being "digital human." **Sadly, as it's not open sourced, you cannot interact with her after her live streams go offline**.
 
-Therefore, this project, AIRI-ALICE, offers another possibility here: **let you own your digital life, cyber living, easily, anywhere, anytime**.
+Therefore, this project, ALICIZATION, offers another possibility here: **let you own your digital life, cyber living, easily, anywhere, anytime**.
 
 > [!NOTE]
 > A.L.I.C.E planning and implementation docs are available under `docs/content/zh-Hans/docs/alice/`:

@@ -9,7 +9,7 @@ animations:
     title: 是否使用页面特定过场动画
 dialogs:
   onboarding:
-    title: 欢迎来到 AIRI-ALICE！
+    title: 欢迎来到 ALICIZATION！
     description: 让我们设置您的第一个服务来源来开始使用。
     selectProvider: 选择服务来源
     configureProvider: 配置 {provider}

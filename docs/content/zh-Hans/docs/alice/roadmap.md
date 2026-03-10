@@ -7,7 +7,7 @@ description: Epoch 1-5 路线图、里程碑、风险与进退场标准
 
 ## 1. 规划目标
 
-本路线图用于指导 `airi-alice` 从 Epoch 1 到 Epoch 5 的递进演化，确保：
+本路线图用于指导 `alicization` 从 Epoch 1 到 Epoch 5 的递进演化，确保：
 
 - 需求落地顺序可执行。
 - 架构投入与里程碑一致。

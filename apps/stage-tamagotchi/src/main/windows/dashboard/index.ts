@@ -40,7 +40,7 @@ const appConfigSchema = object({
 
 type AppConfig = InferOutput<typeof appConfigSchema>
 
-const dashboardWindowTitle = 'AIRI-ALICE Dashboard'
+const dashboardWindowTitle = 'ALICIZATION Dashboard'
 
 export async function setupDashboardWindow(params: {
   settingsWindow: () => Promise<BrowserWindow>

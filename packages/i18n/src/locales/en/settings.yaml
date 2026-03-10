@@ -10,7 +10,7 @@ animations:
     title: Use Page Specific Transitions
 dialogs:
   onboarding:
-    title: Welcome to AIRI-ALICE!
+    title: Welcome to ALICIZATION!
     description: Let's set up your first AI provider to get started.
     selectProvider: Choose an AI Provider
     configureProvider: Configure {provider}
@@ -35,7 +35,7 @@ dialogs:
 language:
   title: Language
   description: >
-    Change the language of the AIRI-ALICE interface. This will not affect the language
+    Change the language of the ALICIZATION interface. This will not affect the language
     of the character's responses.
 controls-island:
   icon-size:
