@@ -1,5 +1,7 @@
 import type {
   AliceAuditLogInput,
+  AliceConversationTurnInput,
+  AliceDialogueRespondedPayload,
   AliceGender,
   AliceGenesisInput,
   AlicePersonalityState,
@@ -21,6 +23,7 @@ import { createContext } from '@moeru/eventa/adapters/electron/main'
 import { app, globalShortcut, ipcMain } from 'electron'
 
 import {
+  aliceDialogueResponded,
   aliceKillSwitchStateChanged,
   aliceSoulChanged,
   electronAliceAppendAuditLog,
@@ -41,11 +44,12 @@ import {
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
+  normalizeAliceEmotion,
 } from '../../../shared/eventa'
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
 import { setupAliceDb } from './db'
 import { createAliceSensoryBus } from './sensory-bus'
-import { getAliceKillSwitchSnapshot, setAliceKillSwitchState } from './state'
+import { getAliceKillSwitchSnapshot, setAliceAuditLogger, setAliceKillSwitchState } from './state'
 
 const currentSoulSchemaVersion = 2
 const soulPersonaNotesStart = '<!-- ALICE_PERSONA_NOTES_START -->'
@@ -802,6 +806,44 @@ function isAbortError(error: unknown) {
     && (error as { name?: unknown }).name === 'AbortError'
 }
 
+function readStringValue(value: unknown) {
+  return typeof value === 'string' ? value : ''
+}
+
+function normalizeDialogueRespondedPayload(input: AliceConversationTurnInput): AliceDialogueRespondedPayload | null {
+  const normalizedSessionId = input.sessionId?.trim()
+  if (!normalizedSessionId)
+    return null
+
+  const structuredPayload = input.structured && typeof input.structured === 'object' ? input.structured : {}
+  const thought = readStringValue((structuredPayload as Record<string, unknown>).thought).trim()
+  const rawEmotion = readStringValue((structuredPayload as Record<string, unknown>).emotion).trim().toLowerCase()
+  const reply = readStringValue((structuredPayload as Record<string, unknown>).reply).trim()
+    || input.assistantText?.trim()
+    || ''
+  const parsePath = readStringValue((structuredPayload as Record<string, unknown>).parsePath).trim().toLowerCase()
+  const contractFailed = (structuredPayload as Record<string, unknown>).contractFailed === true
+  const policyLocked = readStringValue((structuredPayload as Record<string, unknown>).policyLocked).trim()
+  const normalizedEmotionResult = normalizeAliceEmotion(rawEmotion)
+  const createdAt = input.createdAt ?? Date.now()
+  const turnId = input.turnId?.trim() || `turn:${normalizedSessionId}:${createdAt}`
+  const isFallback = contractFailed || !['json', 'repair-json'].includes(parsePath)
+
+  return {
+    turnId,
+    sessionId: normalizedSessionId,
+    structured: {
+      thought,
+      emotion: normalizedEmotionResult.emotion,
+      reply,
+      policyLocked: policyLocked || undefined,
+      rawEmotion: normalizedEmotionResult.downgraded ? normalizedEmotionResult.rawEmotion : undefined,
+    },
+    isFallback,
+    createdAt,
+  }
+}
+
 interface AliceRuntimeSetupOptions {
   userDataPathOverride?: string
 }
@@ -842,6 +884,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       console.warn('[alice-runtime] failed to append audit log:', error)
     }
   }
+  setAliceAuditLogger(appendAuditLog)
 
   const sensoryBus = createAliceSensoryBus({
     tickMs: 60_000,
@@ -1371,7 +1414,27 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   defineInvokeHandler(context, electronAliceKillSwitchResume, async payload => await resumeKillSwitch(payload?.reason ?? 'manual'))
 
   defineInvokeHandler(context, electronAliceGetMemoryStats, async () => await aliceDb.getMemoryStats())
-  defineInvokeHandler(context, electronAliceGetSensorySnapshot, async () => sensoryBus.getSnapshot())
+  defineInvokeHandler(context, electronAliceGetSensorySnapshot, async () => {
+    let snapshot = sensoryBus.getSnapshot()
+    if (snapshot.stale && snapshot.running && getAliceKillSwitchSnapshot().state !== 'SUSPENDED') {
+      try {
+        await sensoryBus.refreshNow({ force: true, timeoutMs: 1_200 })
+      }
+      catch (error) {
+        await appendAuditLog({
+          level: 'warning',
+          category: 'alice.sensory',
+          action: 'refresh-stale-failed',
+          message: 'Failed to refresh stale sensory snapshot before renderer request.',
+          payload: {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+      snapshot = sensoryBus.getSnapshot()
+    }
+    return snapshot
+  })
   defineInvokeHandler(context, electronAliceUpdateMemoryStats, async payload => await aliceDb.overrideMemoryStats(payload))
   defineInvokeHandler(context, electronAliceRunMemoryPrune, async () => await aliceDb.runMemoryPrune())
   defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit))
@@ -1410,6 +1473,37 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
     try {
       await aliceDb.appendConversationTurn(payload, { signal })
+      if (signal?.aborted || getAliceKillSwitchSnapshot().state === 'SUSPENDED') {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-abort-dropped',
+          message: 'Dropped dialogue responded event because the turn was aborted after persistence.',
+          payload: {
+            sessionId: payload.sessionId,
+            turnId: payload.turnId,
+          },
+        })
+        return
+      }
+
+      const dialoguePayload = normalizeDialogueRespondedPayload(payload)
+      if (dialoguePayload) {
+        context.emit(aliceDialogueResponded, dialoguePayload)
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.dialogue',
+          action: 'alice.dialogue.responded.emitted',
+          message: 'Emitted alice.dialogue.responded after successful turn persistence.',
+          payload: {
+            turnId: dialoguePayload.turnId,
+            sessionId: dialoguePayload.sessionId,
+            isFallback: dialoguePayload.isFallback,
+            emotion: dialoguePayload.structured.emotion,
+            rawEmotion: dialoguePayload.structured.rawEmotion,
+          },
+        })
+      }
     }
     catch (error) {
       if (isAbortError(error) || signal?.aborted) {
@@ -1478,6 +1572,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     stopWatch()
     sensoryBus.stop('shutdown')
     turnWriteAbortControllers.clear()
+    setAliceAuditLogger(undefined)
     if (pruneTimer) {
       clearInterval(pruneTimer)
       pruneTimer = undefined

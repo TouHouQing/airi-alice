@@ -252,7 +252,7 @@ function installAliceBridge() {
   } as any)
 }
 
-describe('chat orchestrator (alice epoch1 strict)', () => {
+describe('chat orchestrator', () => {
   beforeEach(() => {
     const pinia = createTestingPinia({ createSpy: vi.fn, stubActions: false })
     setActivePinia(pinia)
@@ -270,13 +270,13 @@ describe('chat orchestrator (alice epoch1 strict)', () => {
     ensureSessionMessages(activeSessionId.value)
   })
 
-  it('uses strict personality-refusal path for realtime queries without execution engine', async () => {
+  it('uses realtime execution engine first and keeps tools enabled in default Epoch2 mode', async () => {
     streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
-      expect(options.supportsTools).toBe(false)
-      expect(options.waitForTools).toBe(false)
+      expect(options.supportsTools).toBe(true)
+      expect(options.waitForTools).toBe(true)
       await options.onStreamEvent?.({
         type: 'text-delta',
-        text: '{"thought":"当前权限受限","emotion":"neutral","reply":"抱歉，我在 Epoch 1 阶段无法访问实时外部数据。"}',
+        text: '{"thought":"normal","emotion":"neutral","reply":"这是普通回复。"}',
       })
       await options.onStreamEvent?.({ type: 'finish' })
     })
@@ -289,12 +289,12 @@ describe('chat orchestrator (alice epoch1 strict)', () => {
       origin: 'ui-user',
     })
 
-    expect(executeRealtimeQueryTurnMock).toBeCalledTimes(0)
+    expect(executeRealtimeQueryTurnMock).toBeCalledTimes(1)
     expect(streamMock).toBeCalledTimes(1)
     expect(appendConversationTurnMock).toBeCalledTimes(1)
     const payload = appendConversationTurnMock.mock.calls[0]?.[0]
-    expect(payload?.structured?.policyLocked).toBe('epoch1-strict-realtime')
-    expect(payload?.assistantText).toContain('Epoch 1')
+    expect(payload?.structured?.policyLocked).toBeUndefined()
+    expect(payload?.assistantText).toContain('普通回复')
   })
 
   it('drops in-flight turn persistence after kill-switch abort', async () => {

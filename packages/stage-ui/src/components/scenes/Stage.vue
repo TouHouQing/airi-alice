@@ -26,7 +26,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import { useDelayMessageQueue, useEmotionsMessageQueue } from '../../composables/queues'
 import { llmInferenceEndToken } from '../../constants'
-import { EMOTION_EmotionMotionName_value, EMOTION_VRMExpressionName_value, EmotionThinkMotionName } from '../../constants/emotions'
+import { Emotion, EMOTION_EmotionMotionName_value, EMOTION_VRMExpressionName_value, EmotionThinkMotionName } from '../../constants/emotions'
+import { useAlicePresenceDispatcherStore } from '../../stores/alice-presence-dispatcher'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useChatOrchestratorStore } from '../../stores/chat'
 import { useAiriCardStore } from '../../stores/modules'
@@ -72,11 +73,13 @@ const currentAudioSource = ref<AudioBufferSourceNode>()
 
 const { onBeforeMessageComposed, onBeforeSend, onTokenLiteral, onTokenSpecial, onStreamEnd, onAssistantResponseEnd } = useChatOrchestratorStore()
 const chatHookCleanups: Array<() => void> = []
+const presenceCleanups: Array<() => void> = []
 // WORKAROUND: clear previous handlers on unmount to avoid duplicate calls when this component remounts.
 //             We keep per-hook disposers instead of wiping the global chat hooks to play nicely with
 //             cross-window broadcast wiring.
 
 const providersStore = useProvidersStore()
+const alicePresenceDispatcherStore = useAlicePresenceDispatcherStore()
 const live2dStore = useLive2d()
 const vrmStore = useModelStore()
 
@@ -120,7 +123,7 @@ const live2dLipSyncOptions: Live2DLipSyncOptions = { mouthUpdateIntervalMs: 50, 
 
 const { activeCard } = storeToRefs(useAiriCardStore())
 const speechStore = useSpeechStore()
-const { ssmlEnabled, activeSpeechProvider, activeSpeechModel, activeSpeechVoice, pitch } = storeToRefs(speechStore)
+const { ssmlEnabled, activeSpeechProvider, activeSpeechModel, activeSpeechVoice, pitch, rate } = storeToRefs(speechStore)
 const activeCardId = computed(() => activeCard.value?.name ?? 'default')
 const speechRuntimeStore = useSpeechRuntimeStore()
 
@@ -146,6 +149,7 @@ const emotionsQueue = createQueue<EmotionPayload>({
 
 const emotionMessageContentQueue = useEmotionsMessageQueue(emotionsQueue)
 emotionMessageContentQueue.onHandlerEvent('emotion', (emotion) => {
+  applyEmotionSpeechStyle(emotion.name)
   // eslint-disable-next-line no-console
   console.debug('emotion detected', emotion)
 })
@@ -162,6 +166,48 @@ function playSpecialToken(special: string) {
   emotionMessageContentQueue.enqueue(special)
 }
 const lipSyncNode = ref<AudioNode>()
+const emotionPitchDelta = ref(0)
+const emotionRateMultiplier = ref(1)
+
+function normalizePresenceEmotionName(rawEmotion: string): EmotionPayload['name'] {
+  const normalized = rawEmotion.trim().toLowerCase()
+  if (normalized === 'happy')
+    return Emotion.Happy
+  if (normalized === 'sad')
+    return Emotion.Sad
+  if (normalized === 'angry')
+    return Emotion.Angry
+  if (normalized === 'surprised')
+    return Emotion.Surprise
+  if (normalized === 'awkward')
+    return Emotion.Awkward
+  if (normalized === 'question' || normalized === 'concerned')
+    return Emotion.Question
+  if (normalized === 'curious')
+    return Emotion.Curious
+  if (normalized === 'tired' || normalized === 'apologetic')
+    return Emotion.Sad
+  if (normalized === 'think')
+    return Emotion.Think
+  return Emotion.Neutral
+}
+
+function applyEmotionSpeechStyle(emotionName: EmotionPayload['name']) {
+  const styleMap: Record<Emotion, { pitchDelta: number, rateMultiplier: number }> = {
+    [Emotion.Happy]: { pitchDelta: 8, rateMultiplier: 1.06 },
+    [Emotion.Sad]: { pitchDelta: -10, rateMultiplier: 0.94 },
+    [Emotion.Angry]: { pitchDelta: 4, rateMultiplier: 1.08 },
+    [Emotion.Think]: { pitchDelta: -2, rateMultiplier: 0.97 },
+    [Emotion.Surprise]: { pitchDelta: 10, rateMultiplier: 1.1 },
+    [Emotion.Awkward]: { pitchDelta: -4, rateMultiplier: 0.95 },
+    [Emotion.Question]: { pitchDelta: 3, rateMultiplier: 1.02 },
+    [Emotion.Curious]: { pitchDelta: 4, rateMultiplier: 1.04 },
+    [Emotion.Neutral]: { pitchDelta: 0, rateMultiplier: 1 },
+  }
+  const style = styleMap[emotionName]
+  emotionPitchDelta.value = style.pitchDelta
+  emotionRateMultiplier.value = style.rateMultiplier
+}
 
 async function playFunction(item: Parameters<Parameters<typeof createPlaybackManager<AudioBuffer>>[0]['play']>[0], signal: AbortSignal): Promise<void> {
   if (!audioContext || !item.audio)
@@ -302,8 +348,16 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
     if (!model || !voice)
       return null
 
+    const styledPitch = Math.max(-50, Math.min(50, pitch.value + emotionPitchDelta.value))
+    const styledRate = Math.max(0.5, Math.min(2, rate.value * emotionRateMultiplier.value))
+    const providerRuntimeConfigForSsml = {
+      ...providerConfig,
+      pitch: styledPitch,
+      speed: styledRate,
+    }
+
     const input = ssmlEnabled.value
-      ? speechStore.generateSSML(request.text, voice, { ...providerConfig, pitch: pitch.value })
+      ? speechStore.generateSSML(request.text, voice, providerRuntimeConfigForSsml)
       : request.text
 
     try {
@@ -327,6 +381,41 @@ const speechPipeline = createSpeechPipeline<AudioBuffer>({
 })
 
 void speechRuntimeStore.registerHost(speechPipeline)
+let currentChatIntent: ReturnType<typeof speechRuntimeStore.openIntent> | null = null
+
+presenceCleanups.push(alicePresenceDispatcherStore.registerLive2DController({
+  playEmotion: async (emotion, payload) => {
+    const emotionName = normalizePresenceEmotionName(emotion)
+    emotionsQueue.enqueue({
+      name: emotionName,
+      intensity: payload.isFallback ? 0.75 : 1,
+    })
+    applyEmotionSpeechStyle(emotionName)
+  },
+}))
+
+presenceCleanups.push(alicePresenceDispatcherStore.registerTTSController({
+  speak: async (reply, emotion) => {
+    const emotionName = normalizePresenceEmotionName(emotion)
+    applyEmotionSpeechStyle(emotionName)
+
+    const normalizedReply = reply.trim()
+    if (!normalizedReply)
+      return
+
+    if (currentChatIntent || nowSpeaking.value)
+      return
+
+    const fallbackIntent = speechRuntimeStore.openIntent({
+      ownerId: activeCardId.value,
+      priority: 'normal',
+      behavior: 'queue',
+    })
+    fallbackIntent.writeLiteral(normalizedReply)
+    fallbackIntent.writeFlush()
+    fallbackIntent.end()
+  },
+}))
 
 speechPipeline.on('onSpecial', (segment) => {
   if (segment.special)
@@ -401,8 +490,6 @@ function setupAnalyser() {
     audioAnalyser.value = audioContext.createAnalyser()
   }
 }
-
-let currentChatIntent: ReturnType<typeof speechRuntimeStore.openIntent> | null = null
 
 chatHookCleanups.push(onBeforeMessageComposed(async () => {
   playbackManager.stopAll('new-message')
@@ -517,6 +604,7 @@ onUnmounted(() => {
   }
 
   chatHookCleanups.forEach(dispose => dispose?.())
+  presenceCleanups.forEach(dispose => dispose?.())
   viewUpdateCleanups.forEach(dispose => dispose?.())
 })
 

@@ -7,6 +7,9 @@ export interface AlicePromptTemplateVars {
   moduleName: string
 }
 
+export const aliceFixedSensoryContextHeader = 'Current sensory state:'
+export const aliceFixedStructuredContractHeader = 'Output contract (must-follow, highest priority):'
+
 export const aliceFixedCoreSystemInstruction = [
   '- For any programming code block, always specify the programming language in fenced markdown, eg. ```python ... ```.',
   '- For any math equation, use LaTeX format, eg: $ x^3 $, always escape dollar sign outside math equations.',
@@ -21,9 +24,9 @@ export const aliceFixedHostNameDirectiveTemplate = 'The user you are talking to 
 export const aliceFixedDatetimeContextTemplate = 'Current datetime:\n- ISO: {{iso}}\n- Local: {{local}}'
 export const aliceFixedMemoryContextTemplate = 'Relevant memory facts:\n{{content}}'
 export const aliceFixedGenericContextTemplate = 'Context from {{source}}:\n{{content}}'
-export const aliceFixedSensoryContextTemplate = 'Current sensory state:\n{{content}}'
+export const aliceFixedSensoryContextTemplate = `${aliceFixedSensoryContextHeader}\n{{content}}`
 export const aliceFixedStructuredContractAnchor = [
-  'Output contract (must-follow, highest priority):',
+  aliceFixedStructuredContractHeader,
   '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
   '- No markdown fences, no extra keys, no prose outside JSON.',
 ].join('\n')

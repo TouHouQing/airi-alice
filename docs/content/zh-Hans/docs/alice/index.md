@@ -1,6 +1,6 @@
 ---
 title: A.L.I.C.E 文档索引
-description: A.L.I.C.E 需求、架构、规划与 Epoch 1 开发文档入口
+description: A.L.I.C.E 需求、架构、规划与 Epoch 1/2 开发与验收文档入口
 ---
 
 # A.L.I.C.E 文档索引
@@ -12,6 +12,7 @@ description: A.L.I.C.E 需求、架构、规划与 Epoch 1 开发文档入口
 3. [未来规划文档（Epoch 路线）](./roadmap)
 4. [开发需求文档（仅 Epoch 1，任务级）](./development-epoch1)
 5. [Epoch1 收官验收报告](./epoch1-closure-report)
+6. [Epoch2 收官验收报告（进行中）](./epoch2-closure-report)
 
 ## 2. 建议阅读顺序
 
@@ -20,6 +21,7 @@ description: A.L.I.C.E 需求、架构、规划与 Epoch 1 开发文档入口
 3. 再读 `roadmap.md`，确认阶段节奏与风险。
 4. 最后读 `development-epoch1.md`，按任务清单执行开发。
 5. 执行完成后读 `epoch1-closure-report.md`，核对门禁与回归结果。
+6. 进入 Epoch2 后读 `epoch2-closure-report.md`，核对 M2.1/M2.2/M2.3 门禁。
 
 ## 3. 追踪矩阵（需求ID -> 架构章节 -> Epoch1任务ID）
 

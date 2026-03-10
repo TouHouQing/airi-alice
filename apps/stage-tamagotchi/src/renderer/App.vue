@@ -1,10 +1,13 @@
 <script setup lang="ts">
+import type { AliceSafetyPermissionRequest } from '@proj-airi/stage-ui/stores/alice-bridge'
+
 import { defineInvokeHandler } from '@moeru/eventa'
 import { useElectronEventaContext, useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { themeColorFromValue, useThemeColor } from '@proj-airi/stage-layouts/composables/theme-color'
 import { ToasterRoot } from '@proj-airi/stage-ui/components'
 import { clearAliceBridge, setAliceBridge } from '@proj-airi/stage-ui/stores/alice-bridge'
 import { useAliceEpoch1Store } from '@proj-airi/stage-ui/stores/alice-epoch1'
+import { useAlicePresenceDispatcherStore } from '@proj-airi/stage-ui/stores/alice-presence-dispatcher'
 import { useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
 import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/character'
 import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
@@ -29,7 +32,9 @@ import { toast, Toaster } from 'vue-sonner'
 import ResizeHandler from './components/ResizeHandler.vue'
 
 import {
+  aliceDialogueResponded,
   aliceKillSwitchStateChanged,
+  aliceSafetyPermissionRequested,
   aliceSoulChanged,
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
@@ -46,6 +51,7 @@ import {
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
   electronAliceRunMemoryPrune,
+  electronAliceSafetyResolvePermission,
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
@@ -84,6 +90,7 @@ const hearingSpeechInputPipeline = useHearingSpeechInputPipeline()
 const serverChannelStore = useModsServerChannelStore()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
 const aliceEpoch1Store = useAliceEpoch1Store()
+const alicePresenceDispatcherStore = useAlicePresenceDispatcherStore()
 const analyticsStore = useSharedAnalyticsStore()
 const pluginHostInspectorStore = usePluginHostInspectorStore()
 const {
@@ -125,6 +132,7 @@ const aliceUpdateMemoryStats = useElectronEventaInvoke(electronAliceUpdateMemory
 const aliceAppendConversationTurn = useElectronEventaInvoke(electronAliceAppendConversationTurn)
 const aliceAppendAuditLog = useElectronEventaInvoke(electronAliceAppendAuditLog)
 const aliceRealtimeExecute = useElectronEventaInvoke(electronAliceRealtimeExecute)
+const aliceResolveSafetyPermission = useElectronEventaInvoke(electronAliceSafetyResolvePermission)
 
 const showGenesisDialog = computed(() => aliceNeedsGenesis.value)
 const hasGenesisConflictCandidate = computed(() => Boolean(genesisConflictCandidate.value))
@@ -145,7 +153,49 @@ const genesisForm = ref({
 })
 const genesisError = ref('')
 const genesisLoading = ref(false)
+const pendingSafetyRequests = ref<AliceSafetyPermissionRequest[]>([])
+const safetyRememberSession = ref(false)
+const safetyResolving = ref(false)
+const activeSafetyRequest = computed(() => pendingSafetyRequests.value[0] ?? null)
+const hasPendingSafetyRequest = computed(() => Boolean(activeSafetyRequest.value))
 const unregisterPipelineAborters: Array<() => void> = []
+
+function enqueueSafetyRequest(request: AliceSafetyPermissionRequest) {
+  if (!request?.token)
+    return
+  if (pendingSafetyRequests.value.some(item => item.token === request.token))
+    return
+  pendingSafetyRequests.value = [...pendingSafetyRequests.value, request]
+}
+
+function shiftSafetyRequest() {
+  pendingSafetyRequests.value = pendingSafetyRequests.value.slice(1)
+  safetyRememberSession.value = false
+}
+
+async function resolveSafetyRequest(allow: boolean) {
+  const request = activeSafetyRequest.value
+  if (!request || safetyResolving.value)
+    return
+
+  safetyResolving.value = true
+  try {
+    await aliceResolveSafetyPermission({
+      token: request.token,
+      requestId: request.requestId,
+      allow,
+      rememberSession: allow && request.supportsRememberSession && safetyRememberSession.value,
+      reason: allow ? 'user-approved' : 'user-denied',
+    })
+  }
+  catch (error) {
+    toast.error(error instanceof Error ? error.message : String(error))
+  }
+  finally {
+    shiftSafetyRequest()
+    safetyResolving.value = false
+  }
+}
 
 function getSoulBodyFromContent(content: string) {
   if (!content.startsWith('---\n'))
@@ -406,6 +456,9 @@ onMounted(async () => {
   characterOrchestratorStore.initialize()
   await aliceEpoch1Store.initialize()
   await startTrackingCursorPoint()
+  alicePresenceDispatcherStore.setAuditLogger(async (input) => {
+    await aliceAppendAuditLog(input).catch(() => {})
+  })
 
   unregisterPipelineAborters.push(chatOrchestratorStore.registerPipelineAborter(async () => {
     await hearingSpeechInputPipeline.stopStreamingTranscription(true).catch(() => {})
@@ -432,9 +485,17 @@ onMounted(async () => {
   context.value.on(aliceSoulChanged, (event: any) => {
     aliceEpoch1Store.setSoulSnapshot(event.body)
   })
+  context.value.on(aliceDialogueResponded, (event: any) => {
+    void alicePresenceDispatcherStore.dispatchDialogueResponded(event.body)
+  })
+  context.value.on(aliceSafetyPermissionRequested, (event: any) => {
+    enqueueSafetyRequest(event.body)
+  })
   context.value.on(aliceKillSwitchStateChanged, (event: any) => {
     aliceEpoch1Store.setKillSwitchSnapshot(event.body)
     if (event.body.state === 'SUSPENDED') {
+      pendingSafetyRequests.value = []
+      safetyRememberSession.value = false
       void chatOrchestratorStore.abortAllPipelines('kill-switch')
       characterOrchestratorStore.stopTicker()
     }
@@ -456,6 +517,9 @@ onUnmounted(() => {
   while (unregisterPipelineAborters.length > 0) {
     unregisterPipelineAborters.pop()?.()
   }
+  pendingSafetyRequests.value = []
+  safetyRememberSession.value = false
+  alicePresenceDispatcherStore.resetDispatcher()
   aliceEpoch1Store.dispose()
   contextBridgeStore.dispose()
   clearAliceBridge()
@@ -646,6 +710,55 @@ onUnmounted(() => {
           @click="submitGenesis(false)"
         >
           {{ genesisLoading ? '保存中...' : '完成初始化' }}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div
+    v-if="hasPendingSafetyRequest && activeSafetyRequest"
+    class="fixed inset-0 z-10000 flex items-center justify-center bg-black/60 px-4"
+  >
+    <div class="max-w-lg w-full rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900">
+      <div class="mb-2 text-xs text-amber-600 font-semibold tracking-wide uppercase dark:text-amber-300">
+        Human In The Loop
+      </div>
+      <h3 class="text-base font-semibold">
+        A.L.I.C.E 请求执行高风险工具
+      </h3>
+      <p class="mt-2 text-sm text-neutral-700 dark:text-neutral-200">
+        工具：{{ activeSafetyRequest.serverName }}::{{ activeSafetyRequest.toolName }}
+      </p>
+      <p class="mt-1 text-sm text-neutral-700 dark:text-neutral-200">
+        风险级别：{{ activeSafetyRequest.riskLevel }} / 动作：{{ activeSafetyRequest.actionCategory }}
+      </p>
+      <p v-if="activeSafetyRequest.resourceLabel" class="mt-1 break-all text-xs text-neutral-500 dark:text-neutral-400">
+        目标：{{ activeSafetyRequest.resourceLabel }}
+      </p>
+      <p class="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
+        {{ activeSafetyRequest.reason }}
+      </p>
+      <label
+        v-if="activeSafetyRequest.supportsRememberSession"
+        class="mt-3 flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-300"
+      >
+        <input v-model="safetyRememberSession" type="checkbox">
+        本次运行内记住该读取路径（重启后失效）
+      </label>
+      <div class="mt-4 flex justify-end gap-2">
+        <button
+          class="border border-neutral-300 rounded px-3 py-1.5 text-sm dark:border-neutral-700"
+          :disabled="safetyResolving"
+          @click="resolveSafetyRequest(false)"
+        >
+          拒绝
+        </button>
+        <button
+          class="rounded bg-emerald-600 px-3 py-1.5 text-sm text-white disabled:opacity-60"
+          :disabled="safetyResolving"
+          @click="resolveSafetyRequest(true)"
+        >
+          {{ safetyResolving ? '处理中...' : '允许一次' }}
         </button>
       </div>
     </div>
