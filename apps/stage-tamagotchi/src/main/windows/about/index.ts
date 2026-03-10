@@ -19,7 +19,7 @@ export function setupAboutWindowReusable(params: {
 }) {
   return createReusableWindow(async () => {
     const window = new BrowserWindow({
-      title: 'About AIRI-ALICE',
+      title: 'About ALICIZATION',
       width: 670,
       height: 730,
       show: false,

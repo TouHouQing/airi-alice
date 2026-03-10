@@ -7,7 +7,7 @@ description: 覆盖 Project A.L.I.C.E 从 Epoch 1 到 Epoch 5 的完整需求基
 
 ## 1. 文档定位
 
-本文档是 `airi-alice` 的产品与工程需求基线，面向开发团队，用于回答三个问题：
+本文档是 `alicization` 的产品与工程需求基线，面向开发团队，用于回答三个问题：
 
 1. 最终要做成什么。
 2. 每个 Epoch 必须交付什么。

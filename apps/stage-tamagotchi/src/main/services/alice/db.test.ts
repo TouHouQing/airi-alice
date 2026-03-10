@@ -11,7 +11,7 @@ const metaState = new Map<string, string>()
 const sandboxDirs: string[] = []
 
 async function createSandboxUserDataPath() {
-  const dir = await mkdtemp(join(tmpdir(), 'airi-alice-db-test-'))
+  const dir = await mkdtemp(join(tmpdir(), 'alicization-db-test-'))
   sandboxDirs.push(dir)
   return dir
 }

@@ -45,7 +45,7 @@ const appConfigSchema = object({
 
 type AppConfig = InferOutput<typeof appConfigSchema>
 
-const mainWindowTitle = 'AIRI-ALICE'
+const mainWindowTitle = 'ALICIZATION'
 
 export async function setupMainWindow(params: {
   settingsWindow: () => Promise<BrowserWindow>
