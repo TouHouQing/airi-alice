@@ -124,11 +124,13 @@ describe('alice guardrails', () => {
       const budgeted = applyPromptBudget(composed.messages, {
         totalTokens: 1024,
       })
+      const runtimeMessage = budgeted.messages.find((message, index) => index !== 0 && message.role === 'system')
 
       expect(budgeted.messages[0]?.role).toBe('system')
       expect(String(budgeted.messages[0]?.content)).toBe(soul)
       expect(budgeted.report.anchorPreserved).toBe(true)
       expect(budgeted.report.totalAfterTokens).toBeLessThanOrEqual(1024)
+      expect(String(runtimeMessage?.content ?? '')).toContain('Output contract (must-follow, highest priority):')
     }
   })
 
@@ -171,6 +173,47 @@ describe('alice guardrails', () => {
 
     expect(report.sections.sensory.beforeTokens).toBeGreaterThan(0)
     expect(report.sections.sensory.afterTokens).toBeLessThanOrEqual(report.sections.sensory.beforeTokens)
+    expect(runtimeSystem).toContain('Output contract (must-follow, highest priority):')
+  })
+
+  it('keeps runtime system message protected under extreme budget pressure', () => {
+    const runtime = [
+      'Current sensory state:',
+      '[System Context: Sensory], time=2026-03-11 10:00:00,battery=20%,cpu=35%,memory=66%,location=desktop-host,'.repeat(80),
+      '',
+      'Output contract (must-follow, highest priority):',
+      '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+      '- No markdown fences, no extra keys, no prose outside JSON.',
+    ].join('\n')
+
+    const { messages: nextMessages, report } = applyPromptBudget([
+      { role: 'system', content: '# SOUL' },
+      { role: 'system', content: runtime },
+      { role: 'assistant', content: 'history'.repeat(600) },
+      { role: 'assistant', content: 'history'.repeat(600) },
+      { role: 'user', content: '请继续回答。' },
+    ], { totalTokens: 520 })
+
+    const runtimeSystem = nextMessages.find((message, index) => index !== 0 && message.role === 'system')
+    expect(runtimeSystem).toBeTruthy()
+    expect(String(runtimeSystem?.content ?? '')).toContain('Output contract (must-follow, highest priority):')
+    expect(report.runtimeContractAnchorRecovered).toBe(false)
+  })
+
+  it('recovers runtime contract anchor when it is unexpectedly missing', () => {
+    const runtimeWithoutAnchor = [
+      'Current sensory state:',
+      '[System Context: Sensory], time=2026-03-11 10:00:00,battery=20%,cpu=35%,memory=66%',
+    ].join('\n')
+
+    const { messages: nextMessages, report } = applyPromptBudget([
+      { role: 'system', content: '# SOUL' },
+      { role: 'system', content: runtimeWithoutAnchor },
+      { role: 'user', content: '继续' },
+    ], { totalTokens: 900 })
+
+    const runtimeSystem = String(nextMessages[1]?.content ?? '')
+    expect(report.runtimeContractAnchorRecovered).toBe(true)
     expect(runtimeSystem).toContain('Output contract (must-follow, highest priority):')
   })
 

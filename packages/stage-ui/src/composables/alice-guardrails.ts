@@ -2,6 +2,7 @@ import type { Message } from '@xsai/shared-chat'
 
 import {
   aliceFixedSensoryContextHeader,
+  aliceFixedStructuredContractAnchor,
   aliceFixedStructuredContractHeader,
 } from '@proj-airi/stage-shared/alice-prompting'
 
@@ -30,6 +31,7 @@ export interface PromptBudgetReport {
   totalAfterTokens: number
   droppedMessageCount: number
   anchorPreserved: boolean
+  runtimeContractAnchorRecovered: boolean
   safeMode: PromptBudgetSafeModeReport
   sections: {
     soul: PromptBudgetSectionStats
@@ -260,7 +262,7 @@ function estimateSensoryTokens(text: string) {
   return estimateTokens(sensorySegment)
 }
 
-function compactRuntimeSensorySegment(text: string, budgetTokens = 48) {
+function compressRuntimeSensory(text: string, budgetTokens = 48) {
   const headerIndex = text.indexOf(runtimeSensoryHeader)
   if (headerIndex < 0)
     return text
@@ -273,12 +275,55 @@ function compactRuntimeSensorySegment(text: string, budgetTokens = 48) {
   if (estimateTokens(sensorySegment) <= budgetTokens)
     return text
 
-  const compactedSegment = `${runtimeSensoryHeader}\n[System Context: Sensory], telemetry=degraded-for-budget\n\n`
+  const degradedSegment = sensorySegment
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('='))
+        return line
+
+      return line
+        .split(',')
+        .map((segment) => {
+          const equalsIndex = segment.indexOf('=')
+          if (equalsIndex < 0)
+            return segment
+
+          const keyPrefix = segment.slice(0, equalsIndex + 1)
+          if (!keyPrefix.trim())
+            return segment
+
+          return `${keyPrefix}[DEGRADED]`
+        })
+        .join(',')
+    })
+    .join('\n')
+  const compactedSegment = estimateTokens(degradedSegment) <= budgetTokens
+    ? degradedSegment
+    : `${runtimeSensoryHeader}\n[System Context: Sensory], telemetry=[DEGRADED]\n\n`
+
   if (contractIndex > headerIndex) {
     return `${text.slice(0, headerIndex)}${compactedSegment}${text.slice(contractIndex)}`
   }
 
   return `${text.slice(0, headerIndex)}${compactedSegment}`.trim()
+}
+
+function ensureRuntimeContractAnchor(text: string) {
+  if (text.includes(runtimeContractAnchorHeader)) {
+    return {
+      text,
+      recovered: false,
+    }
+  }
+
+  const nextText = text.trim().length > 0
+    ? `${text.trimEnd()}\n\n${aliceFixedStructuredContractAnchor}`
+    : aliceFixedStructuredContractAnchor
+
+  return {
+    text: nextText,
+    recovered: true,
+  }
 }
 
 function getLastUserIndex(messages: Message[]) {
@@ -400,6 +445,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
   const currentTurnIndex = getLastUserIndex(result)
   const memoryIndex = result.findIndex((message, index) => index !== soulIndex && isMemoryMessage(message))
   let anchorPreserved = true
+  let runtimeContractAnchorRecovered = false
   let safeMode: PromptBudgetSafeModeReport = {
     activated: false,
   }
@@ -450,6 +496,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
         totalAfterTokens: totalAfter,
         droppedMessageCount: Math.max(0, messages.length - minimalMessages.length),
         anchorPreserved,
+        runtimeContractAnchorRecovered: false,
         safeMode,
         sections: {
           soul: {
@@ -477,7 +524,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
 
   if (runtimeIndex >= 0) {
     const runtimeText = readMessageText(result[runtimeIndex]!)
-    const nextRuntimeText = compactRuntimeSensorySegment(runtimeText)
+    const nextRuntimeText = compressRuntimeSensory(runtimeText)
     result[runtimeIndex] = writeMessageText(result[runtimeIndex]!, nextRuntimeText)
   }
 
@@ -504,7 +551,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     }
   }
 
-  const isProtectedIndex = (index: number) => [soulIndex, memoryIndex, currentTurnIndex].includes(index)
+  const isProtectedIndex = (index: number) => [soulIndex, runtimeIndex, memoryIndex, currentTurnIndex].includes(index)
 
   let droppedMessageCount = 0
   let totalAfter = result.reduce((sum, message) => sum + estimateMessageTokens(message), 0)
@@ -531,6 +578,14 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     anchorPreserved = anchorTextAfter === anchorTextBefore
   }
 
+  if (runtimeIndex >= 0 && result[runtimeIndex]) {
+    const runtimeAnchorCheck = ensureRuntimeContractAnchor(readMessageText(result[runtimeIndex]!))
+    if (runtimeAnchorCheck.recovered) {
+      runtimeContractAnchorRecovered = true
+      result[runtimeIndex] = writeMessageText(result[runtimeIndex]!, runtimeAnchorCheck.text)
+    }
+  }
+
   const sectionAfter = {
     soul: soulIndex >= 0 && result[soulIndex] ? estimateMessageTokens(result[soulIndex]!) : 0,
     memory: memoryIndex >= 0 && result[memoryIndex] ? estimateMessageTokens(result[memoryIndex]!) : 0,
@@ -553,6 +608,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
       totalAfterTokens: compacted.reduce((sum, message) => sum + estimateMessageTokens(message), 0),
       droppedMessageCount,
       anchorPreserved,
+      runtimeContractAnchorRecovered,
       safeMode,
       sections: {
         soul: {

@@ -81,6 +81,13 @@ function emitKillSwitchState(state: 'ACTIVE' | 'SUSPENDED', reason = 'test') {
   }
 }
 
+function parseToolErrorJson(result: ElectronMcpCallToolResult) {
+  const text = typeof result.content?.[0]?.text === 'string'
+    ? result.content[0].text
+    : ''
+  return text ? JSON.parse(text) as { status: string, code: string, message: string } : null
+}
+
 describe('mcp safety gate', () => {
   beforeEach(() => {
     invokeHandlers.clear()
@@ -116,6 +123,10 @@ describe('mcp safety gate', () => {
 
     expect(result.isError).toBe(true)
     expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_TOOL_DENIED',
+    }))
     expect(manager.callTool).not.toBeCalled()
     expect(contextEmitMock).not.toBeCalledWith(aliceSafetyPermissionRequested, expect.anything())
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
@@ -149,6 +160,59 @@ describe('mcp safety gate', () => {
     expect(result.isError).toBe(true)
     expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
     expect(manager.callTool).not.toBeCalled()
+  })
+
+  it('denies relative traversal into userData root without prompting', async () => {
+    const { createMcpServersService } = await import('./index')
+    const manager = createManager()
+
+    createMcpServersService({
+      context: { emit: contextEmitMock } as any,
+      manager,
+    })
+
+    const callTool = invokeHandlers.get(electronMcpCallTool)
+    expect(callTool).toBeTypeOf('function')
+
+    const result = await callTool!({
+      name: 'filesystem::read_file',
+      arguments: {
+        path: '../../alice-user-data/alice/alice.db',
+      },
+    })
+
+    expect(result.isError).toBe(true)
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_TOOL_DENIED',
+    }))
+    expect(manager.callTool).not.toBeCalled()
+    expect(getSafetyRequests()).toHaveLength(0)
+  })
+
+  it('allows relative workspace path by resolving against sandbox root', async () => {
+    const { createMcpServersService } = await import('./index')
+    const manager = createManager()
+
+    createMcpServersService({
+      context: { emit: contextEmitMock } as any,
+      manager,
+    })
+
+    const callTool = invokeHandlers.get(electronMcpCallTool)
+    expect(callTool).toBeTypeOf('function')
+
+    const result = await callTool!({
+      name: 'filesystem::read_file',
+      arguments: {
+        path: 'notes/today.md',
+      },
+    })
+
+    expect(result.isError).not.toBe(true)
+    expect(manager.callTool).toBeCalledTimes(1)
+    expect(getSafetyRequests()).toHaveLength(0)
   })
 
   it('allows sandbox read without prompting and executes tool directly', async () => {
@@ -301,7 +365,10 @@ describe('mcp safety gate', () => {
       allow: true,
       reason: 'replay',
     })
-    expect(replayResult.accepted).toBe(false)
+    expect(replayResult).toEqual({
+      accepted: false,
+      reason: 'not-found',
+    })
 
     contextEmitMock.mockReset()
     const secondResult = await callTool!({
@@ -399,6 +466,10 @@ describe('mcp safety gate', () => {
     const result = await pending
     expect(result.isError).toBe(true)
     expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_TOOL_DENIED',
+    }))
     expect(String(result.errorMessage)).toContain('User explicitly denied')
     expect(manager.callTool).not.toBeCalled()
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
@@ -487,6 +558,10 @@ describe('mcp safety gate', () => {
     const result = await pending
     expect(result.isError).toBe(true)
     expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_TOOL_DENIED',
+    }))
     expect(String(result.errorMessage)).toContain('timed out')
     expect(manager.callTool).not.toBeCalled()
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({

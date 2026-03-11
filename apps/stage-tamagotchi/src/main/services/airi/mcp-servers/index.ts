@@ -99,15 +99,23 @@ interface PendingPermissionRequest {
   argumentsSummary?: ReturnType<typeof summarizeToolArguments>
 }
 
-function normalizeFsPath(value: string) {
+function normalizeFsPath(value: string, basePath?: string) {
   if (!value.trim())
     return ''
 
-  if (value.startsWith('~')) {
-    return resolve(join(homedir(), value.slice(1)))
+  const expanded = value.startsWith('~')
+    ? join(homedir(), value.slice(1))
+    : value
+
+  if (isAbsolute(expanded)) {
+    return resolve(normalize(expanded))
   }
 
-  return resolve(normalize(value))
+  if (basePath) {
+    return resolve(basePath, normalize(expanded))
+  }
+
+  return resolve(normalize(expanded))
 }
 
 function isPathWithin(basePath: string, targetPath: string) {
@@ -191,6 +199,12 @@ function stringifyError(error: unknown) {
 }
 
 function createToolErrorResult(errorCode: string, errorMessage: string, durationMs = 0): ElectronMcpCallToolResult {
+  const llmVisibleContent = JSON.stringify({
+    status: 'error',
+    code: errorCode,
+    message: errorMessage,
+  })
+
   return {
     isError: true,
     ok: false,
@@ -200,7 +214,7 @@ function createToolErrorResult(errorCode: string, errorMessage: string, duration
     content: [
       {
         type: 'text',
-        text: errorMessage,
+        text: llmVisibleContent,
       },
     ],
   }
@@ -220,8 +234,8 @@ function createPermissionDeniedResult(reason?: string) {
   return createToolErrorResult('ALICE_TOOL_DENIED', 'Tool operation was denied by safety policy.')
 }
 
-function uniqueNormalizedPaths(paths: string[]) {
-  return [...new Set(paths.map(item => normalizeFsPath(item)).filter(Boolean))]
+function uniqueNormalizedPaths(paths: string[], basePath?: string) {
+  return [...new Set(paths.map(item => normalizeFsPath(item, basePath)).filter(Boolean))]
 }
 
 export function isFallbackEligibleMcpError(error: unknown) {
@@ -674,6 +688,7 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
   const log = useLogg('main/mcp-safety').useGlobalConfig()
   const pendingPermissionRequests = new Map<string, PendingPermissionRequest>()
   const sessionReadWhitelist = new Set<string>()
+  const userDataAbsolutePath = normalizeFsPath(app.getPath('userData'))
   const aliceRootPath = normalizeFsPath(join(app.getPath('userData'), 'alice'))
   const workspaceRootPath = normalizeFsPath(join(app.getPath('documents'), mcpWorkspaceDirectoryName))
   const absolutePathBlacklist = new Set<string>([
@@ -687,6 +702,9 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
   })
 
   function isPathDeniedByBlacklist(targetPath: string) {
+    if (isPathWithin(userDataAbsolutePath, targetPath))
+      return true
+
     for (const deniedPath of absolutePathBlacklist) {
       if (targetPath === deniedPath || isPathWithin(deniedPath, targetPath))
         return true
@@ -709,7 +727,7 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
   function evaluateToolPermission(payload: ElectronMcpCallToolPayload): ToolPermissionEvaluation {
     const parsed = parseQualifiedToolName(payload.name)
     const actionCategory = inferActionCategory(parsed.toolName)
-    const pathCandidates = uniqueNormalizedPaths(collectPathCandidates(payload.arguments ?? {}))
+    const pathCandidates = uniqueNormalizedPaths(collectPathCandidates(payload.arguments ?? {}), workspaceRootPath)
     const resourcePath = pathCandidates[0]
 
     const blacklistedPath = pathCandidates.find(item => isPathDeniedByBlacklist(item))

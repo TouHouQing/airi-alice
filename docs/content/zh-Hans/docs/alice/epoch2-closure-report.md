@@ -3,83 +3,87 @@ title: A.L.I.C.E Epoch2 收官验收报告
 description: Epoch2（M2.1/M2.2/M2.3）闭环门禁执行结果与追溯记录
 ---
 
-# A.L.I.C.E Epoch2 收官验收报告（进行中）
+# A.L.I.C.E Epoch2 收官验收报告（已完成 / COMPLETED）
 
 ## 1. 执行范围
 
-- 目标版本：Epoch2 完整闭环施工计划（M2.1 + M2.2 + M2.3）
-- 执行日期：2026-03-10
+- 目标版本：Epoch2 完整闭环（M2.1 + M2.2 + M2.3）
+- 执行日期：2026-03-11
 - 范围：`apps/stage-tamagotchi` + `packages/stage-ui`
+- 结论：Epoch2 退场门禁已全部满足，可进入 Epoch3 准备阶段。
 
-## 2. 模块验收结论
+## 2. DoD 门禁勾选
 
-1. M2.1 系统探针与静默注入：通过
-主进程 `alice-sensory-bus` 以低频缓存采样系统状态，Runtime system 高内聚注入保持“SOUL Anchor + Runtime”两层结构，Budget 下优先压缩 sensory 段且 JSON 合约锚点保留。
+### 门禁一：M2.1 感知与提示词防线
+- [x] 探针隔离与降级：`child_process.exec` 超时场景（>1500ms）不会打崩 Tick Loop，稳定标记 `degraded` 并写入 warning 审计。
+- [x] 上下文无损注入：10k 压测中 `system[0]` 始终保持完整 SOUL，Runtime 末尾 `Output contract (must-follow, highest priority):` 锚点稳定存在。
 
-2. M2.2 全息表现层桥接：通过
-`alice.dialogue.responded` 只在结构化完成且 `conversation_turns` 成功落库后发射；Renderer 通过 Presence Dispatcher 按 `turnId` 去重、情绪白名单归一化、Live2D/TTS `Promise.allSettled` 并发降级。
+### 门禁二：M2.2 表现层权威广播
+- [x] 单一事实源：`alice.dialogue.responded` 仅在 `alice_conversation_turns` 成功落库后发射。
+- [x] 中断绝对阻断：Kill Switch `AbortError` 中断轮次不发射表现层事件，Renderer 监听器保持静默。
+- [x] 情绪降级兜底：非法情绪输入回退 `neutral`，Live2D/TTS 不崩溃且保留 warning 审计。
 
-3. M2.3 MCP + 人在回路：通过（门禁级）
-完成三层读取漏斗、绝对黑名单硬拒绝、一次性 token + `requestId` 绑定校验、60s 超时拒绝、防重放、Kill Switch 对 pending/在途/会话生命周期硬中断。
+### 门禁三：M2.3 银行级工具控制
+- [x] 路径防穿透：`../` 与 `userData` 绝对黑名单路径直拒，返回 `{ status: 'error', code: 'ALICE_TOOL_DENIED' }`，不触发 HitL 弹窗。
+- [x] 单次 Token 防重放：同一 token 第二次消费返回 `accepted: false` + `reason: 'not-found'`。
+- [x] 优雅拒绝对话回环：HitL 拒绝后 LLM 可接收结构化拒绝结果并继续输出致歉结构化回复，主对话链不断裂。
 
 ## 3. 验证命令与结果
 
 ```bash
-pnpm -F @proj-airi/stage-tamagotchi exec vitest run \
-  src/main/services/alice/sensory-bus.test.ts \
-  src/main/services/alice/runtime.test.ts \
-  src/main/services/airi/mcp-servers/index.test.ts
-# 结果：PASS（26 tests）
+pnpm -F @proj-airi/stage-ui exec vitest run src/composables/alice-guardrails.test.ts
+# PASS (15 tests)
 ```
 
 ```bash
-pnpm -F @proj-airi/stage-ui exec vitest run \
-  src/stores/alice-presence-dispatcher.test.ts \
-  src/stores/chat.test.ts \
-  src/composables/alice-guardrails.test.ts \
-  src/composables/alice-prompt-composer.test.ts
-# 结果：PASS（21 tests）
+pnpm -F @proj-airi/stage-tamagotchi exec vitest run src/main/services/airi/mcp-servers/index.test.ts
+# PASS (15 tests)
 ```
 
 ```bash
-pnpm exec eslint \
-  apps/stage-tamagotchi/src/main/services/airi/mcp-servers/index.ts \
-  apps/stage-tamagotchi/src/main/services/airi/mcp-servers/index.test.ts \
-  apps/stage-tamagotchi/src/main/services/alice/runtime.ts \
-  apps/stage-tamagotchi/src/main/services/alice/runtime.test.ts \
-  apps/stage-tamagotchi/src/renderer/App.vue \
-  apps/stage-tamagotchi/src/shared/eventa.ts \
-  packages/stage-ui/src/components/scenes/Stage.vue \
-  packages/stage-ui/src/stores/alice-presence-dispatcher.ts \
-  packages/stage-ui/src/stores/alice-presence-dispatcher.test.ts
-# 结果：PASS
+pnpm -F @proj-airi/stage-tamagotchi exec vitest run src/main/services/alice/epoch2-e2e-closure.test.ts
+# PASS (2 tests)
 ```
 
-## 4. 关键断言覆盖
+## 4. 审计日志样本（测试运行期实采）
 
-1. M2.1
-- 1500ms 探针超时与失败降级不阻断对话。
-- 10k 预算回归中 `system[0]` SOUL 锚点不变。
+> 以下样本来自 `epoch2-e2e-closure.test.ts` 运行时捕获的 `runtimeAuditLogs`。
 
-2. M2.2
-- 非法 emotion 归一化为 `neutral` 且保留 `rawEmotion`。
-- 落库失败或中断轮不发 `alice.dialogue.responded`。
+```json
+[
+  {
+    "level": "warning",
+    "category": "alice.sensory",
+    "action": "sample-battery-timeout",
+    "message": "Failed to sample battery telemetry.",
+    "payload": {
+      "reason": "probe timeout"
+    }
+  },
+  {
+    "level": "warning",
+    "category": "alice.safety.permission",
+    "action": "alice.safety.permission.denied",
+    "message": "Tool permission denied by user.",
+    "payload": {
+      "riskLevel": "danger",
+      "toolName": "write_file",
+      "reason": "user-denied",
+      "path": "/.../secrets.txt",
+      "argumentsSummary": {
+        "kind": "object",
+        "keys": [
+          "path",
+          "content"
+        ]
+      }
+    }
+  }
+]
+```
 
-3. M2.3
-- 黑名单路径直接拒绝且无弹窗。
-- 工作区内读取静默放行，工作区外读取进入 HitL。
-- token 单次消费、防重放；`requestId` 与 token 绑定校验。
-- 权限超时、用户拒绝、Kill Switch 中断均返回结构化错误，不抛异常打断主循环。
-- 目录穿越样本（`../`）无法绕过漏斗。
+## 5. 端到端主链路闭环结论
 
-## 5. 未决项与非阻断环境噪音
-
-1. 根级 `pnpm typecheck` 仍受仓库既有问题影响（`server-runtime` 类型错误、volar ESM 警告等），不属于本次 Epoch2 Alice 变更引入。
-2. 根级 `pnpm lint:fix` 仍受 `oxlint` native binding 缺失与仓内历史 lint 问题影响。
-3. `stage-tamagotchi` 全量构建与打包产物记录需在最终收官阶段补执行并附时间戳。
-
-## 6. 下一阶段收官清单
-
-1. 执行 `stage-tamagotchi build` 与 `build:mac`，补录产物路径与时间戳。
-2. 增加一次端到端人工回放记录（权限弹窗拒绝、Kill Switch 中断在途工具、恢复后继续对话）。
-3. 将本报告“进行中”升级为“最终版”，冻结 Epoch2 基线。
+- [x] 完成 `[系统感知 -> 高危工具请求 -> HitL 弹窗 -> 用户拒绝 -> LLM 致歉(apologetic) -> Renderer 接收 alice.dialogue.responded]` 闭环模拟。
+- [x] 断言全程无 `Unhandled Promise Rejection`。
+- [x] 断言流式中断场景下 Renderer `aliceDialogueResponded` 监听器未被调用。

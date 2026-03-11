@@ -1027,6 +1027,15 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           })
         }
 
+        if (budgeted.report.runtimeContractAnchorRecovered) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'alice.prompt',
+            action: 'runtime-contract-anchor-recovered',
+            message: 'Runtime structured contract anchor was missing and recovered by prompt budget guard.',
+          })
+        }
+
         const runtimeSystemMessage = budgeted.messages.find((message, index) => index !== 0 && message.role === 'system')
         const runtimeContractAnchorPreserved = typeof runtimeSystemMessage?.content === 'string'
           ? runtimeSystemMessage.content.includes(runtimeContractAnchorHeader)
