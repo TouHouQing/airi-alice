@@ -330,14 +330,10 @@ watch(enabled, async (val) => {
   }
 }, { immediate: true })
 
-watch([() => onboardingStore.shouldShowSetup], ([shouldShowSetup]) => {
-  if (shouldShowSetup) {
+onMounted(() => {
+  if (onboardingStore.needsOnboarding) {
     openOnboarding()
   }
-}, { immediate: true })
-
-onMounted(() => {
-  onboardingStore.initializeSetupCheck()
 })
 
 onUnmounted(() => {

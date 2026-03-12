@@ -72,6 +72,7 @@ catalog:
   better-auth: ^1.4.19
   bindings: ^1.5.0
   builder-util-runtime: ^9.5.1
+  capacitor-native-settings: ^8.0.0
   copy-anything: ^3.0.5
   crossws: ^0.4.4
   drizzle-valibot: ^0.4.2
