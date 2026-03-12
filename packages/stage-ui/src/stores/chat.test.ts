@@ -48,9 +48,13 @@ vi.mock('./alice-execution-engine', () => ({
 vi.mock('./chat/session-store', () => ({
   useChatSessionStore: () => ({
     activeSessionId,
+    initialize: vi.fn(),
     ensureSession: (sessionId: string) => {
       ensureSessionMessages(sessionId)
     },
+    ensureSessionReady: vi.fn(async (sessionId: string) => {
+      ensureSessionMessages(sessionId)
+    }),
     getSessionMessages: (sessionId: string) => ensureSessionMessages(sessionId),
     persistSessionMessages: vi.fn(),
     getSessionGeneration: vi.fn().mockReturnValue(0),
@@ -77,6 +81,13 @@ vi.mock('./chat/context-providers', () => ({
     contextId: 'system:datetime',
     strategy: 'replace-self',
     text: '{}',
+    createdAt: Date.now(),
+  }),
+  createSensoryContext: () => ({
+    id: 'ctx-sensory',
+    contextId: 'alice:sensory',
+    strategy: 'replace-self',
+    text: '[System Context: Sensory], time=2026/3/9 08:00:00, battery=80%, cpu=12%, memory=50%',
     createdAt: Date.now(),
   }),
 }))
@@ -124,8 +135,14 @@ vi.mock('../composables/alice-prompt-composer', () => ({
         role: 'system',
         content: soulContent || '# SOUL',
       },
+      {
+        role: 'system',
+        content: 'Output contract (must-follow, highest priority):\nIn thought, you MUST evaluate current personality parameters',
+      },
       ...messages.filter(message => message.role !== 'system'),
     ],
+    personalityDirectiveResult: null,
+    contractRequiresPersonalityEval: true,
   }),
 }))
 
@@ -292,6 +309,10 @@ describe('chat orchestrator', () => {
     expect(executeRealtimeQueryTurnMock).toBeCalledTimes(1)
     expect(streamMock).toBeCalledTimes(1)
     expect(appendConversationTurnMock).toBeCalledTimes(1)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.prompt',
+      action: 'contract-personality-eval-required',
+    }))
     const payload = appendConversationTurnMock.mock.calls[0]?.[0]
     expect(payload?.structured?.policyLocked).toBeUndefined()
     expect(payload?.assistantText).toContain('普通回复')
@@ -320,5 +341,46 @@ describe('chat orchestrator', () => {
     await expect(pending).rejects.toThrow('A.L.I.C.E turn aborted')
 
     expect(appendConversationTurnMock).toBeCalledTimes(0)
+  })
+
+  it('retries structured output when emotion is outside whitelist and keeps personality-consistent result', async () => {
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 1) {
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"mood check","emotion":"cheerful","reply":"我今天的心情非常愉快！😊"}',
+        })
+      }
+      else {
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.05, liveliness=0.05, sensibility=0.05, I should stay low-arousal.","emotion":"tired","reply":"我现在状态偏低，先简短回复。"}',
+        })
+      }
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('你今天心情怎么样？', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.structured',
+      action: 'contract-invalid',
+    }))
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.structured',
+      action: 'contract-retry-reasoned',
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(payload?.structured?.emotion).toBe('tired')
+    expect(String(payload?.assistantText ?? '')).not.toContain('非常愉快')
   })
 })

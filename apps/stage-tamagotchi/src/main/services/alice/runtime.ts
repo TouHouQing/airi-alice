@@ -170,6 +170,42 @@ function buildSoulBody(frontmatter: AliceSoulFrontmatter, personaNotes: string) 
   ].join('\n')
 }
 
+function syncPersonalityBaselineInBody(body: string, personality: AlicePersonalityState) {
+  const lines = body.split('\n')
+  const sectionIndex = lines.findIndex(line => line.trim() === '## Personality Baseline')
+  if (sectionIndex < 0)
+    return body
+
+  const nextSectionIndex = lines.findIndex((line, index) => index > sectionIndex && line.trim().startsWith('## '))
+  const sectionEnd = nextSectionIndex >= 0 ? nextSectionIndex : lines.length
+  const sectionLines = [...lines.slice(sectionIndex, sectionEnd)]
+
+  const upsertMetric = (label: string, value: number) => {
+    const line = `- ${label}：${value.toFixed(2)}`
+    const metricIndex = sectionLines.findIndex(current => current.trimStart().startsWith(`- ${label}：`))
+    if (metricIndex >= 0) {
+      sectionLines[metricIndex] = line
+      return
+    }
+
+    const insertIndex = sectionLines.findIndex(current => current.trim().startsWith('- '))
+    if (insertIndex >= 0)
+      sectionLines.splice(insertIndex, 0, line)
+    else
+      sectionLines.push('', line)
+  }
+
+  upsertMetric('服从度', personality.obedience)
+  upsertMetric('活泼度', personality.liveliness)
+  upsertMetric('感性度', personality.sensibility)
+
+  return [
+    ...lines.slice(0, sectionIndex),
+    ...sectionLines,
+    ...lines.slice(sectionEnd),
+  ].join('\n')
+}
+
 const defaultSoulBody = buildSoulBody(defaultFrontmatter, '')
 
 function hashContent(content: string) {
@@ -1404,7 +1440,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         ...parsed.frontmatter,
         personality: nextPersonality,
       }
-      const content = toSoulContent(nextFrontmatter, parsed.body)
+      const syncedBody = syncPersonalityBaselineInBody(parsed.body, nextPersonality)
+      const content = toSoulContent(nextFrontmatter, syncedBody)
       return snapshotFromContent(content)
     })
   })

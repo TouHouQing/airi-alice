@@ -71,18 +71,31 @@ async function streamFrom(model: string, chatProvider: ChatProvider, messages: M
 
   return new Promise<void>((resolve, reject) => {
     let settled = false
+    const abortSignal = options?.abortSignal
     const resolveOnce = () => {
       if (settled)
         return
       settled = true
+      abortSignal?.removeEventListener('abort', abortHandler)
       resolve()
     }
     const rejectOnce = (err: unknown) => {
       if (settled)
         return
       settled = true
+      abortSignal?.removeEventListener('abort', abortHandler)
       reject(err)
     }
+    const abortHandler = () => {
+      rejectOnce(abortSignal?.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+
+    if (abortSignal?.aborted) {
+      rejectOnce(abortSignal.reason ?? new DOMException('Aborted', 'AbortError'))
+      return
+    }
+
+    abortSignal?.addEventListener('abort', abortHandler, { once: true })
 
     const onEvent = async (event: unknown) => {
       try {
@@ -108,7 +121,7 @@ async function streamFrom(model: string, chatProvider: ChatProvider, messages: M
         maxSteps: 10,
         messages: sanitized,
         headers,
-        abortSignal: options?.abortSignal,
+        abortSignal,
         // TODO: we need Automatic tools discovery
         tools,
         onEvent,

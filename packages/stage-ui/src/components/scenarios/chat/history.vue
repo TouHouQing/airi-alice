@@ -48,7 +48,21 @@ onMounted(scrollToBottom)
 const streaming = computed<ChatAssistantMessage & { context?: ContextMessage } & { createdAt?: number }>(() => props.streamingMessage ?? { role: 'assistant', content: '', slices: [], tool_results: [], createdAt: Date.now() })
 const showStreamingPlaceholder = computed(() => (streaming.value.slices?.length ?? 0) === 0 && !streaming.value.content)
 const streamingTs = computed(() => streaming.value?.createdAt)
+const streamingMessageId = computed(() => (streaming.value as ChatHistoryItem | undefined)?.id)
+
+function getMessageRenderKey(message: ChatHistoryItem, index: number) {
+  if (message.id)
+    return message.id
+  if (message.context?.id)
+    return message.context.id
+  return `${message.role ?? 'unknown'}:${message.createdAt ?? 0}:${index}`
+}
+
 function shouldShowPlaceholder(message: ChatHistoryItem) {
+  const streamId = streamingMessageId.value
+  if (streamId)
+    return message.id === streamId
+
   const ts = streamingTs.value
   if (ts == null)
     return false
@@ -63,7 +77,10 @@ const renderMessages = computed<ChatHistoryItem[]>(() => {
   if (!streamTs)
     return props.messages
 
-  const hasStreamAlready = streamTs && props.messages.some(msg => msg?.role === 'assistant' && msg?.createdAt === streamTs)
+  const streamId = streamingMessageId.value
+  const hasStreamAlready = streamId
+    ? props.messages.some(msg => msg?.role === 'assistant' && msg?.id === streamId)
+    : streamTs && props.messages.some(msg => msg?.role === 'assistant' && msg?.createdAt === streamTs)
   if (hasStreamAlready)
     return props.messages
 
@@ -73,7 +90,7 @@ const renderMessages = computed<ChatHistoryItem[]>(() => {
 
 <template>
   <div ref="chatHistoryRef" v-auto-animate flex="~ col" relative h-full w-full overflow-y-auto rounded-xl px="<sm:2" py="<sm:2" :class="variant === 'mobile' ? 'gap-1' : 'gap-2'">
-    <template v-for="(message, index) in renderMessages" :key="message?.createdAt ?? index">
+    <template v-for="(message, index) in renderMessages" :key="getMessageRenderKey(message, index)">
       <div v-if="message.role === 'error'">
         <ChatErrorItem
           :message="message"

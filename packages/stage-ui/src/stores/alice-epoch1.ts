@@ -759,14 +759,40 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
           return
 
         structured.sentimentConfidence = calibratedConfidence
-        const score = structured.userSentimentScore ?? 0
         const confidence = calibratedConfidence
         if (confidence < 0.25) {
           lastAssistantEmotion = structured.emotion
           return
         }
-        const delta = computePersonalityDelta(score, confidence)
-        if (Math.abs(delta) <= 0.0001) {
+        const userSignal = estimateLexicalSentiment(userText)
+        const modelScore = clamp(structured.userSentimentScore ?? 0, -1, 1)
+        const weightedScore = clamp(userSignal * 0.75 + modelScore * 0.25, -1, 1)
+        const confidenceDecay = confidence < 0.35
+          ? clamp(confidence / 0.35, 0, 1)
+          : 1
+        const effectiveScore = clamp(weightedScore * confidenceDecay, -1, 1)
+
+        await appendAliceAuditLog({
+          level: 'info',
+          category: 'alice.personality',
+          action: 'drift-signal',
+          message: 'Computed autonomous personality drift signal from user-first sentiment weighting.',
+          details: {
+            sessionId: context.sessionId,
+            turnId,
+            userSignal,
+            modelScore,
+            effectiveScore,
+            confidence,
+          },
+        })
+
+        const delta = computePersonalityDelta(effectiveScore, confidence)
+        if (
+          Math.abs(delta.obedience) <= 0.0001
+          && Math.abs(delta.liveliness) <= 0.0001
+          && Math.abs(delta.sensibility) <= 0.0001
+        ) {
           lastAssistantEmotion = structured.emotion
           return
         }
@@ -774,15 +800,27 @@ export const useAliceEpoch1Store = defineStore('alice-epoch1', () => {
         const nextSoul = await getAliceBridge().updatePersonality({
           expectedRevision: soul.value?.revision,
           reason: 'epoch1-sentiment-drift',
-          deltas: {
-            obedience: delta * 0.7,
-            liveliness: delta * 0.5,
-            sensibility: delta * 0.6,
-          },
+          deltas: delta,
         }).catch(() => null)
 
-        if (nextSoul)
+        if (nextSoul) {
           soul.value = nextSoul
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'personality-drift',
+            action: 'personality-drift-updated',
+            message: 'Applied autonomous multi-axis personality drift from structured turn sentiment.',
+            details: {
+              sessionId: context.sessionId,
+              turnId,
+              userSignal,
+              modelScore,
+              effectiveScore,
+              confidence,
+              delta,
+            },
+          })
+        }
         lastAssistantEmotion = structured.emotion
 
         await syncMemoryStatsToRuntime()

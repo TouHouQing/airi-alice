@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { calibrateSentimentConfidence, normalizeStructuredOutput, parseLastActEmotion } from './alice-structured-output'
+import { calibrateSentimentConfidence, normalizeStructuredOutput, parseLastActEmotion, validateStructuredContract } from './alice-structured-output'
 
 describe('alice structured output', () => {
   it('parses last ACT emotion', () => {
@@ -91,5 +91,34 @@ describe('alice structured output', () => {
     })
     expect(calibrated).toBeLessThan(1)
     expect(calibrated).toBeGreaterThan(0)
+  })
+
+  it('marks non-whitelisted emotion as invalid', () => {
+    const issues = validateStructuredContract({
+      thought: 'I reviewed obedience/liveliness/sensibility and will stay stable.',
+      emotion: 'cheerful',
+      reply: '我今天很开心！',
+    }, {
+      obedience: 0.05,
+      liveliness: 0.05,
+      sensibility: 0.05,
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('emotion-not-whitelisted')
+  })
+
+  it('blocks high-arousal emotion/reply when liveliness is very low', () => {
+    const issues = validateStructuredContract({
+      thought: 'obedience=0.05 liveliness=0.05 sensibility=0.05, I should stay cold and concise.',
+      emotion: 'happy',
+      reply: '我今天的心情非常愉快！😊',
+    }, {
+      obedience: 0.05,
+      liveliness: 0.05,
+      sensibility: 0.05,
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('low-liveliness-high-arousal-emotion')
+    expect(issues.map(issue => issue.code)).toContain('low-liveliness-high-arousal-reply')
   })
 })

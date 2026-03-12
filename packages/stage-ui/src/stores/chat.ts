@@ -2,9 +2,10 @@ import type { WebSocketEventInputs } from '@proj-airi/server-sdk'
 import type { ChatProvider } from '@xsai-ext/providers/utils'
 import type { CommonContentPart, Message, ToolMessage } from '@xsai/shared-chat'
 
-import type { StructuredOutputResult } from '../composables/alice-structured-output'
+import type { StructuredOutputResult, StructuredValidationIssue } from '../composables/alice-structured-output'
 import type { AliceAbortReason } from '../composables/alice-turn-abort'
 import type { ChatAssistantMessage, ChatSlices, ChatStreamEventContext, StreamingAssistantMessage } from '../types/chat'
+import type { AlicePersonalityState } from './alice-bridge'
 import type { StreamEvent, StreamOptions } from './llm'
 
 import { createQueue } from '@proj-airi/stream-kit'
@@ -16,7 +17,7 @@ import { useAnalytics } from '../composables'
 import { applyPromptBudget, sanitizeAssistantOutputForDisplay, sanitizeForRemoteModel } from '../composables/alice-guardrails'
 import { composeAlicePromptMessages } from '../composables/alice-prompt-composer'
 import { detectRealtimeQueryIntent } from '../composables/alice-realtime-query'
-import { normalizeStructuredOutput } from '../composables/alice-structured-output'
+import { normalizeStructuredOutput, validateStructuredContract } from '../composables/alice-structured-output'
 import { abortAliceTurns, completeAliceTurnAbort, isAliceAbortError, registerAliceTurnAbort } from '../composables/alice-turn-abort'
 import { useLlmmarkerParser } from '../composables/llm-marker-parser'
 import { categorizeResponse, createStreamingCategorizer } from '../composables/response-categoriser'
@@ -70,7 +71,9 @@ const runtimeContractAnchorHeader = 'Output contract (must-follow, highest prior
 const structuredRetrySystemPrompt = [
   'Return ONLY one strict JSON object with keys: thought, emotion, reply.',
   'No markdown fences, no prose, no tool calls, no extra keys.',
-  'The "emotion" value must be a short lowercase label, and "reply" must be natural language.',
+  'The "emotion" value must be exactly one of: neutral, happy, sad, angry, concerned, tired, apologetic, processing.',
+  'In thought, explicitly evaluate obedience/liveliness/sensibility before deciding emotion and reply.',
+  'When liveliness <= 0.2, avoid high-arousal wording and avoid choosing happy.',
 ].join(' ')
 const strictRealtimeRefusalSystemPrompt = [
   '[System Lock]',
@@ -264,6 +267,16 @@ function createStructuredFallback(replyText: string): StructuredWithContract {
   }
 }
 
+function summarizeValidationIssues(issues: StructuredValidationIssue[]) {
+  return issues.map(issue => issue.code)
+}
+
+function createContractFallbackReply(personalityState?: AlicePersonalityState | null) {
+  if (personalityState && personalityState.liveliness <= 0.2)
+    return '我现在状态偏低，先简短回复。'
+  return assistantStructuredContractFallbackReply
+}
+
 async function safelyGetAliceSoulSnapshot() {
   if (!hasAliceBridge())
     return null
@@ -354,7 +367,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
     if (!sendingMessage && !options.attachments?.length)
       return
 
-    chatSession.ensureSession(sessionId)
+    await chatSession.ensureSessionReady(sessionId)
 
     // Inject current datetime context before composing the message
     chatContext.ingestContextMessage(createDatetimeContext())
@@ -547,6 +560,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       const categorizer = createStreamingCategorizer(activeProvider.value)
       let streamPosition = 0
       let finalAssistantDisplayText = ''
+      let turnPersonalityState: AlicePersonalityState | null = null
 
       const getPreviousAssistantEmotion = () => {
         const previousAssistant = [...sessionMessagesForSend]
@@ -557,13 +571,39 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           : undefined
       }
 
+      const formatTurnPersonalityState = () => {
+        if (!turnPersonalityState)
+          return 'unknown'
+        return `obedience=${turnPersonalityState.obedience.toFixed(2)}, liveliness=${turnPersonalityState.liveliness.toFixed(2)}, sensibility=${turnPersonalityState.sensibility.toFixed(2)}`
+      }
+
       const runStructuredContractRetry = async (payload: {
         reasoning: string
         reply: string
         fullText: string
+        validationIssues: StructuredValidationIssue[]
+        attempt: number
       }) => {
         if (shouldAbort())
           return null
+
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'alice.structured',
+          action: 'contract-retry-reasoned',
+          message: 'Retrying structured contract with explicit personality and violation hints.',
+          details: {
+            attempt: payload.attempt,
+            personality: turnPersonalityState
+              ? {
+                  obedience: turnPersonalityState.obedience,
+                  liveliness: turnPersonalityState.liveliness,
+                  sensibility: turnPersonalityState.sensibility,
+                }
+              : null,
+            violations: summarizeValidationIssues(payload.validationIssues),
+          },
+        })
 
         const retryMessages: Message[] = [
           {
@@ -576,6 +616,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               'Rewrite the draft assistant output into strict JSON contract.',
               `User input:\n${sendingMessage}`,
               `Assistant draft:\n${payload.reply || payload.fullText}`,
+              `Current personality state:\n${formatTurnPersonalityState()}`,
+              `Violations to fix:\n${payload.validationIssues.map((issue, index) => `${index + 1}. ${issue.message}`).join('\n')}`,
               payload.reasoning.trim()
                 ? `Draft thought:\n${payload.reasoning.trim()}`
                 : '',
@@ -637,15 +679,6 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         })
 
         if (hasStructuredJsonContract(retriedStructured)) {
-          await appendAliceAuditLog({
-            level: 'notice',
-            category: 'structured-output',
-            action: 'contract-retry-succeeded',
-            message: 'Structured contract retry succeeded with JSON output.',
-            details: {
-              parsePath: retriedStructured.parsePath,
-            },
-          })
           return retriedStructured
         }
 
@@ -667,29 +700,82 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         reasoning: string
         reply: string
       }): Promise<StructuredWithContract> => {
-        const normalized = normalizeStructuredOutput({
+        let candidate = normalizeStructuredOutput({
           fullText: payload.fullText,
           thought: payload.reasoning,
           reply: payload.reply,
           previousEmotion: getPreviousAssistantEmotion(),
         })
 
-        if (hasStructuredJsonContract(normalized))
-          return normalized
+        let validationIssues = hasStructuredJsonContract(candidate)
+          ? validateStructuredContract(candidate, turnPersonalityState)
+          : [
+              {
+                code: 'json-contract-missing',
+                message: 'Structured output is not valid JSON contract and requires retry.',
+              } satisfies StructuredValidationIssue,
+            ]
 
-        const retried = await runStructuredContractRetry(payload)
-        if (retried)
-          return retried
+        if (hasStructuredJsonContract(candidate) && validationIssues.length === 0)
+          return candidate
 
-        const fallbackReply = payload.reply.trim() || payload.fullText.trim() || assistantStructuredContractFallbackReply
-        const fallback = createStructuredFallback(fallbackReply)
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'alice.structured',
+            action: 'contract-invalid',
+            message: 'Structured output violated contract constraints before finalization.',
+            details: {
+              attempt,
+              parsePath: candidate.parsePath ?? 'fallback',
+              emotion: candidate.emotion,
+              violations: summarizeValidationIssues(validationIssues),
+            },
+          })
+
+          const retried = await runStructuredContractRetry({
+            ...payload,
+            validationIssues,
+            attempt,
+          })
+          if (!retried)
+            break
+
+          candidate = retried
+          validationIssues = hasStructuredJsonContract(candidate)
+            ? validateStructuredContract(candidate, turnPersonalityState)
+            : [
+                {
+                  code: 'json-contract-missing',
+                  message: 'Structured retry did not produce valid JSON contract.',
+                } satisfies StructuredValidationIssue,
+              ]
+
+          if (hasStructuredJsonContract(candidate) && validationIssues.length === 0) {
+            await appendAliceAuditLog({
+              level: 'notice',
+              category: 'structured-output',
+              action: 'contract-retry-succeeded',
+              message: 'Structured contract retry succeeded with valid personality-consistent JSON output.',
+              details: {
+                attempt,
+                parsePath: candidate.parsePath,
+              },
+            })
+            return candidate
+          }
+        }
+
+        const fallback = createStructuredFallback(createContractFallbackReply(turnPersonalityState))
         await appendAliceAuditLog({
           level: 'warning',
           category: 'structured-output',
           action: 'contract-fallback',
           message: 'Structured contract failed after retry and switched to fallback-v1.',
           details: {
-            parsePath: normalized.parsePath,
+            parsePath: candidate.parsePath,
+            emotion: candidate.emotion,
+            violations: summarizeValidationIssues(validationIssues),
           },
         })
         return fallback
@@ -703,7 +789,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         policyLocked?: StructuredPolicyLock
       }) => {
         const structured = payload.enforceContract === false
-          ? createStructuredFallback(payload.reply.trim() || payload.fullText.trim() || assistantStructuredContractFallbackReply)
+          ? createStructuredFallback(createContractFallbackReply(turnPersonalityState))
           : await buildStructuredOutputWithGuard(payload)
         if (payload.policyLocked) {
           structured.policyLocked = payload.policyLocked
@@ -974,13 +1060,36 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       const contextsSnapshot = chatContext.getContextsSnapshot()
       if (hasAliceBridge()) {
         const soulSnapshot = await safelyGetAliceSoulSnapshot()
+        turnPersonalityState = soulSnapshot?.frontmatter?.personality ?? null
         const composed = composeAlicePromptMessages({
           messages: newMessages as Message[],
           soulContent: soulSnapshot?.content ?? null,
           hostName: soulSnapshot?.frontmatter?.profile?.hostName ?? null,
+          personalityState: turnPersonalityState,
           contextsSnapshot,
         })
         newMessages = composed.messages as any
+
+        if (composed.personalityDirectiveResult) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'alice.prompt',
+            action: 'personality-directives.injected',
+            message: 'Injected low-personality semantic directives into SOUL anchor.',
+            details: {
+              triggered: composed.personalityDirectiveResult.triggered,
+            },
+          })
+        }
+
+        if (composed.contractRequiresPersonalityEval) {
+          await appendAliceAuditLog({
+            level: 'notice',
+            category: 'alice.prompt',
+            action: 'contract-personality-eval-required',
+            message: 'Runtime structured contract requires thought-level personality parameter evaluation.',
+          })
+        }
 
         const budgeted = applyPromptBudget(newMessages as Message[])
         newMessages = budgeted.messages as any
@@ -1383,7 +1492,13 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       }
     }
 
+    if (!targetSessionId && !activeSessionId.value)
+      await chatSession.initialize()
+
     const sessionId = targetSessionId || activeSessionId.value
+    if (!sessionId)
+      throw new Error('Chat session is not ready. Please retry after initialization.')
+
     const generation = chatSession.getSessionGeneration(sessionId)
 
     return new Promise<void>((resolve, reject) => {

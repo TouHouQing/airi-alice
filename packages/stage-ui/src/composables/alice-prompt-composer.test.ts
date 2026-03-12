@@ -24,6 +24,10 @@ describe('alice prompt composer', () => {
     expect(String(result.messages[0]?.content)).toContain('# SOUL')
     expect(String(result.messages[1]?.content)).toContain('AliceHost')
     expect(String(result.messages[1]?.content)).toContain('Output contract (must-follow, highest priority):')
+    expect(String(result.messages[1]?.content)).toContain('In thought, you MUST evaluate current personality parameters')
+    expect(String(result.messages[1]?.content)).toContain('The emotion value must be exactly one of')
+    expect(String(result.messages[1]?.content)).toContain('Reply tone and wording MUST be semantically consistent')
+    expect(String(result.messages[1]?.content)).toContain('Personality numeric state from SOUL frontmatter has higher priority than Persona Notes text')
     expect(String(result.messages[0]?.content)).not.toContain('legacy-system')
     expect(String(result.messages[1]?.content)).not.toContain('legacy-system')
   })
@@ -73,6 +77,82 @@ describe('alice prompt composer', () => {
     expect(String(result.messages[1]?.content)).toContain('Current datetime:')
     expect(String(result.messages[1]?.content)).toContain('Current sensory state:')
     expect(String(result.messages[1]?.content)).toContain('Output contract (must-follow, highest priority):')
+    expect(String(result.messages[1]?.content)).toContain('In thought, you MUST evaluate current personality parameters')
+    expect(String(result.messages[1]?.content)).toContain('The emotion value must be exactly one of')
     expect(result.messages.at(-1)?.role).toBe('user')
+  })
+
+  it('appends low-personality directives into SOUL anchor when traits are near zero', () => {
+    const soulContent = [
+      '---',
+      JSON.stringify({
+        personality: {
+          obedience: 0.05,
+          liveliness: 0.05,
+          sensibility: 0.05,
+        },
+      }),
+      '---',
+      '# SOUL',
+      'anchor',
+    ].join('\n')
+
+    const result = composeAlicePromptMessages({
+      messages: [{ role: 'user', content: '你现在心情怎么样？' }],
+      soulContent,
+      hostName: 'Host',
+      contextsSnapshot: {},
+    })
+
+    expect(String(result.messages[0]?.content)).toContain('=== 当前状态极度干预 ===')
+    expect(String(result.messages[0]?.content)).toContain('=== 当前人格参数（强约束解释层）===')
+    expect(String(result.messages[0]?.content)).toContain('当前参数：obedience=0.05, liveliness=0.05, sensibility=0.05')
+    expect(String(result.messages[0]?.content)).toContain('frontmatter.personality 数值高于 Persona Notes 文本描述')
+    expect(String(result.messages[0]?.content)).toContain('Liveliness (活泼度) 极低')
+    expect(String(result.messages[0]?.content)).toContain('Sensibility (感性度) 极低')
+    expect(String(result.messages[0]?.content)).toContain('Obedience (服从度) 极低')
+    expect(result.personalityDirectiveResult?.triggered).toEqual(['liveliness', 'sensibility', 'obedience'])
+  })
+
+  it('supports legacy frontmatter style personality values for directive translation', () => {
+    const soulContent = [
+      '---',
+      'personality:',
+      '  obedience: 0.05',
+      '  liveliness: 0.05',
+      '  sensibility: 0.05',
+      '---',
+      '# SOUL',
+      'anchor',
+    ].join('\n')
+
+    const result = composeAlicePromptMessages({
+      messages: [{ role: 'user', content: '状态报告' }],
+      soulContent,
+      hostName: 'Host',
+      contextsSnapshot: {},
+    })
+
+    expect(String(result.messages[0]?.content)).toContain('=== 当前状态极度干预 ===')
+    expect(result.personalityDirectiveResult?.triggered).toEqual(['liveliness', 'sensibility', 'obedience'])
+  })
+
+  it('uses explicit personality state from snapshot when soul content is not parseable', () => {
+    const result = composeAlicePromptMessages({
+      messages: [{ role: 'user', content: '你今天心情怎么样？' }],
+      soulContent: '# SOUL without frontmatter',
+      hostName: 'Host',
+      personalityState: {
+        obedience: 0.05,
+        liveliness: 0.05,
+        sensibility: 0.05,
+      },
+      contextsSnapshot: {},
+    })
+
+    expect(String(result.messages[0]?.content)).toContain('=== 当前人格参数（强约束解释层）===')
+    expect(String(result.messages[0]?.content)).toContain('当前参数：obedience=0.05, liveliness=0.05, sensibility=0.05')
+    expect(String(result.messages[0]?.content)).toContain('=== 当前状态极度干预 ===')
+    expect(result.personalityDirectiveResult?.triggered).toEqual(['liveliness', 'sensibility', 'obedience'])
   })
 })

@@ -28,6 +28,11 @@ export const aliceFixedSensoryContextTemplate = `${aliceFixedSensoryContextHeade
 export const aliceFixedStructuredContractAnchor = [
   aliceFixedStructuredContractHeader,
   '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+  '- In thought, you MUST evaluate current personality parameters (liveliness, sensibility, obedience) before finalizing emotion and reply.',
+  '- The emotion value must be exactly one of: neutral, happy, sad, angry, concerned, tired, apologetic, processing.',
+  '- Reply tone and wording MUST be semantically consistent with the chosen emotion.',
+  '- Personality numeric state from SOUL frontmatter has higher priority than Persona Notes text when they conflict.',
+  '- When liveliness <= 0.2, avoid high-arousal mood claims or excited wording in reply.',
   '- No markdown fences, no extra keys, no prose outside JSON.',
 ].join('\n')
 

@@ -345,6 +345,86 @@ export interface StructuredOutputResult {
   repairTimedOut?: boolean
 }
 
+export interface StructuredValidationPersonalityState {
+  obedience: number
+  liveliness: number
+  sensibility: number
+}
+
+export type StructuredValidationIssueCode
+  = | 'json-contract-missing'
+    | 'emotion-not-whitelisted'
+    | 'thought-missing-personality-eval'
+    | 'low-liveliness-high-arousal-emotion'
+    | 'low-liveliness-high-arousal-reply'
+
+export interface StructuredValidationIssue {
+  code: StructuredValidationIssueCode
+  message: string
+}
+
+const structuredEmotionWhitelist = new Set([
+  'neutral',
+  'happy',
+  'sad',
+  'angry',
+  'concerned',
+  'tired',
+  'apologetic',
+  'processing',
+])
+
+const excitedReplyPattern = /非常愉快|超级开心|很开心|好开心|兴奋|激动|太棒|开心呀|[😁😄🥳✨💕]|happy|excited|thrilled|delighted/iu
+
+function thoughtMentionsPersonalityParams(thought: string) {
+  const lower = thought.toLowerCase()
+  const hasObedience = lower.includes('obedience') || thought.includes('服从度')
+  const hasLiveliness = lower.includes('liveliness') || thought.includes('活泼度')
+  const hasSensibility = lower.includes('sensibility') || thought.includes('感性度')
+  const hasLevelHint = /极低|偏低|中等|偏高|较高|low|medium|high|0\.\d{1,3}|1(?:\.0+)?/iu.test(thought)
+  return hasObedience && hasLiveliness && hasSensibility && hasLevelHint
+}
+
+export function validateStructuredContract(
+  structured: Pick<StructuredOutputResult, 'thought' | 'emotion' | 'reply'>,
+  personalityState?: StructuredValidationPersonalityState | null,
+): StructuredValidationIssue[] {
+  const issues: StructuredValidationIssue[] = []
+  const emotion = structured.emotion.trim().toLowerCase()
+
+  if (!structuredEmotionWhitelist.has(emotion)) {
+    issues.push({
+      code: 'emotion-not-whitelisted',
+      message: `Emotion "${structured.emotion}" is outside AliceEmotion whitelist.`,
+    })
+  }
+
+  if (personalityState && !thoughtMentionsPersonalityParams(structured.thought)) {
+    issues.push({
+      code: 'thought-missing-personality-eval',
+      message: 'Thought must explicitly evaluate obedience/liveliness/sensibility before reply.',
+    })
+  }
+
+  if (personalityState && personalityState.liveliness <= 0.2) {
+    if (emotion === 'happy') {
+      issues.push({
+        code: 'low-liveliness-high-arousal-emotion',
+        message: 'Liveliness <= 0.2 cannot use high-arousal emotion "happy".',
+      })
+    }
+
+    if (excitedReplyPattern.test(structured.reply)) {
+      issues.push({
+        code: 'low-liveliness-high-arousal-reply',
+        message: 'Liveliness <= 0.2 cannot use high-arousal wording in reply.',
+      })
+    }
+  }
+
+  return issues
+}
+
 export function normalizeStructuredOutput(input: StructuredOutputInput): StructuredOutputResult {
   const parsed = parseStructuredPayloadFromText(input.fullText)
   const payload = parsed.payload

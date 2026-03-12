@@ -221,12 +221,25 @@ export const useAiriCardStore = defineStore('airi-card', () => {
     if (!extension)
       return
 
-    activeConsciousnessProvider.value = extension?.modules?.consciousness?.provider
-    activeConsciousnessModel.value = extension?.modules?.consciousness?.model
+    const consciousnessProvider = extension?.modules?.consciousness?.provider?.trim()
+    const consciousnessModel = extension?.modules?.consciousness?.model?.trim()
+    const speechProvider = extension?.modules?.speech?.provider?.trim()
+    const speechModel = extension?.modules?.speech?.model?.trim()
+    const speechVoiceId = extension?.modules?.speech?.voice_id?.trim()
 
-    activeSpeechProvider.value = extension?.modules?.speech?.provider
-    activeSpeechModel.value = extension?.modules?.speech?.model
-    activeSpeechVoiceId.value = extension?.modules?.speech?.voice_id
+    // NOTICE: avoid clobbering persisted runtime selections with empty card fields.
+    // Card metadata can be stale/missing for legacy cards, while runtime selections remain valid.
+    if (consciousnessProvider)
+      activeConsciousnessProvider.value = consciousnessProvider
+    if (consciousnessModel)
+      activeConsciousnessModel.value = consciousnessModel
+
+    if (speechProvider)
+      activeSpeechProvider.value = speechProvider
+    if (speechModel)
+      activeSpeechModel.value = speechModel
+    if (speechVoiceId)
+      activeSpeechVoiceId.value = speechVoiceId
   })
 
   function resetState() {

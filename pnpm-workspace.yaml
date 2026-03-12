@@ -10,7 +10,6 @@ packages:
   - docs/**
   - apps/**
   - '!**/dist/**'
-
 overrides:
   array-flatten: npm:@nolyfill/array-flatten@^1.0.44
   axios: npm:feaxios@^0.0.23
@@ -73,6 +72,7 @@ catalog:
   better-auth: ^1.4.19
   bindings: ^1.5.0
   builder-util-runtime: ^9.5.1
+  copy-anything: ^3.0.5
   crossws: ^0.4.4
   drizzle-valibot: ^0.4.2
   electron: ^40.8.0
@@ -109,7 +109,6 @@ catalog:
   xsschema: 0.4.0-beta.13
   yaml: ^2.8.2
   zod: ^4.3.6
-
 catalogs:
   vitest:
     '@vitest/browser-playwright': ^4.0.18

@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="220" src="./docs/content/public/alice-logo.png" alt="ALICIZATION logo" />
+  <img width="220" src="./docs/content/public/alicization.png" alt="ALICIZATION logo" />
 </p>
 
 <h1 align="center">Project ALICIZATION</h1>

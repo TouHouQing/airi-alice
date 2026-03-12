@@ -1,6 +1,7 @@
 import type { ChatHistoryItem } from '../../types/chat'
 import type { ChatSessionMeta, ChatSessionRecord, ChatSessionsExport, ChatSessionsIndex } from '../../types/chat-session'
 
+import { isStageTamagotchi } from '@proj-airi/stage-shared'
 import { nanoid } from 'nanoid'
 import { defineStore, storeToRefs } from 'pinia'
 import { computed, ref, watch } from 'vue'
@@ -32,6 +33,8 @@ export const useChatSessionStore = defineStore('chat-session', () => {
   const loadingSessions = new Map<string, Promise<void>>()
 
   function getCurrentUserId() {
+    if (isStageTamagotchi())
+      return 'local'
     return userId.value || 'local'
   }
 
@@ -85,6 +88,41 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       sessionMessages.value[sessionId] = next
 
     return next
+  }
+
+  function normalizeMessagesWithIds(messages: ChatHistoryItem[]) {
+    let changed = false
+    const normalized = messages.map((message) => {
+      if (message.id)
+        return message
+      changed = true
+      return {
+        ...message,
+        id: nanoid(),
+      }
+    })
+    return { normalized, changed }
+  }
+
+  function mergeStoredAndLocalMessages(storedMessages: ChatHistoryItem[], localMessages: ChatHistoryItem[]) {
+    if (localMessages.length === 0)
+      return storedMessages
+    if (storedMessages.length === 0)
+      return localMessages
+
+    const mergedById = new Map<string, ChatHistoryItem>()
+
+    for (const message of storedMessages) {
+      const key = message.id ?? nanoid()
+      mergedById.set(key, message)
+    }
+
+    for (const message of localMessages) {
+      const key = message.id ?? nanoid()
+      mergedById.set(key, message)
+    }
+
+    return [...mergedById.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
   }
 
   function buildSyncMessages(messages: ChatHistoryItem[]) {
@@ -225,7 +263,13 @@ export const useChatSessionStore = defineStore('chat-session', () => {
   }
 
   function setSessionMessages(sessionId: string, next: ChatHistoryItem[]) {
-    sessionMessages.value[sessionId] = next
+    const current = sessionMessages.value[sessionId]
+    if (current) {
+      current.splice(0, current.length, ...next)
+    }
+    else {
+      sessionMessages.value[sessionId] = next
+    }
     void persistSession(sessionId)
   }
 
@@ -240,8 +284,28 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     const loadPromise = (async () => {
       const stored = await chatSessionsRepo.getSession(sessionId)
       if (stored) {
+        const { normalized: normalizedStoredMessages, changed } = normalizeMessagesWithIds(stored.messages)
+        if (changed) {
+          await chatSessionsRepo.saveSession(sessionId, {
+            ...stored,
+            messages: normalizedStoredMessages,
+          })
+        }
+
+        const localMessages = sessionMessages.value[sessionId] ?? []
+        const hasLocalMessages = localMessages.length > 0
+        const mergedMessages = hasLocalMessages
+          ? mergeStoredAndLocalMessages(normalizedStoredMessages, localMessages)
+          : normalizedStoredMessages
+
         sessionMetas.value[sessionId] = stored.meta
-        sessionMessages.value[sessionId] = stored.messages
+        const current = sessionMessages.value[sessionId]
+        if (current) {
+          current.splice(0, current.length, ...mergedMessages)
+        }
+        else {
+          sessionMessages.value[sessionId] = mergedMessages
+        }
         ensureGeneration(sessionId)
       }
       loadedSessions.add(sessionId)
@@ -284,12 +348,17 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     index.value.characters[characterId] = characterIndex
 
     const record: ChatSessionRecord = { meta, messages: initialMessages }
-    await enqueuePersist(() => chatSessionsRepo.saveSession(sessionId, record))
-    await persistIndex()
-    scheduleSync(sessionId)
 
     if (options?.setActive !== false)
       activeSessionId.value = sessionId
+
+    // NOTICE: mark just-created session as loaded to prevent async loadSession() from
+    // clobbering fresh in-memory messages with a stale persisted snapshot during reset races.
+    loadedSessions.add(sessionId)
+
+    await enqueuePersist(() => chatSessionsRepo.saveSession(sessionId, record))
+    await persistIndex()
+    scheduleSync(sessionId)
 
     return sessionId
   }
@@ -339,9 +408,8 @@ export const useChatSessionStore = defineStore('chat-session', () => {
 
   function ensureSession(sessionId: string) {
     ensureGeneration(sessionId)
-    if (!sessionMessages.value[sessionId] || sessionMessages.value[sessionId].length === 0) {
+    if (!sessionMessages.value[sessionId]) {
       sessionMessages.value[sessionId] = []
-      void persistSession(sessionId)
     }
   }
 
@@ -350,14 +418,18 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       if (!activeSessionId.value)
         return []
       ensureSession(activeSessionId.value)
-      if (ready.value)
-        void loadSession(activeSessionId.value)
       return sessionMessages.value[activeSessionId.value] ?? []
     },
     set: (value) => {
       if (!activeSessionId.value)
         return
-      sessionMessages.value[activeSessionId.value] = value
+      const current = sessionMessages.value[activeSessionId.value]
+      if (current) {
+        current.splice(0, current.length, ...value)
+      }
+      else {
+        sessionMessages.value[activeSessionId.value] = value
+      }
       void persistSession(activeSessionId.value)
     },
   })
@@ -399,9 +471,6 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       }
     }
 
-    for (const sessionId of sessionIds)
-      await enqueuePersist(() => chatSessionsRepo.deleteSession(sessionId))
-
     sessionMessages.value = {}
     sessionMetas.value = {}
     sessionGenerations.value = {}
@@ -413,14 +482,23 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       characters: {},
     }
 
-    await createSession(characterId)
+    const nextActiveSessionId = await createSession(characterId)
+
+    for (const sessionId of sessionIds) {
+      if (sessionId === nextActiveSessionId)
+        continue
+      await enqueuePersist(() => chatSessionsRepo.deleteSession(sessionId))
+    }
   }
 
   function getSessionMessages(sessionId: string) {
     ensureSession(sessionId)
-    if (ready.value)
-      void loadSession(sessionId)
     return sessionMessages.value[sessionId] ?? []
+  }
+
+  async function ensureSessionReady(sessionId: string) {
+    ensureSession(sessionId)
+    await loadSession(sessionId)
   }
 
   function getSessionGeneration(sessionId: string) {
@@ -504,7 +582,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     await ensureActiveSessionForCharacter()
   }
 
-  watch([userId, activeCardId], () => {
+  watch(activeCardId, () => {
     if (!ready.value)
       return
     void ensureActiveSessionForCharacter()
@@ -527,6 +605,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     setSessionMessages,
     persistSessionMessages,
     getSessionMessages,
+    ensureSessionReady,
     sessionMessages,
     sessionMetas,
     getSessionGeneration,

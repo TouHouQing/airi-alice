@@ -1,10 +1,10 @@
 import { useLocalStorage } from '@vueuse/core'
-import { defineStore } from 'pinia'
+import { defineStore, storeToRefs } from 'pinia'
 import { computed, nextTick, ref, watch } from 'vue'
 
+import { useConsciousnessStore } from './modules/consciousness'
 import { useProvidersStore } from './providers'
 
-const essentialProviderIds = ['openai', 'anthropic', 'google-generative-ai', 'openrouter-ai', 'ollama', 'deepseek', 'openai-compatible'] as const
 const credentialBasedEssentialProviderIds = ['openai', 'anthropic', 'google-generative-ai', 'openrouter-ai', 'deepseek'] as const
 
 function hasNonEmptyText(value: unknown): boolean {
@@ -13,6 +13,12 @@ function hasNonEmptyText(value: unknown): boolean {
 
 export const useOnboardingStore = defineStore('onboarding', () => {
   const providersStore = useProvidersStore()
+  const consciousnessStore = useConsciousnessStore()
+  const { activeProvider, activeModel } = storeToRefs(consciousnessStore)
+
+  function isChatProvider(providerId: string) {
+    return providersStore.providerMetadata[providerId]?.category === 'chat'
+  }
 
   // Track if first-time setup has been completed or skipped
   const hasCompletedSetup = useLocalStorage('onboarding/completed', false)
@@ -21,15 +27,16 @@ export const useOnboardingStore = defineStore('onboarding', () => {
   // Track if we should show the setup dialog
   const shouldShowSetup = ref(false)
 
-  // Check if any essential provider is configured
-  const hasEssentialProviderConfigured = computed(() => {
-    return essentialProviderIds.some(providerId => providersStore.configuredProviders[providerId])
+  // Check if any chat provider is configured
+  const hasChatProviderConfigured = computed(() => {
+    return Object.entries(providersStore.configuredProviders)
+      .some(([providerId, configured]) => configured && isChatProvider(providerId))
   })
 
   // Fallback for app startup timing:
   // If configured state has not been revalidated yet, infer "configured"
-  // from persisted essential credentials.
-  const hasEssentialProviderCredentialConfigured = computed(() => {
+  // from persisted credentials.
+  const hasCredentialBackedChatProviderConfigured = computed(() => {
     return credentialBasedEssentialProviderIds.some((providerId) => {
       const providerConfig = providersStore.providers[providerId] as Record<string, unknown> | undefined
       if (!providerConfig) {
@@ -40,6 +47,25 @@ export const useOnboardingStore = defineStore('onboarding', () => {
     })
   })
 
+  const hasPersistedActiveProviderSelection = computed(() => {
+    const providerId = activeProvider.value
+    if (!providerId || !isChatProvider(providerId) || !hasNonEmptyText(activeModel.value)) {
+      return false
+    }
+
+    return !!providersStore.providers[providerId] || !!providersStore.addedProviders[providerId]
+  })
+
+  // NOTICE: runtime selection can be valid before provider metadata/category fully hydrates.
+  // Treat any non-empty provider+model pair as configured to avoid false-positive onboarding reopen.
+  const hasRuntimeProviderSelection = computed(() => {
+    return hasNonEmptyText(activeProvider.value) && hasNonEmptyText(activeModel.value)
+  })
+
+  const hasPersistedChatProviderConfig = computed(() => {
+    return (providersStore.persistedChatProvidersMetadata?.length ?? 0) > 0
+  })
+
   // Check if first-time setup should be shown
   const needsOnboarding = computed(() => {
     if (hasSkippedSetup.value) {
@@ -47,18 +73,20 @@ export const useOnboardingStore = defineStore('onboarding', () => {
       return false
     }
 
-    const hasConfiguredEssentialProvider = hasEssentialProviderCredentialConfigured.value || hasEssentialProviderConfigured.value
-
-    // Recover from stale completed flag (e.g. setup window closed unexpectedly):
-    // only treat completion as final when an essential provider is actually configured.
-    if (hasCompletedSetup.value && hasConfiguredEssentialProvider) {
-      console.warn('Onboarding already completed with configured provider')
+    if (hasCompletedSetup.value) {
+      console.warn('Onboarding already completed')
       return false
     }
 
-    // Don't show if user already has persisted essential credentials/runtime config.
-    if (hasConfiguredEssentialProvider) {
-      console.warn('Essential provider credentials already configured, no onboarding needed')
+    const hasConfiguredChatProvider = hasCredentialBackedChatProviderConfigured.value
+      || hasChatProviderConfigured.value
+      || hasPersistedChatProviderConfig.value
+      || hasPersistedActiveProviderSelection.value
+      || hasRuntimeProviderSelection.value
+
+    // Don't show if user already has persisted chat credentials/runtime config.
+    if (hasConfiguredChatProvider) {
+      console.warn('Chat provider already configured, no onboarding needed')
       return false
     }
 
@@ -75,11 +103,22 @@ export const useOnboardingStore = defineStore('onboarding', () => {
 
   // Initialize setup check
   async function initializeSetupCheck() {
-    if (needsOnboarding.value) {
-      // Use nextTick to ensure the app is fully rendered before showing dialog
-      await nextTick()
-      shouldShowSetup.value = true
+    const hasConfiguredChatProvider = hasCredentialBackedChatProviderConfigured.value
+      || hasChatProviderConfigured.value
+      || hasPersistedChatProviderConfig.value
+      || hasPersistedActiveProviderSelection.value
+      || hasRuntimeProviderSelection.value
+
+    if (!needsOnboarding.value) {
+      shouldShowSetup.value = false
+      if (hasConfiguredChatProvider && !hasSkippedSetup.value && !hasCompletedSetup.value)
+        hasCompletedSetup.value = true
+      return
     }
+
+    // Use nextTick to ensure the app is fully rendered before showing dialog
+    await nextTick()
+    shouldShowSetup.value = true
   }
 
   // Mark setup as completed
@@ -111,8 +150,11 @@ export const useOnboardingStore = defineStore('onboarding', () => {
     hasCompletedSetup,
     hasSkippedSetup,
     shouldShowSetup,
-    hasEssentialProviderConfigured,
-    hasEssentialProviderCredentialConfigured,
+    hasChatProviderConfigured,
+    hasCredentialBackedChatProviderConfigured,
+    hasPersistedActiveProviderSelection,
+    hasRuntimeProviderSelection,
+    hasPersistedChatProviderConfig,
     needsOnboarding,
 
     initializeSetupCheck,

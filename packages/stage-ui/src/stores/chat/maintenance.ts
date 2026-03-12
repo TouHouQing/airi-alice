@@ -11,10 +11,10 @@ export const useChatMaintenanceStore = defineStore('chat-maintenance', () => {
   const chatContext = useChatContextStore()
   const chatOrchestrator = useChatOrchestratorStore()
 
-  function cleanupMessages(sessionId = chatSession.activeSessionId) {
+  async function cleanupMessages(sessionId = chatSession.activeSessionId) {
+    await chatOrchestrator.abortActiveTurns('session-reset')
     chatSession.cleanupMessages(sessionId)
     chatContext.resetContexts()
-    chatOrchestrator.cancelPendingSends(sessionId)
     chatStream.resetStream()
   }
 

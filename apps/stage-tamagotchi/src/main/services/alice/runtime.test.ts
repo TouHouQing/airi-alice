@@ -14,6 +14,7 @@ import {
   electronAliceInitializeGenesis,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceUpdatePersonality,
 } from '../../../shared/eventa'
 
 const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
@@ -186,6 +187,51 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     await resume!({ reason: 'test' })
     const resumedSnapshot = await getSensorySnapshot!()
     expect(resumedSnapshot.running).toBe(true)
+  })
+
+  it('keeps SOUL personality baseline body lines in sync after updatePersonality', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const updatePersonality = invokeHandlers.get(electronAliceUpdatePersonality)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(updatePersonality).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      ownerName: '测试主人',
+      hostName: '主人',
+      aliceName: 'A.L.I.C.E.',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.6,
+        liveliness: 0.5,
+        sensibility: 0.7,
+      },
+      personaNotes: '请保持克制和诚实。',
+      allowOverwrite: true,
+    })
+
+    await updatePersonality!({
+      reason: 'test-drift',
+      deltas: {
+        obedience: -0.2,
+        liveliness: -0.3,
+        sensibility: -0.1,
+      },
+    })
+
+    const nextSoul = await getSoul!()
+    expect(nextSoul.content).toContain(`- 服从度：${nextSoul.frontmatter.personality.obedience.toFixed(2)}`)
+    expect(nextSoul.content).toContain(`- 活泼度：${nextSoul.frontmatter.personality.liveliness.toFixed(2)}`)
+    expect(nextSoul.content).toContain(`- 感性度：${nextSoul.frontmatter.personality.sensibility.toFixed(2)}`)
   })
 
   it('emits alice.dialogue.responded only after turn persistence succeeds', async () => {

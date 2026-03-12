@@ -58,9 +58,10 @@ export function useDataMaintenance() {
     minecraftStore.resetState()
   }
 
-  function deleteAllChatSessions() {
+  async function deleteAllChatSessions() {
+    await chatOrchestrator.abortActiveTurns('session-reset')
     chatOrchestrator.cancelPendingSends()
-    chatStore.resetAllSessions()
+    await chatStore.resetAllSessions()
   }
 
   async function exportChatSessions() {
@@ -93,7 +94,7 @@ export function useDataMaintenance() {
     await deleteAllModels()
     await resetProvidersSettings()
     resetModulesSettings()
-    deleteAllChatSessions()
+    await deleteAllChatSessions()
     await resetSettingsState()
   }
 

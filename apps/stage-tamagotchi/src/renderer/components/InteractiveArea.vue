@@ -11,7 +11,7 @@ import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consci
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
 import { BasicTextarea } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { widgetsTools } from '../stores/tools/builtin/widgets'
@@ -68,11 +68,7 @@ async function handleSend() {
       ...att,
       url: URL.createObjectURL(new Blob([Uint8Array.from(atob(att.data), c => c.charCodeAt(0))], { type: att.mimeType })),
     }))
-    messages.value.pop()
-    messages.value.push({
-      role: 'error',
-      content: (error as Error).message,
-    })
+    console.error('Failed to send chat message:', error)
   }
 }
 
@@ -110,10 +106,13 @@ watch([activeProvider, activeModel], async () => {
   }
 }, { immediate: true })
 
-onAfterMessageComposed(async () => {
+const disposeAfterMessageComposed = onAfterMessageComposed(async () => {
   messageInput.value = ''
   attachments.value.forEach(att => URL.revokeObjectURL(att.url))
   attachments.value = []
+})
+onUnmounted(() => {
+  disposeAfterMessageComposed?.()
 })
 
 const historyMessages = computed(() => messages.value as unknown as ChatHistoryItem[])
