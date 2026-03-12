@@ -97,7 +97,7 @@ pages:
     delete: Supprimer
     delete_card: Supprimer la carte
     delete_confirmation: Êtes-vous sûr de vouloir supprimer cette carte ?
-    description: Utiliser les préréglages des cartes d'AIRI
+    description: Utiliser les préréglages des cartes Alicization
     description_label: Description
     drop_here: Déposer pour téléverser
     create_card: Créer une nouvelle carte
@@ -164,7 +164,7 @@ pages:
       model: Parole / Modèle
       voice: Parole / Voix
     systemprompt: Prompt système
-    title: Carte AIRI
+    title: Carte Alicization
     try_different_search: Essayez un autre terme de recherche
     upload: Téléverser
     upload_desc: Cliquez ou glissez un fichier pour téléverser

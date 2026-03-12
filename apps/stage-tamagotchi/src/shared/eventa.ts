@@ -178,6 +178,7 @@ export interface ElectronMcpToolDescriptor {
 }
 
 export interface ElectronMcpCallToolPayload {
+  cardId?: string
   name: string
   arguments?: Record<string, unknown>
 }
@@ -277,6 +278,10 @@ export const i18nSetLocale = defineInvokeEventa<void, Locale>('eventa:invoke:ele
 export const i18nGetLocale = defineInvokeEventa<Locale>('eventa:invoke:electron:i18n:get-locale')
 
 export type AliceKillSwitchState = 'ACTIVE' | 'SUSPENDED'
+
+export interface AliceCardScope {
+  cardId: string
+}
 
 export interface AlicePersonalityState {
   obedience: number
@@ -513,6 +518,7 @@ export interface AliceDialogueStructuredPayload {
 }
 
 export interface AliceDialogueRespondedPayload {
+  cardId: string
   turnId: string
   sessionId: string
   structured: AliceDialogueStructuredPayload
@@ -524,6 +530,7 @@ export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
 export type AliceToolActionCategory = 'read' | 'write' | 'delete' | 'execute' | 'network' | 'unknown'
 
 export interface AliceSafetyPermissionRequest {
+  cardId: string
   requestId: string
   token: string
   riskLevel: AliceToolRiskLevel
@@ -538,6 +545,7 @@ export interface AliceSafetyPermissionRequest {
 }
 
 export interface AliceSafetyPermissionDecision {
+  cardId?: string
   token: string
   requestId: string
   allow: boolean
@@ -550,28 +558,29 @@ export interface AliceSafetyPermissionDecisionResult {
   reason?: string
 }
 
-export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:bootstrap')
-export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot>('eventa:invoke:electron:alice:get-soul')
-export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
-export const electronAliceUpdateSoul = defineInvokeEventa<AliceSoulSnapshot, AliceSoulUpdatePayload>('eventa:invoke:electron:alice:update-soul')
-export const electronAliceUpdatePersonality = defineInvokeEventa<AliceSoulSnapshot, AlicePersonalityUpdatePayload>('eventa:invoke:electron:alice:update-personality')
-export const electronAliceKillSwitchGetState = defineInvokeEventa<AliceKillSwitchSnapshot>('eventa:invoke:electron:alice:kill-switch:get-state')
-export const electronAliceKillSwitchSuspend = defineInvokeEventa<AliceKillSwitchSnapshot, { reason?: string }>('eventa:invoke:electron:alice:kill-switch:suspend')
-export const electronAliceKillSwitchResume = defineInvokeEventa<AliceKillSwitchSnapshot, { reason?: string }>('eventa:invoke:electron:alice:kill-switch:resume')
-export const electronAliceGetMemoryStats = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:get-stats')
-export const electronAliceRunMemoryPrune = defineInvokeEventa<AliceMemoryStats>('eventa:invoke:electron:alice:memory:run-prune')
-export const electronAliceUpdateMemoryStats = defineInvokeEventa<AliceMemoryStats, AliceMemoryStats>('eventa:invoke:electron:alice:memory:update-stats')
-export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFact[], { query: string, limit?: number }>('eventa:invoke:electron:alice:memory:retrieve-facts')
-export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
-export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
-export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
-export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
-export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
-export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot>('eventa:invoke:electron:alice:sensory:get-snapshot')
+export const electronAliceBootstrap = defineInvokeEventa<AliceSoulSnapshot, AliceCardScope>('eventa:invoke:electron:alice:bootstrap')
+export const electronAliceGetSoul = defineInvokeEventa<AliceSoulSnapshot, AliceCardScope>('eventa:invoke:electron:alice:get-soul')
+export const electronAliceInitializeGenesis = defineInvokeEventa<AliceInitializeGenesisResult, AliceCardScope & AliceGenesisInput>('eventa:invoke:electron:alice:initialize-genesis')
+export const electronAliceUpdateSoul = defineInvokeEventa<AliceSoulSnapshot, AliceCardScope & AliceSoulUpdatePayload>('eventa:invoke:electron:alice:update-soul')
+export const electronAliceUpdatePersonality = defineInvokeEventa<AliceSoulSnapshot, AliceCardScope & AlicePersonalityUpdatePayload>('eventa:invoke:electron:alice:update-personality')
+export const electronAliceKillSwitchGetState = defineInvokeEventa<AliceKillSwitchSnapshot, AliceCardScope>('eventa:invoke:electron:alice:kill-switch:get-state')
+export const electronAliceKillSwitchSuspend = defineInvokeEventa<AliceKillSwitchSnapshot, AliceCardScope & { reason?: string }>('eventa:invoke:electron:alice:kill-switch:suspend')
+export const electronAliceKillSwitchResume = defineInvokeEventa<AliceKillSwitchSnapshot, AliceCardScope & { reason?: string }>('eventa:invoke:electron:alice:kill-switch:resume')
+export const electronAliceGetMemoryStats = defineInvokeEventa<AliceMemoryStats, AliceCardScope>('eventa:invoke:electron:alice:memory:get-stats')
+export const electronAliceRunMemoryPrune = defineInvokeEventa<AliceMemoryStats, AliceCardScope>('eventa:invoke:electron:alice:memory:run-prune')
+export const electronAliceUpdateMemoryStats = defineInvokeEventa<AliceMemoryStats, AliceCardScope & AliceMemoryStats>('eventa:invoke:electron:alice:memory:update-stats')
+export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFact[], AliceCardScope & { query: string, limit?: number }>('eventa:invoke:electron:alice:memory:retrieve-facts')
+export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, AliceCardScope & { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
+export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceCardScope & AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
+export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceCardScope & AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
+export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceCardScope & AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
+export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceCardScope & AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
+export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot, AliceCardScope>('eventa:invoke:electron:alice:sensory:get-snapshot')
 export const electronAliceSafetyResolvePermission = defineInvokeEventa<AliceSafetyPermissionDecisionResult, AliceSafetyPermissionDecision>('eventa:invoke:electron:alice:safety:resolve-permission')
+export const electronAliceDeleteCardScope = defineInvokeEventa<void, AliceCardScope>('eventa:invoke:electron:alice:delete-card-scope')
 
-export const aliceKillSwitchStateChanged = defineEventa<AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
-export const aliceSoulChanged = defineEventa<AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')
+export const aliceKillSwitchStateChanged = defineEventa<AliceCardScope & AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
+export const aliceSoulChanged = defineEventa<AliceCardScope & AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')
 export const aliceDialogueResponded = defineEventa<AliceDialogueRespondedPayload>('eventa:event:electron:alice:dialogue:responded')
 export const aliceSafetyPermissionRequested = defineEventa<AliceSafetyPermissionRequest>('eventa:event:electron:alice:safety:permission-requested')
 

@@ -16,12 +16,14 @@ import {
   electronAliceSafetyResolvePermission,
   electronMcpCallTool,
 } from '../../../shared/eventa'
+import { setAliceKillSwitchState } from './state'
 
 const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
 const sandboxDirs: string[] = []
 const emittedEvents: Array<{ event: unknown, payload: any }> = []
 const runtimeAuditLogs: any[] = []
 let dialogueRespondedListener: ((payload: any) => void) | null = null
+const metaStore = new Map<string, string>()
 
 const eventaContext = {
   emit: vi.fn((event: unknown, payload: unknown) => {
@@ -66,6 +68,10 @@ const dbStub = {
     lastPrunedAt: null,
   }),
   getJournalMode: vi.fn().mockResolvedValue('wal'),
+  getMetaValue: vi.fn(async (key: string) => metaStore.get(key)),
+  setMetaValue: vi.fn(async (key: string, value: string) => {
+    metaStore.set(key, value)
+  }),
 }
 
 vi.mock('@moeru/eventa', () => ({
@@ -157,6 +163,7 @@ describe('epoch2 closure e2e', () => {
     emittedEvents.splice(0, emittedEvents.length)
     runtimeAuditLogs.splice(0, runtimeAuditLogs.length)
     dialogueRespondedListener = null
+    metaStore.clear()
     vi.clearAllMocks()
     dbStub.appendConversationTurn.mockResolvedValue(undefined)
   })
@@ -238,6 +245,7 @@ describe('epoch2 closure e2e', () => {
       }))
 
       await appendConversationTurn!({
+        cardId: 'default',
         turnId: 'e2e-hitl-denied-turn',
         sessionId: 'epoch2-e2e-session',
         userText: '请帮我写入系统文件',
@@ -252,6 +260,7 @@ describe('epoch2 closure e2e', () => {
       })
 
       expect(rendererListener).toBeCalledWith(expect.objectContaining({
+        cardId: 'default',
         turnId: 'e2e-hitl-denied-turn',
         structured: expect.objectContaining({
           emotion: 'apologetic',
@@ -296,10 +305,11 @@ describe('epoch2 closure e2e', () => {
     dialogueRespondedListener = rendererListener
 
     dbStub.appendConversationTurn.mockImplementationOnce(async () => {
-      await suspend!({ reason: 'epoch2-e2e-stream-abort' })
+      setAliceKillSwitchState('SUSPENDED', 'epoch2-e2e-stream-abort')
     })
 
     await appendConversationTurn!({
+      cardId: 'default',
       turnId: 'e2e-stream-abort-turn',
       sessionId: 'epoch2-e2e-session',
       assistantText: '中断中',
@@ -313,6 +323,6 @@ describe('epoch2 closure e2e', () => {
     })
 
     expect(rendererListener).not.toBeCalled()
-    await resume!({ reason: 'epoch2-e2e-cleanup' })
+    setAliceKillSwitchState('ACTIVE', 'epoch2-e2e-cleanup')
   })
 })

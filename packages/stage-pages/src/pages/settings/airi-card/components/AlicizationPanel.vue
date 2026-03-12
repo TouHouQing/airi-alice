@@ -1,26 +1,26 @@
 <script setup lang="ts">
+import { isStageTamagotchi } from '@proj-airi/stage-shared'
 import { useAliceEpoch1Store } from '@proj-airi/stage-ui/stores/alice-epoch1'
 import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/character'
 import { storeToRefs } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 
 const aliceEpoch1Store = useAliceEpoch1Store()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
-const router = useRouter()
 const {
   memoryStats: aliceMemoryStats,
   killSwitch: aliceKillSwitch,
   soul: aliceSoul,
 } = storeToRefs(aliceEpoch1Store)
 
-const soulPersonaNotesStart = '<!-- ALICE_PERSONA_NOTES_START -->'
-const soulPersonaNotesEnd = '<!-- ALICE_PERSONA_NOTES_END -->'
-
 const memoryRefreshLoading = ref(false)
 const memoryPruneLoading = ref(false)
 const killSwitchLoading = ref(false)
 const personaSaving = ref(false)
+const supported = computed(() => isStageTamagotchi())
+
+const soulPersonaNotesStart = '<!-- ALICE_PERSONA_NOTES_START -->'
+const soulPersonaNotesEnd = '<!-- ALICE_PERSONA_NOTES_END -->'
 
 const personaDraft = ref({
   ownerName: '',
@@ -35,8 +35,6 @@ const personaDraft = ref({
   sensibility: 0.5,
   personaNotes: '',
 })
-
-void router.replace('/settings/airi-card')
 
 function formatDateTime(value?: number | null) {
   if (!value)
@@ -181,7 +179,7 @@ async function savePersona() {
 </script>
 
 <template>
-  <div flex="~ col gap-6" p-4 font-normal>
+  <div v-if="supported" flex="~ col gap-6" p-2 font-normal>
     <div class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
       <div class="mb-3 flex items-center justify-between">
         <div class="text-sm font-semibold">
@@ -374,15 +372,7 @@ async function savePersona() {
       </div>
     </div>
   </div>
+  <div v-else class="border border-neutral-200 rounded-lg p-4 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-400">
+    Alicization 仅在桌面端可用。
+  </div>
 </template>
-
-<route lang="yaml">
-meta:
-  layout: settings
-  title: Alicization
-  description: Redirect to Alicization Card
-  icon: i-solar:atom-bold-duotone
-  order: 8
-  stageTransition:
-    name: slide
-</route>

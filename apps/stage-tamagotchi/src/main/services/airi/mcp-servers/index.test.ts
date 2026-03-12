@@ -13,6 +13,8 @@ const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
 const contextEmitMock = vi.fn()
 const appendAuditLogMock = vi.fn().mockResolvedValue(undefined)
 const isKillSwitchSuspendedMock = vi.fn(() => false)
+const isCardKillSwitchSuspendedMock = vi.fn(() => false)
+const getCardKillSwitchSnapshotMock = vi.fn(() => ({ state: 'ACTIVE' as const, updatedAt: Date.now() }))
 const killSwitchListeners = new Set<(snapshot: { state: 'ACTIVE' | 'SUSPENDED', reason?: string, updatedAt: number }) => void>()
 
 vi.mock('@moeru/eventa', () => ({
@@ -45,6 +47,8 @@ vi.mock('../../../libs/bootkit/lifecycle', () => ({
 
 vi.mock('../../alice/state', () => ({
   appendAliceRuntimeAuditLog: appendAuditLogMock,
+  getAliceCardKillSwitchSnapshot: getCardKillSwitchSnapshotMock,
+  isAliceCardKillSwitchSuspended: isCardKillSwitchSuspendedMock,
   isAliceKillSwitchSuspended: isKillSwitchSuspendedMock,
   onAliceKillSwitchChanged: vi.fn((listener: (snapshot: { state: 'ACTIVE' | 'SUSPENDED', reason?: string, updatedAt: number }) => void) => {
     killSwitchListeners.add(listener)
@@ -95,6 +99,10 @@ describe('mcp safety gate', () => {
     appendAuditLogMock.mockClear()
     isKillSwitchSuspendedMock.mockReset()
     isKillSwitchSuspendedMock.mockReturnValue(false)
+    isCardKillSwitchSuspendedMock.mockReset()
+    isCardKillSwitchSuspendedMock.mockReturnValue(false)
+    getCardKillSwitchSnapshotMock.mockReset()
+    getCardKillSwitchSnapshotMock.mockImplementation(() => ({ state: 'ACTIVE', updatedAt: Date.now() }))
     killSwitchListeners.clear()
   })
 
@@ -117,7 +125,7 @@ describe('mcp safety gate', () => {
     const result = await callTool!({
       name: 'filesystem::read_file',
       arguments: {
-        path: '/tmp/alice-user-data/alice/SOUL.md',
+        path: '/tmp/alice-user-data/alicizations/SOUL.md',
       },
     })
 
@@ -153,7 +161,7 @@ describe('mcp safety gate', () => {
       name: 'filesystem::read_file',
       arguments: {
         sourcePath: '/tmp/documents/Alice_Workspace/notes.txt',
-        targetPath: '/tmp/alice-user-data/alice/alice.db',
+        targetPath: '/tmp/alice-user-data/alicizations/alice.db',
       },
     })
 
@@ -177,7 +185,7 @@ describe('mcp safety gate', () => {
     const result = await callTool!({
       name: 'filesystem::read_file',
       arguments: {
-        path: '../../alice-user-data/alice/alice.db',
+        path: '../../alice-user-data/alicizations/alice.db',
       },
     })
 
@@ -380,6 +388,130 @@ describe('mcp safety gate', () => {
     expect(secondResult.isError).not.toBe(true)
     expect(manager.callTool).toBeCalledTimes(2)
     expect(getSafetyRequests()).toHaveLength(0)
+  })
+
+  it('keeps session whitelist isolated per cardId', async () => {
+    const { createMcpServersService } = await import('./index')
+    const manager = createManager()
+
+    createMcpServersService({
+      context: { emit: contextEmitMock } as any,
+      manager,
+    })
+
+    const callTool = invokeHandlers.get(electronMcpCallTool)
+    const resolvePermission = invokeHandlers.get(electronAliceSafetyResolvePermission)
+    expect(callTool).toBeTypeOf('function')
+    expect(resolvePermission).toBeTypeOf('function')
+
+    const firstPending = callTool!({
+      cardId: 'card-a',
+      name: 'filesystem::read_file',
+      arguments: {
+        path: '/tmp/outside/shared-read.txt',
+      },
+    })
+
+    await vi.waitFor(() => {
+      expect(getSafetyRequests()).toHaveLength(1)
+    })
+
+    const firstRequest = getSafetyRequests()[0]
+    expect(firstRequest?.cardId).toBe('card-a')
+    await resolvePermission!({
+      cardId: 'card-a',
+      token: firstRequest.token,
+      requestId: firstRequest.requestId,
+      allow: true,
+      rememberSession: true,
+      reason: 'user-approved',
+    })
+    await firstPending
+    expect(manager.callTool).toBeCalledTimes(1)
+
+    contextEmitMock.mockReset()
+    const secondResult = await callTool!({
+      cardId: 'card-a',
+      name: 'filesystem::read_file',
+      arguments: {
+        path: '/tmp/outside/shared-read.txt',
+      },
+    })
+    expect(secondResult.isError).not.toBe(true)
+    expect(manager.callTool).toBeCalledTimes(2)
+    expect(getSafetyRequests()).toHaveLength(0)
+
+    const thirdPending = callTool!({
+      cardId: 'card-b',
+      name: 'filesystem::read_file',
+      arguments: {
+        path: '/tmp/outside/shared-read.txt',
+      },
+    })
+    await vi.waitFor(() => {
+      expect(getSafetyRequests()).toHaveLength(1)
+    })
+    const thirdRequest = getSafetyRequests()[0]
+    expect(thirdRequest?.cardId).toBe('card-b')
+    await resolvePermission!({
+      cardId: 'card-b',
+      token: thirdRequest.token,
+      requestId: thirdRequest.requestId,
+      allow: false,
+      reason: 'user-denied',
+    })
+    const thirdResult = await thirdPending
+    expect(thirdResult.isError).toBe(true)
+    expect(thirdResult.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(manager.callTool).toBeCalledTimes(2)
+  })
+
+  it('rejects permission token replay across different cardId', async () => {
+    const { createMcpServersService } = await import('./index')
+    const manager = createManager()
+
+    createMcpServersService({
+      context: { emit: contextEmitMock } as any,
+      manager,
+    })
+
+    const callTool = invokeHandlers.get(electronMcpCallTool)
+    const resolvePermission = invokeHandlers.get(electronAliceSafetyResolvePermission)
+    expect(callTool).toBeTypeOf('function')
+    expect(resolvePermission).toBeTypeOf('function')
+
+    const pending = callTool!({
+      cardId: 'card-a',
+      name: 'filesystem::read_file',
+      arguments: {
+        path: '/tmp/outside/cross-card-token.txt',
+      },
+    })
+
+    await vi.waitFor(() => {
+      expect(getSafetyRequests()).toHaveLength(1)
+    })
+
+    const request = getSafetyRequests()[0]
+    const forgedResult = await resolvePermission!({
+      cardId: 'card-b',
+      token: request.token,
+      requestId: request.requestId,
+      allow: true,
+      reason: 'forged-cross-card',
+    })
+    expect(forgedResult).toEqual({ accepted: false, reason: 'context-mismatch' })
+
+    await resolvePermission!({
+      cardId: 'card-a',
+      token: request.token,
+      requestId: request.requestId,
+      allow: false,
+      reason: 'user-denied',
+    })
+    const denied = await pending
+    expect(denied.isError).toBe(true)
+    expect(denied.errorCode).toBe('ALICE_TOOL_DENIED')
   })
 
   it('rejects permission resolution when requestId does not match token context', async () => {

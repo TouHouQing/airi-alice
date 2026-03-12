@@ -23,6 +23,12 @@ const routeMeta = computed(() => route.meta as {
   subtitle?: string
 })
 
+function normalizeAlicizationLabel(value: string | undefined) {
+  if (!value)
+    return ''
+  return value.replace(/AIRI/gi, 'Alicization')
+}
+
 const providerTitle = computed(() => {
   if (!route.path.startsWith('/settings/providers/'))
     return undefined
@@ -47,10 +53,13 @@ const routeHeaderMetadata = computed(() => {
   const { titleKey, subtitleKey, title, subtitle } = routeMeta.value
   const resolvedTitle = titleKey ? t(titleKey) : title
   const resolvedSubtitle = subtitleKey ? t(subtitleKey) : subtitle
+  const normalizedTitle = route.path === '/settings/airi-card'
+    ? normalizeAlicizationLabel(resolvedTitle)
+    : resolvedTitle
 
-  if (resolvedTitle || resolvedSubtitle) {
+  if (normalizedTitle || resolvedSubtitle) {
     return {
-      title: resolvedTitle,
+      title: normalizedTitle,
       subtitle: resolvedSubtitle,
     }
   }

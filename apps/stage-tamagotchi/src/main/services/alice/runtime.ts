@@ -1,5 +1,6 @@
 import type {
   AliceAuditLogInput,
+  AliceCardScope,
   AliceConversationTurnInput,
   AliceDialogueRespondedPayload,
   AliceGender,
@@ -14,7 +15,7 @@ import type {
 
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, open as openFile, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open as openFile, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pid, platform } from 'node:process'
 
@@ -29,6 +30,7 @@ import {
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
+  electronAliceDeleteCardScope,
   electronAliceGetMemoryStats,
   electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
@@ -49,7 +51,14 @@ import {
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
 import { setupAliceDb } from './db'
 import { createAliceSensoryBus } from './sensory-bus'
-import { getAliceKillSwitchSnapshot, setAliceAuditLogger, setAliceKillSwitchState } from './state'
+import {
+  getAliceCardKillSwitchSnapshot,
+  getAliceKillSwitchSnapshot,
+  isAliceKillSwitchSuspended,
+  setAliceAuditLogger,
+  setAliceCardKillSwitchState,
+  setAliceKillSwitchState,
+} from './state'
 
 const currentSoulSchemaVersion = 2
 const soulPersonaNotesStart = '<!-- ALICE_PERSONA_NOTES_START -->'
@@ -79,6 +88,15 @@ const defaultFrontmatter: AliceSoulFrontmatter = {
 }
 
 const winRenameRetryDelaysMs = [5, 10, 20, 40, 80]
+const aliceCardKillSwitchMetaKey = 'kill_switch_state_v1'
+const defaultAliceCardId = 'default'
+
+function normalizeCardId(raw: unknown) {
+  if (typeof raw !== 'string')
+    return defaultAliceCardId
+  const trimmed = raw.trim()
+  return trimmed || defaultAliceCardId
+}
 
 function clamp01(value: number) {
   if (Number.isNaN(value))
@@ -846,7 +864,7 @@ function readStringValue(value: unknown) {
   return typeof value === 'string' ? value : ''
 }
 
-function normalizeDialogueRespondedPayload(input: AliceConversationTurnInput): AliceDialogueRespondedPayload | null {
+function normalizeDialogueRespondedPayload(input: AliceConversationTurnInput): Omit<AliceDialogueRespondedPayload, 'cardId'> | null {
   const normalizedSessionId = input.sessionId?.trim()
   if (!normalizedSessionId)
     return null
@@ -886,14 +904,25 @@ interface AliceRuntimeSetupOptions {
 
 export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   const userDataPath = options?.userDataPathOverride ?? app.getPath('userData')
-  const soulRoot = join(userDataPath, 'alice')
-  const soulPath = join(soulRoot, 'SOUL.md')
-  const legacyPromptProfilePath = join(soulRoot, 'prompt-profile.json')
-  const legacySparkProfilePath = join(soulRoot, 'spark-profile.json')
-  const aliceDb = await setupAliceDb(userDataPath)
+  const resolveCardPaths = (cardId: string) => {
+    const soulRoot = join(userDataPath, 'alicizations', 'cards', cardId)
+    return {
+      soulRoot,
+      soulPath: join(soulRoot, 'SOUL.md'),
+      legacyPromptProfilePath: join(soulRoot, 'prompt-profile.json'),
+      legacySparkProfilePath: join(soulRoot, 'spark-profile.json'),
+    }
+  }
+
+  let activeCardId = defaultAliceCardId
+  let { soulRoot, soulPath, legacyPromptProfilePath, legacySparkProfilePath } = resolveCardPaths(activeCardId)
+  let aliceDb = await setupAliceDb(userDataPath, { cardId: activeCardId })
 
   const { context } = createContext(ipcMain)
 
+  const scopeLifecycleQueueState = {
+    queue: Promise.resolve<unknown>(undefined),
+  }
   let revision = 0
   let watching = false
   let soulSnapshot: AliceSoulSnapshot | null = null
@@ -904,17 +933,42 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   let muteWatchUntil = 0
   const turnWriteAbortControllers = new Map<string, AbortController>()
 
-  const emitSoulChanged = (snapshot: AliceSoulSnapshot) => {
-    context.emit(aliceSoulChanged, snapshot)
+  const emitSoulChanged = (snapshot: AliceSoulSnapshot, cardId = activeCardId) => {
+    context.emit(aliceSoulChanged, {
+      cardId,
+      ...snapshot,
+    })
   }
 
-  const emitKillSwitchChanged = () => {
-    context.emit(aliceKillSwitchStateChanged, getAliceKillSwitchSnapshot())
+  const getScopedKillSwitchSnapshot = (cardId = activeCardId) => {
+    const globalSnapshot = getAliceKillSwitchSnapshot()
+    const cardSnapshot = getAliceCardKillSwitchSnapshot(cardId)
+    if (globalSnapshot.state === 'SUSPENDED') {
+      return {
+        state: 'SUSPENDED' as const,
+        reason: globalSnapshot.reason ?? cardSnapshot.reason ?? 'global',
+        updatedAt: Math.max(globalSnapshot.updatedAt, cardSnapshot.updatedAt),
+      }
+    }
+    return cardSnapshot
   }
 
-  async function appendAuditLog(input: AliceAuditLogInput) {
+  const emitKillSwitchChanged = (cardId = activeCardId) => {
+    context.emit(aliceKillSwitchStateChanged, {
+      cardId,
+      ...getScopedKillSwitchSnapshot(cardId),
+    })
+  }
+
+  async function appendAuditLog(input: AliceAuditLogInput, cardId = activeCardId) {
     try {
-      await aliceDb.appendAuditLog(input)
+      await aliceDb.appendAuditLog({
+        ...input,
+        payload: {
+          ...(input.payload ?? {}),
+          cardId,
+        },
+      })
     }
     catch (error) {
       console.warn('[alice-runtime] failed to append audit log:', error)
@@ -922,12 +976,107 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   }
   setAliceAuditLogger(appendAuditLog)
 
-  const sensoryBus = createAliceSensoryBus({
+  let sensoryBus = createAliceSensoryBus({
     tickMs: 60_000,
     staleMs: 90_000,
     cpuWindowMs: 1_000,
-    appendAuditLog,
+    appendAuditLog: input => appendAuditLog(input, activeCardId),
   })
+
+  async function persistScopedKillSwitch(cardId: string, state: 'ACTIVE' | 'SUSPENDED', reason?: string) {
+    const snapshot = setAliceCardKillSwitchState(cardId, state, reason)
+    await aliceDb.setMetaValue(aliceCardKillSwitchMetaKey, JSON.stringify(snapshot)).catch(() => {})
+    return snapshot
+  }
+
+  async function restoreScopedKillSwitch(cardId: string) {
+    const raw = await aliceDb.getMetaValue(aliceCardKillSwitchMetaKey).catch(() => undefined)
+    if (!raw) {
+      setAliceCardKillSwitchState(cardId, 'ACTIVE', 'bootstrap')
+      return
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { state?: unknown, reason?: unknown, updatedAt?: unknown }
+      const state = parsed.state === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE'
+      const reason = typeof parsed.reason === 'string' ? parsed.reason : undefined
+      const snapshot = setAliceCardKillSwitchState(cardId, state, reason)
+      if (typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt)) {
+        snapshot.updatedAt = parsed.updatedAt
+      }
+    }
+    catch {
+      setAliceCardKillSwitchState(cardId, 'ACTIVE', 'bootstrap')
+    }
+  }
+
+  async function switchCardScope(nextCardIdRaw: unknown) {
+    const nextCardId = normalizeCardId(nextCardIdRaw)
+    if (nextCardId === activeCardId)
+      return
+
+    sensoryBus.stop('manual')
+    stopWatch()
+    if (pruneTimer) {
+      clearInterval(pruneTimer)
+      pruneTimer = undefined
+    }
+    turnWriteAbortControllers.clear()
+    queuedWrite = Promise.resolve()
+    soulSnapshot = null
+    watching = false
+    muteWatchUntil = 0
+    revision = 0
+
+    await aliceDb.close().catch(() => {})
+
+    activeCardId = nextCardId
+    ;({ soulRoot, soulPath, legacyPromptProfilePath, legacySparkProfilePath } = resolveCardPaths(activeCardId))
+    aliceDb = await setupAliceDb(userDataPath, { cardId: activeCardId })
+    await restoreScopedKillSwitch(activeCardId)
+
+    sensoryBus = createAliceSensoryBus({
+      tickMs: 60_000,
+      staleMs: 90_000,
+      cpuWindowMs: 1_000,
+      appendAuditLog: input => appendAuditLog(input, activeCardId),
+    })
+
+    if (!isAliceKillSwitchSuspended() && getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED') {
+      sensoryBus.start()
+    }
+    startPruneTimer()
+  }
+
+  async function withCardScope<T>(nextCardIdRaw: unknown, task: () => Promise<T>) {
+    const execute = async () => {
+      await switchCardScope(nextCardIdRaw)
+      return await task()
+    }
+    const next = scopeLifecycleQueueState.queue.then(execute, execute)
+    scopeLifecycleQueueState.queue = next.then(() => undefined, () => undefined)
+    return await next
+  }
+
+  function startPruneTimer() {
+    if (pruneTimer) {
+      clearInterval(pruneTimer)
+      pruneTimer = undefined
+    }
+    pruneTimer = setInterval(() => {
+      void aliceDb.runMemoryPrune().catch(async (error) => {
+        await appendAuditLog({
+          level: 'warning',
+          category: 'memory',
+          action: 'prune-scheduled-failed',
+          message: 'Scheduled memory prune failed.',
+          payload: {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      })
+    }, 24 * 60 * 60 * 1000)
+  }
 
   function createTurnWriteAbortSignal(turnId?: string) {
     const normalizedTurnId = turnId?.trim()
@@ -1365,7 +1514,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   }
 
   async function suspendKillSwitch(reason?: string) {
-    const snapshot = setAliceKillSwitchState('SUSPENDED', reason)
+    const snapshot = await persistScopedKillSwitch(activeCardId, 'SUSPENDED', reason)
     sensoryBus.stop('kill-switch')
     await abortAllTurnWrites(reason ?? 'manual')
     emitKillSwitchChanged()
@@ -1382,8 +1531,9 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   }
 
   async function resumeKillSwitch(reason?: string) {
-    const snapshot = setAliceKillSwitchState('ACTIVE', reason)
-    sensoryBus.start()
+    const snapshot = await persistScopedKillSwitch(activeCardId, 'ACTIVE', reason)
+    if (!isAliceKillSwitchSuspended())
+      sensoryBus.start()
     emitKillSwitchChanged()
     await appendAuditLog({
       level: 'notice',
@@ -1397,158 +1547,143 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     return snapshot
   }
 
-  defineInvokeHandler(context, electronAliceBootstrap, async () => {
-    return await bootstrap()
+  async function suspendGlobalKillSwitch(reason?: string) {
+    const snapshot = setAliceKillSwitchState('SUSPENDED', reason)
+    sensoryBus.stop('kill-switch')
+    await abortAllTurnWrites(reason ?? 'manual')
+    emitKillSwitchChanged(activeCardId)
+    await appendAuditLog({
+      level: 'notice',
+      category: 'kill-switch',
+      action: 'global-suspend',
+      message: 'Global kill switch set to SUSPENDED.',
+      payload: {
+        reason: reason ?? 'manual',
+      },
+    })
+    return snapshot
+  }
+
+  async function resumeGlobalKillSwitch(reason?: string) {
+    const snapshot = setAliceKillSwitchState('ACTIVE', reason)
+    if (getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED')
+      sensoryBus.start()
+    emitKillSwitchChanged(activeCardId)
+    await appendAuditLog({
+      level: 'notice',
+      category: 'kill-switch',
+      action: 'global-resume',
+      message: 'Global kill switch resumed to ACTIVE.',
+      payload: {
+        reason: reason ?? 'manual',
+      },
+    })
+    return snapshot
+  }
+
+  const cardIdFrom = (scope?: Partial<AliceCardScope>) => normalizeCardId(scope?.cardId)
+
+  defineInvokeHandler(context, electronAliceBootstrap, async (scope) => {
+    return await withCardScope(cardIdFrom(scope), async () => await bootstrap())
   })
 
-  defineInvokeHandler(context, electronAliceGetSoul, async () => {
-    if (!soulSnapshot)
-      return await bootstrap()
-    return {
-      ...soulSnapshot,
-      watching,
-    }
+  defineInvokeHandler(context, electronAliceGetSoul, async (scope) => {
+    return await withCardScope(cardIdFrom(scope), async () => {
+      if (!soulSnapshot)
+        return await bootstrap()
+      return {
+        ...soulSnapshot,
+        watching,
+      }
+    })
   })
 
-  defineInvokeHandler(context, electronAliceInitializeGenesis, async payload => await initializeGenesis(payload))
+  defineInvokeHandler(context, electronAliceInitializeGenesis, async (payload) => {
+    const { cardId, ...genesisPayload } = payload
+    return await withCardScope(cardId, async () => await initializeGenesis(genesisPayload))
+  })
 
   defineInvokeHandler(context, electronAliceUpdateSoul, async (payload) => {
-    return await queueSoulMutation(async (current) => {
-      if (payload.expectedRevision != null && payload.expectedRevision !== current.revision) {
-        throw new Error(`SOUL revision mismatch. expected=${payload.expectedRevision} actual=${current.revision}`)
-      }
+    const { cardId, ...updatePayload } = payload
+    return await withCardScope(cardId, async () => {
+      return await queueSoulMutation(async (current) => {
+        if (updatePayload.expectedRevision != null && updatePayload.expectedRevision !== current.revision) {
+          throw new Error(`SOUL revision mismatch. expected=${updatePayload.expectedRevision} actual=${current.revision}`)
+        }
 
-      const parsed = parseSoul(payload.content)
-      const content = toSoulContent(parsed.frontmatter, parsed.body)
-      return snapshotFromContent(content)
+        const parsed = parseSoul(updatePayload.content)
+        const content = toSoulContent(parsed.frontmatter, parsed.body)
+        return snapshotFromContent(content)
+      })
     })
   })
 
   defineInvokeHandler(context, electronAliceUpdatePersonality, async (payload) => {
-    return await queueSoulMutation(async (current) => {
-      if (payload.expectedRevision != null && payload.expectedRevision !== current.revision) {
-        throw new Error(`SOUL revision mismatch. expected=${payload.expectedRevision} actual=${current.revision}`)
-      }
+    const { cardId, ...updatePayload } = payload
+    return await withCardScope(cardId, async () => {
+      return await queueSoulMutation(async (current) => {
+        if (updatePayload.expectedRevision != null && updatePayload.expectedRevision !== current.revision) {
+          throw new Error(`SOUL revision mismatch. expected=${updatePayload.expectedRevision} actual=${current.revision}`)
+        }
 
-      const parsed = parseSoul(current.content)
-      const nextPersonality: AlicePersonalityState = {
-        obedience: clamp01(parsed.frontmatter.personality.obedience + (payload.deltas.obedience ?? 0)),
-        liveliness: clamp01(parsed.frontmatter.personality.liveliness + (payload.deltas.liveliness ?? 0)),
-        sensibility: clamp01(parsed.frontmatter.personality.sensibility + (payload.deltas.sensibility ?? 0)),
-      }
-      const nextFrontmatter: AliceSoulFrontmatter = {
-        ...parsed.frontmatter,
-        personality: nextPersonality,
-      }
-      const syncedBody = syncPersonalityBaselineInBody(parsed.body, nextPersonality)
-      const content = toSoulContent(nextFrontmatter, syncedBody)
-      return snapshotFromContent(content)
+        const parsed = parseSoul(current.content)
+        const nextPersonality: AlicePersonalityState = {
+          obedience: clamp01(parsed.frontmatter.personality.obedience + (updatePayload.deltas.obedience ?? 0)),
+          liveliness: clamp01(parsed.frontmatter.personality.liveliness + (updatePayload.deltas.liveliness ?? 0)),
+          sensibility: clamp01(parsed.frontmatter.personality.sensibility + (updatePayload.deltas.sensibility ?? 0)),
+        }
+        const nextFrontmatter: AliceSoulFrontmatter = {
+          ...parsed.frontmatter,
+          personality: nextPersonality,
+        }
+        const syncedBody = syncPersonalityBaselineInBody(parsed.body, nextPersonality)
+        const content = toSoulContent(nextFrontmatter, syncedBody)
+        return snapshotFromContent(content)
+      })
     })
   })
 
-  defineInvokeHandler(context, electronAliceKillSwitchGetState, () => getAliceKillSwitchSnapshot())
-  defineInvokeHandler(context, electronAliceKillSwitchSuspend, async payload => await suspendKillSwitch(payload?.reason ?? 'manual'))
-  defineInvokeHandler(context, electronAliceKillSwitchResume, async payload => await resumeKillSwitch(payload?.reason ?? 'manual'))
+  defineInvokeHandler(context, electronAliceKillSwitchGetState, async scope => await withCardScope(cardIdFrom(scope), async () => getScopedKillSwitchSnapshot()))
+  defineInvokeHandler(context, electronAliceKillSwitchSuspend, async payload => await withCardScope(cardIdFrom(payload), async () => await suspendKillSwitch(payload?.reason ?? 'manual')))
+  defineInvokeHandler(context, electronAliceKillSwitchResume, async payload => await withCardScope(cardIdFrom(payload), async () => await resumeKillSwitch(payload?.reason ?? 'manual')))
 
-  defineInvokeHandler(context, electronAliceGetMemoryStats, async () => await aliceDb.getMemoryStats())
-  defineInvokeHandler(context, electronAliceGetSensorySnapshot, async () => {
-    let snapshot = sensoryBus.getSnapshot()
-    if (snapshot.stale && snapshot.running && getAliceKillSwitchSnapshot().state !== 'SUSPENDED') {
-      try {
-        await sensoryBus.refreshNow({ force: true, timeoutMs: 1_200 })
+  defineInvokeHandler(context, electronAliceGetMemoryStats, async scope => await withCardScope(cardIdFrom(scope), async () => await aliceDb.getMemoryStats()))
+  defineInvokeHandler(context, electronAliceGetSensorySnapshot, async (scope) => {
+    return await withCardScope(cardIdFrom(scope), async () => {
+      let snapshot = sensoryBus.getSnapshot()
+      if (snapshot.stale && snapshot.running && !isAliceKillSwitchSuspended()) {
+        try {
+          await sensoryBus.refreshNow({ force: true, timeoutMs: 1_200 })
+        }
+        catch (error) {
+          await appendAuditLog({
+            level: 'warning',
+            category: 'alice.sensory',
+            action: 'refresh-stale-failed',
+            message: 'Failed to refresh stale sensory snapshot before renderer request.',
+            payload: {
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          })
+        }
+        snapshot = sensoryBus.getSnapshot()
       }
-      catch (error) {
-        await appendAuditLog({
-          level: 'warning',
-          category: 'alice.sensory',
-          action: 'refresh-stale-failed',
-          message: 'Failed to refresh stale sensory snapshot before renderer request.',
-          payload: {
-            reason: error instanceof Error ? error.message : String(error),
-          },
-        })
-      }
-      snapshot = sensoryBus.getSnapshot()
-    }
-    return snapshot
+      return snapshot
+    })
   })
-  defineInvokeHandler(context, electronAliceUpdateMemoryStats, async payload => await aliceDb.overrideMemoryStats(payload))
-  defineInvokeHandler(context, electronAliceRunMemoryPrune, async () => await aliceDb.runMemoryPrune())
-  defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit))
-  defineInvokeHandler(context, electronAliceMemoryUpsertFacts, async payload => await aliceDb.upsertMemoryFacts(payload.facts, payload.source))
-  defineInvokeHandler(context, electronAliceMemoryImportLegacy, async payload => await aliceDb.importLegacyMemory(payload))
+  defineInvokeHandler(context, electronAliceUpdateMemoryStats, async payload => await withCardScope(payload.cardId, async () => await aliceDb.overrideMemoryStats(payload)))
+  defineInvokeHandler(context, electronAliceRunMemoryPrune, async scope => await withCardScope(cardIdFrom(scope), async () => await aliceDb.runMemoryPrune()))
+  defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit)))
+  defineInvokeHandler(context, electronAliceMemoryUpsertFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.upsertMemoryFacts(payload.facts, payload.source)))
+  defineInvokeHandler(context, electronAliceMemoryImportLegacy, async payload => await withCardScope(payload.cardId, async () => await aliceDb.importLegacyMemory(payload)))
   defineInvokeHandler(context, electronAliceAppendConversationTurn, async (payload) => {
-    if (getAliceKillSwitchSnapshot().state === 'SUSPENDED') {
-      await appendAuditLog({
-        level: 'notice',
-        category: 'kill-switch',
-        action: 'turn-write-skipped-aborted',
-        message: 'Skipped conversation turn persistence because kill switch is suspended.',
-        payload: {
-          sessionId: payload.sessionId,
-          turnId: payload.turnId,
-        },
-      })
-      return
-    }
-
-    const signal = createTurnWriteAbortSignal(payload.turnId)
-    if (signal?.aborted) {
-      releaseTurnWriteAbortController(payload.turnId)
-      await appendAuditLog({
-        level: 'notice',
-        category: 'kill-switch',
-        action: 'turn-write-skipped-aborted',
-        message: 'Skipped conversation turn persistence because turn write signal was already aborted.',
-        payload: {
-          sessionId: payload.sessionId,
-          turnId: payload.turnId,
-        },
-      })
-      return
-    }
-
-    try {
-      await aliceDb.appendConversationTurn(payload, { signal })
-      if (signal?.aborted || getAliceKillSwitchSnapshot().state === 'SUSPENDED') {
-        await appendAuditLog({
-          level: 'notice',
-          category: 'kill-switch',
-          action: 'turn-abort-dropped',
-          message: 'Dropped dialogue responded event because the turn was aborted after persistence.',
-          payload: {
-            sessionId: payload.sessionId,
-            turnId: payload.turnId,
-          },
-        })
-        return
-      }
-
-      const dialoguePayload = normalizeDialogueRespondedPayload(payload)
-      if (dialoguePayload) {
-        context.emit(aliceDialogueResponded, dialoguePayload)
-        await appendAuditLog({
-          level: 'notice',
-          category: 'alice.dialogue',
-          action: 'alice.dialogue.responded.emitted',
-          message: 'Emitted alice.dialogue.responded after successful turn persistence.',
-          payload: {
-            turnId: dialoguePayload.turnId,
-            sessionId: dialoguePayload.sessionId,
-            isFallback: dialoguePayload.isFallback,
-            emotion: dialoguePayload.structured.emotion,
-            rawEmotion: dialoguePayload.structured.rawEmotion,
-          },
-        })
-      }
-    }
-    catch (error) {
-      if (isAbortError(error) || signal?.aborted) {
+    return await withCardScope(payload.cardId, async () => {
+      if (isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
         await appendAuditLog({
           level: 'notice',
           category: 'kill-switch',
           action: 'turn-write-skipped-aborted',
-          message: 'Dropped conversation turn persistence due to abort before SQL execution.',
+          message: 'Skipped conversation turn persistence because kill switch is suspended.',
           payload: {
             sessionId: payload.sessionId,
             turnId: payload.turnId,
@@ -1557,32 +1692,115 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         return
       }
 
-      throw error
-    }
-    finally {
-      releaseTurnWriteAbortController(payload.turnId)
-    }
-  })
-  defineInvokeHandler(context, electronAliceAppendAuditLog, async payload => await aliceDb.appendAuditLog(payload))
-  defineInvokeHandler(context, electronAliceRealtimeExecute, async (payload) => {
-    const result = await executeBuiltinRealtimeQuery(payload)
-    await appendAuditLog({
-      level: result.ok ? 'notice' : 'warning',
-      category: 'realtime-builtin',
-      action: result.ok ? 'execute-success' : 'execute-failed',
-      message: result.ok
-        ? `Builtin realtime ${payload.category} execution succeeded.`
-        : `Builtin realtime ${payload.category} execution failed.`,
-      payload: {
-        category: payload.category,
-        ok: result.ok,
-        errorCode: result.errorCode,
-        durationMs: result.durationMs,
-      },
-    })
-    return result
-  })
+      const signal = createTurnWriteAbortSignal(payload.turnId)
+      if (signal?.aborted) {
+        releaseTurnWriteAbortController(payload.turnId)
+        await appendAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-write-skipped-aborted',
+          message: 'Skipped conversation turn persistence because turn write signal was already aborted.',
+          payload: {
+            sessionId: payload.sessionId,
+            turnId: payload.turnId,
+          },
+        })
+        return
+      }
 
+      try {
+        await aliceDb.appendConversationTurn(payload, { signal })
+        if (signal?.aborted || isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
+          await appendAuditLog({
+            level: 'notice',
+            category: 'kill-switch',
+            action: 'turn-abort-dropped',
+            message: 'Dropped dialogue responded event because the turn was aborted after persistence.',
+            payload: {
+              sessionId: payload.sessionId,
+              turnId: payload.turnId,
+            },
+          })
+          return
+        }
+
+        const dialoguePayload = normalizeDialogueRespondedPayload(payload)
+        if (dialoguePayload) {
+          context.emit(aliceDialogueResponded, {
+            cardId: activeCardId,
+            ...dialoguePayload,
+          })
+          await appendAuditLog({
+            level: 'notice',
+            category: 'alice.dialogue',
+            action: 'alice.dialogue.responded.emitted',
+            message: 'Emitted alice.dialogue.responded after successful turn persistence.',
+            payload: {
+              turnId: dialoguePayload.turnId,
+              sessionId: dialoguePayload.sessionId,
+              isFallback: dialoguePayload.isFallback,
+              emotion: dialoguePayload.structured.emotion,
+              rawEmotion: dialoguePayload.structured.rawEmotion,
+            },
+          })
+        }
+      }
+      catch (error) {
+        if (isAbortError(error) || signal?.aborted) {
+          await appendAuditLog({
+            level: 'notice',
+            category: 'kill-switch',
+            action: 'turn-write-skipped-aborted',
+            message: 'Dropped conversation turn persistence due to abort before SQL execution.',
+            payload: {
+              sessionId: payload.sessionId,
+              turnId: payload.turnId,
+            },
+          })
+          return
+        }
+
+        throw error
+      }
+      finally {
+        releaseTurnWriteAbortController(payload.turnId)
+      }
+    })
+  })
+  defineInvokeHandler(context, electronAliceAppendAuditLog, async payload => await withCardScope(payload.cardId, async () => await aliceDb.appendAuditLog(payload)))
+  defineInvokeHandler(context, electronAliceRealtimeExecute, async (payload) => {
+    return await withCardScope(payload.cardId, async () => {
+      const result = await executeBuiltinRealtimeQuery(payload)
+      await appendAuditLog({
+        level: result.ok ? 'notice' : 'warning',
+        category: 'realtime-builtin',
+        action: result.ok ? 'execute-success' : 'execute-failed',
+        message: result.ok
+          ? `Builtin realtime ${payload.category} execution succeeded.`
+          : `Builtin realtime ${payload.category} execution failed.`,
+        payload: {
+          category: payload.category,
+          ok: result.ok,
+          errorCode: result.errorCode,
+          durationMs: result.durationMs,
+        },
+      })
+      return result
+    })
+  })
+  defineInvokeHandler(context, electronAliceDeleteCardScope, async payload => await withCardScope(defaultAliceCardId, async () => {
+    const targetCardId = normalizeCardId(payload?.cardId)
+    if (targetCardId === activeCardId) {
+      await switchCardScope(defaultAliceCardId)
+    }
+    await rm(resolveCardPaths(targetCardId).soulRoot, { recursive: true, force: true })
+    if (targetCardId === defaultAliceCardId) {
+      await switchCardScope(defaultAliceCardId)
+      await bootstrap()
+    }
+  }))
+
+  await restoreScopedKillSwitch(activeCardId)
   const journalMode = await aliceDb.getJournalMode().catch(() => '')
   if (journalMode !== 'wal') {
     await appendAuditLog({
@@ -1598,7 +1816,11 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   const killSwitchShortcut = 'CommandOrControl+Alt+S'
   const shortcutRegistered = globalShortcut.register(killSwitchShortcut, () => {
-    void suspendKillSwitch('global-shortcut')
+    if (isAliceKillSwitchSuspended()) {
+      void resumeGlobalKillSwitch('global-shortcut')
+      return
+    }
+    void suspendGlobalKillSwitch('global-shortcut')
   })
 
   if (!shortcutRegistered) {
@@ -1624,7 +1846,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   // Sync initial snapshots for listeners.
   await bootstrap()
-  if (getAliceKillSwitchSnapshot().state !== 'SUSPENDED')
+  if (!isAliceKillSwitchSuspended() && getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED')
     sensoryBus.start()
   await aliceDb.runMemoryPrune().catch(async (error) => {
     await appendAuditLog({
@@ -1637,19 +1859,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       },
     })
   })
-  pruneTimer = setInterval(() => {
-    void aliceDb.runMemoryPrune().catch(async (error) => {
-      await appendAuditLog({
-        level: 'warning',
-        category: 'memory',
-        action: 'prune-scheduled-failed',
-        message: 'Scheduled memory prune failed.',
-        payload: {
-          reason: error instanceof Error ? error.message : String(error),
-        },
-      })
-    })
-  }, 24 * 60 * 60 * 1000)
+  startPruneTimer()
   emitKillSwitchChanged()
 
   // `fs.watch` is only enabled after Genesis is completed.

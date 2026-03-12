@@ -8,6 +8,7 @@ import { useAlicePresenceDispatcherStore } from './alice-presence-dispatcher'
 function createPayload(overrides?: Partial<AliceDialogueRespondedPayload>): AliceDialogueRespondedPayload {
   const structuredOverrides = overrides?.structured
   return {
+    cardId: 'default',
     turnId: 'turn-1',
     sessionId: 'session-1',
     structured: {

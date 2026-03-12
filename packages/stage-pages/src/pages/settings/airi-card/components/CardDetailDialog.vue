@@ -3,6 +3,7 @@ import type { AiriCard } from '@proj-airi/stage-ui/stores/modules/airi-card'
 
 import DOMPurify from 'dompurify'
 
+import { isStageTamagotchi } from '@proj-airi/stage-shared'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
 import { useSpeechStore } from '@proj-airi/stage-ui/stores/modules/speech'
@@ -18,6 +19,7 @@ import {
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import AlicizationPanel from './AlicizationPanel.vue'
 import DeleteCardDialog from './DeleteCardDialog.vue'
 
 interface Props {
@@ -101,13 +103,30 @@ function highlightTagToHtml(text: string) {
 
 // Delete confirmation
 const showDeleteConfirm = ref(false)
+const deleteErrorMessage = ref('')
 
-function handleDeleteConfirm() {
+async function handleDeleteConfirm() {
   if (selectedCard.value) {
-    removeCard(props.cardId)
-    emit('update:modelValue', false)
+    try {
+      const removed = await removeCard(props.cardId)
+      if (!removed) {
+        deleteErrorMessage.value = t('settings.pages.card.card_not_found')
+        return
+      }
+      deleteErrorMessage.value = ''
+      emit('update:modelValue', false)
+    }
+    catch (error) {
+      deleteErrorMessage.value = error instanceof Error ? error.message : String(error)
+    }
   }
+  if (!deleteErrorMessage.value)
+    showDeleteConfirm.value = false
+}
+
+function handleDeleteCancel() {
   showDeleteConfirm.value = false
+  deleteErrorMessage.value = ''
 }
 
 // Tab type definition
@@ -119,6 +138,7 @@ interface Tab {
 
 // Active tab ID state
 const activeTabId = ref('')
+const isDesktopRuntime = computed(() => isStageTamagotchi())
 
 // Tabs for card details
 const tabs = computed<Tab[]>(() => {
@@ -157,6 +177,14 @@ const tabs = computed<Tab[]>(() => {
     label: t('settings.pages.card.modules'),
     icon: 'i-solar:tuning-square-linear',
   })
+
+  if (isDesktopRuntime.value) {
+    availableTabs.push({
+      id: 'alicization',
+      label: 'Alicization',
+      icon: 'i-solar:atom-linear',
+    })
+  }
 
   return availableTabs
 })
@@ -384,6 +412,26 @@ function getModuleDisplayValue(value: string | undefined, defaultValue: string |
                 </div>
               </div>
             </div>
+
+            <div v-if="activeTab === 'alicization'">
+              <div
+                v-if="deleteErrorMessage"
+                class="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
+              >
+                {{ deleteErrorMessage }}
+              </div>
+              <div v-if="isActive">
+                <AlicizationPanel />
+              </div>
+              <div
+                v-else
+                bg="neutral-50/50 dark:neutral-900/50"
+                rounded-xl p-4 text-sm text-neutral-500
+                border="~ neutral-200/50 dark:neutral-700/30"
+              >
+                请先激活这张角色卡，再编辑其 Alicization 人格与记忆。
+              </div>
+            </div>
           </div>
         </div>
         <div
@@ -405,6 +453,6 @@ function getModuleDisplayValue(value: string | undefined, defaultValue: string |
     v-model="showDeleteConfirm"
     :card-name="selectedCard?.name"
     @confirm="handleDeleteConfirm"
-    @cancel="showDeleteConfirm = false"
+    @cancel="handleDeleteCancel"
   />
 </template>

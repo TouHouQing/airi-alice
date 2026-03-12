@@ -32,7 +32,6 @@ function handleCancel() {
 }
 
 function handleConfirm() {
-  emit('update:modelValue', false)
   emit('confirm')
 }
 </script>

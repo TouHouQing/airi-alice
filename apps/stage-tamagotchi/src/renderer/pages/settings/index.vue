@@ -10,6 +10,12 @@ const resolveAnimation = ref<() => void>()
 const { t } = useI18n()
 const settingsStore = useSettings()
 
+function normalizeAlicizationLabel(value: string | undefined) {
+  if (!value)
+    return ''
+  return value.replace(/AIRI/gi, 'Alicization')
+}
+
 const removeBeforeEach = router.beforeEach(async (_, __, next) => {
   if (!settingsStore.usePageSpecificTransitions || settingsStore.disableTransitions) {
     next()
@@ -26,14 +32,23 @@ const removeBeforeEach = router.beforeEach(async (_, __, next) => {
 const settings = computed(() => {
   return router
     .getRoutes()
-    .filter(route => route.meta?.settingsEntry)
+    .filter((route) => {
+      if (route.path === '/settings/alice-epoch1')
+        return false
+      return Boolean(route.meta?.settingsEntry)
+    })
     .sort((a, b) => (Number(a.meta?.order ?? 0) - Number(b.meta?.order ?? 0)))
-    .map(route => ({
-      title: route.meta?.titleKey ? t(route.meta.titleKey as string) : (route.meta?.title as string | undefined) ?? '',
-      description: route.meta?.descriptionKey ? t(route.meta.descriptionKey as string) : (route.meta?.description as string | undefined) || '',
-      icon: (route.meta?.icon as string | undefined) ?? '',
-      to: route.path,
-    }))
+    .map((route) => {
+      const title = (route.meta?.titleKey ? t(route.meta.titleKey as string) : (route.meta?.title as string | undefined)) ?? ''
+      const description = route.meta?.descriptionKey ? t(route.meta.descriptionKey as string) : (route.meta?.description as string | undefined) || ''
+      const isAlicizationCardEntry = route.path === '/settings/airi-card'
+      return {
+        title: isAlicizationCardEntry ? normalizeAlicizationLabel(title) : title,
+        description: isAlicizationCardEntry ? normalizeAlicizationLabel(description) : description,
+        icon: (route.meta?.icon as string | undefined) ?? '',
+        to: route.path,
+      }
+    })
 })
 </script>
 

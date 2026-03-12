@@ -232,6 +232,8 @@ async function runInTransaction<T>(database: sqlite3.Database, task: () => Promi
 export interface AliceDbService {
   dbPath: string
   close: () => Promise<void>
+  getMetaValue: (key: string) => Promise<string | undefined>
+  setMetaValue: (key: string, value: string) => Promise<void>
   appendAuditLog: (input: AliceAuditLogInput) => Promise<void>
   appendConversationTurn: (input: AliceConversationTurnInput, options?: DbWriteOptions) => Promise<void>
   getMemoryStats: () => Promise<AliceMemoryStats>
@@ -243,8 +245,15 @@ export interface AliceDbService {
   getJournalMode: () => Promise<string>
 }
 
-export async function setupAliceDb(userDataPath: string): Promise<AliceDbService> {
-  const rootDir = join(userDataPath, 'alice')
+export async function setupAliceDb(
+  userDataPath: string,
+  options?: {
+    rootDir?: string
+    cardId?: string
+  },
+): Promise<AliceDbService> {
+  const rootDir = options?.rootDir
+    ?? (options?.cardId ? join(userDataPath, 'alicizations', 'cards', options.cardId) : join(userDataPath, 'alicizations'))
   const dbPath = join(rootDir, 'alice.db')
   await mkdir(rootDir, { recursive: true })
 
@@ -834,6 +843,12 @@ export async function setupAliceDb(userDataPath: string): Promise<AliceDbService
   return {
     dbPath,
     close: async () => await close(database),
+    getMetaValue,
+    setMetaValue: async (key: string, value: string) => {
+      await enqueueWrite(async () => {
+        await upsertMeta(key, value)
+      })
+    },
     appendAuditLog,
     appendConversationTurn,
     getMemoryStats,

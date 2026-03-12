@@ -102,19 +102,36 @@ const sortedFilteredCards = computed<CardItem[]>(() => {
 // Delete confirmation
 const showDeleteConfirm = ref(false)
 const cardToDelete = ref<string | null>(null)
+const deleteErrorMessage = ref('')
 
-function handleDeleteConfirm() {
+async function handleDeleteConfirm() {
   if (cardToDelete.value) {
-    removeCard(cardToDelete.value)
-    cardToDelete.value = null
-    showDeleteConfirm.value = false
+    try {
+      const removed = await removeCard(cardToDelete.value)
+      if (!removed) {
+        deleteErrorMessage.value = t('settings.pages.card.card_not_found')
+        return
+      }
+      deleteErrorMessage.value = ''
+      cardToDelete.value = null
+      showDeleteConfirm.value = false
+    }
+    catch (error) {
+      deleteErrorMessage.value = error instanceof Error ? error.message : String(error)
+    }
   }
 }
 
 // Card deletion confirmation
 function confirmDelete(id: string) {
+  deleteErrorMessage.value = ''
   cardToDelete.value = id
   showDeleteConfirm.value = true
+}
+
+function handleDeleteCancel() {
+  cardToDelete.value = null
+  deleteErrorMessage.value = ''
 }
 
 function handleSelectCard(cardId: string) {
@@ -290,6 +307,15 @@ function getModuleShortName(id: string, module: 'consciousness' | 'voice') {
           {{ t('settings.pages.card.try_different_search') }}
         </template>
       </Alert>
+
+      <Alert v-if="deleteErrorMessage" type="warning">
+        <template #title>
+          Error
+        </template>
+        <template #content>
+          {{ deleteErrorMessage }}
+        </template>
+      </Alert>
     </div>
   </div>
 
@@ -298,7 +324,7 @@ function getModuleShortName(id: string, module: 'consciousness' | 'voice') {
     v-model="showDeleteConfirm"
     :card-name="cardToDelete ? cardStore.getCard(cardToDelete)?.name : ''"
     @confirm="handleDeleteConfirm"
-    @cancel="cardToDelete = null"
+    @cancel="handleDeleteCancel"
   />
 
   <!-- Card detail dialog -->

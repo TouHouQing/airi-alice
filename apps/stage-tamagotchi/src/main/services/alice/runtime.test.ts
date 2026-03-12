@@ -9,6 +9,7 @@ import {
   aliceDialogueResponded,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
+  electronAliceDeleteCardScope,
   electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
   electronAliceInitializeGenesis,
@@ -16,10 +17,12 @@ import {
   electronAliceKillSwitchSuspend,
   electronAliceUpdatePersonality,
 } from '../../../shared/eventa'
+import { setAliceKillSwitchState } from './state'
 
 const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
 const sandboxDirs: string[] = []
 const contextEmitMock = vi.fn()
+const metaStore = new Map<string, string>()
 
 const dbStub = {
   dbPath: '',
@@ -53,6 +56,10 @@ const dbStub = {
     lastPrunedAt: null,
   }),
   getJournalMode: vi.fn().mockResolvedValue('wal'),
+  getMetaValue: vi.fn(async (key: string) => metaStore.get(key)),
+  setMetaValue: vi.fn(async (key: string, value: string) => {
+    metaStore.set(key, value)
+  }),
 }
 
 vi.mock('@moeru/eventa', () => ({
@@ -110,6 +117,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     invokeHandlers.clear()
     vi.clearAllMocks()
     contextEmitMock.mockReset()
+    metaStore.clear()
   })
 
   afterEach(async () => {
@@ -135,9 +143,9 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(getSoul).toBeTypeOf('function')
     expect(initializeGenesis).toBeTypeOf('function')
 
-    const boot = await bootstrap!()
+    const boot = await bootstrap!({ cardId: 'default' })
     expect(boot.soulPath.startsWith(sandboxPath)).toBe(true)
-    expect(existsSync(join(sandboxPath, 'alice', 'SOUL.md'))).toBe(true)
+    expect(existsSync(join(sandboxPath, 'alicizations', 'cards', 'default', 'SOUL.md'))).toBe(true)
     expect(boot.needsGenesis).toBe(true)
     expect(boot.watching).toBe(false)
 
@@ -157,7 +165,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
       allowOverwrite: true,
     })
 
-    const afterGenesis = await getSoul!()
+    const afterGenesis = await getSoul!({ cardId: 'default' })
     expect(afterGenesis.soulPath.startsWith(sandboxPath)).toBe(true)
     expect(afterGenesis.needsGenesis).toBe(false)
     expect(afterGenesis.watching).toBe(true)
@@ -177,15 +185,15 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(suspend).toBeTypeOf('function')
     expect(resume).toBeTypeOf('function')
 
-    const activeSnapshot = await getSensorySnapshot!()
+    const activeSnapshot = await getSensorySnapshot!({ cardId: 'default' })
     expect(activeSnapshot.running).toBe(true)
 
-    await suspend!({ reason: 'test' })
-    const suspendedSnapshot = await getSensorySnapshot!()
+    await suspend!({ cardId: 'default', reason: 'test' })
+    const suspendedSnapshot = await getSensorySnapshot!({ cardId: 'default' })
     expect(suspendedSnapshot.running).toBe(false)
 
-    await resume!({ reason: 'test' })
-    const resumedSnapshot = await getSensorySnapshot!()
+    await resume!({ cardId: 'default', reason: 'test' })
+    const resumedSnapshot = await getSensorySnapshot!({ cardId: 'default' })
     expect(resumedSnapshot.running).toBe(true)
   })
 
@@ -228,10 +236,104 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
       },
     })
 
-    const nextSoul = await getSoul!()
+    const nextSoul = await getSoul!({ cardId: 'default' })
     expect(nextSoul.content).toContain(`- 服从度：${nextSoul.frontmatter.personality.obedience.toFixed(2)}`)
     expect(nextSoul.content).toContain(`- 活泼度：${nextSoul.frontmatter.personality.liveliness.toFixed(2)}`)
     expect(nextSoul.content).toContain(`- 感性度：${nextSoul.frontmatter.personality.sensibility.toFixed(2)}`)
+  })
+
+  it('isolates SOUL state across card scopes', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      cardId: 'card-a',
+      ownerName: '主人A',
+      hostName: 'A',
+      aliceName: 'Alice-A',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.6,
+        liveliness: 0.5,
+        sensibility: 0.7,
+      },
+      personaNotes: 'A notes',
+      allowOverwrite: true,
+    })
+
+    await initializeGenesis!({
+      cardId: 'card-b',
+      ownerName: '主人B',
+      hostName: 'B',
+      aliceName: 'Alice-B',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.3,
+        liveliness: 0.2,
+        sensibility: 0.4,
+      },
+      personaNotes: 'B notes',
+      allowOverwrite: true,
+    })
+
+    const soulA = await getSoul!({ cardId: 'card-a' })
+    const soulB = await getSoul!({ cardId: 'card-b' })
+
+    expect(soulA.frontmatter.profile.aliceName).toBe('Alice-A')
+    expect(soulB.frontmatter.profile.aliceName).toBe('Alice-B')
+    expect(soulA.soulPath).toContain('/alicizations/cards/card-a/')
+    expect(soulB.soulPath).toContain('/alicizations/cards/card-b/')
+  })
+
+  it('deletes card scoped filesystem data when delete scope is invoked', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const deleteCardScope = invokeHandlers.get(electronAliceDeleteCardScope)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(deleteCardScope).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      cardId: 'card-to-delete',
+      ownerName: '删除测试',
+      hostName: '删除测试',
+      aliceName: 'Delete-Me',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.4,
+        liveliness: 0.4,
+        sensibility: 0.4,
+      },
+      personaNotes: 'to be deleted',
+      allowOverwrite: true,
+    })
+
+    const scopedRoot = join(sandboxPath, 'alicizations', 'cards', 'card-to-delete')
+    expect(existsSync(scopedRoot)).toBe(true)
+
+    await deleteCardScope!({ cardId: 'card-to-delete' })
+    expect(existsSync(scopedRoot)).toBe(false)
+
+    const defaultSoul = await getSoul!({ cardId: 'default' })
+    expect(defaultSoul.soulPath).toContain('/alicizations/cards/default/')
   })
 
   it('emits alice.dialogue.responded only after turn persistence succeeds', async () => {
@@ -244,6 +346,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(appendConversationTurn).toBeTypeOf('function')
 
     await appendConversationTurn!({
+      cardId: 'default',
       turnId: 'turn-test-1',
       sessionId: 'session-test',
       userText: '你好',
@@ -259,6 +362,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
 
     expect(dbStub.appendConversationTurn).toBeCalledTimes(1)
     expect(contextEmitMock).toBeCalledWith(aliceDialogueResponded, expect.objectContaining({
+      cardId: 'default',
       turnId: 'turn-test-1',
       sessionId: 'session-test',
       isFallback: false,
@@ -275,6 +379,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(appendConversationTurn).toBeTypeOf('function')
 
     await appendConversationTurn!({
+      cardId: 'default',
       turnId: 'turn-test-unsupported-emotion',
       sessionId: 'session-test',
       assistantText: '我在这里。',
@@ -305,6 +410,7 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     dbStub.appendConversationTurn.mockRejectedValueOnce(new Error('sqlite write failed'))
 
     await expect(appendConversationTurn!({
+      cardId: 'default',
       turnId: 'turn-test-db-fail',
       sessionId: 'session-test',
       assistantText: '不会写成功',
@@ -331,9 +437,10 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(appendConversationTurn).toBeTypeOf('function')
     expect(suspend).toBeTypeOf('function')
 
-    await suspend!({ reason: 'unit-test' })
+    await suspend!({ cardId: 'default', reason: 'unit-test' })
 
     await appendConversationTurn!({
+      cardId: 'default',
       turnId: 'turn-test-suspended',
       sessionId: 'session-test',
       assistantText: '被中断',
@@ -357,17 +464,14 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     })
 
     const appendConversationTurn = invokeHandlers.get(electronAliceAppendConversationTurn)
-    const suspend = invokeHandlers.get(electronAliceKillSwitchSuspend)
-    const resume = invokeHandlers.get(electronAliceKillSwitchResume)
     expect(appendConversationTurn).toBeTypeOf('function')
-    expect(suspend).toBeTypeOf('function')
-    expect(resume).toBeTypeOf('function')
 
     dbStub.appendConversationTurn.mockImplementationOnce(async () => {
-      await suspend!({ reason: 'race-test' })
+      setAliceKillSwitchState('SUSPENDED', 'race-test')
     })
 
     await appendConversationTurn!({
+      cardId: 'default',
       turnId: 'turn-test-race',
       sessionId: 'session-test',
       assistantText: '竞态中断',
@@ -381,6 +485,6 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     })
 
     expect(getDialogueRespondedEvents()).toHaveLength(0)
-    await resume!({ reason: 'race-test-cleanup' })
+    setAliceKillSwitchState('ACTIVE', 'race-test-cleanup')
   })
 })

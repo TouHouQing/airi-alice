@@ -97,7 +97,7 @@ pages:
     delete: 刪除
     delete_card: 刪除角色卡
     delete_confirmation: 確定要刪除此角色卡嗎？
-    description: 使用 AIRI 角色卡預設
+    description: 使用 Alicization 角色卡預設
     description_label: 描述
     drop_here: 放開以上傳檔案
     create_card: 建立新角色卡
@@ -164,7 +164,7 @@ pages:
       model: 聲音 / 模型
       voice: 聲音 / 聲線
     systemprompt: 系統提示詞
-    title: AIRI 角色卡
+    title: Alicization 角色卡
     try_different_search: 嘗試使用其他關鍵字搜尋
     upload: 上傳
     upload_desc: 點擊或拖曳檔案到此處上傳

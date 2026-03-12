@@ -5,6 +5,7 @@ import { nanoid } from 'nanoid'
 import { defineStore, storeToRefs } from 'pinia'
 import { computed, watch } from 'vue'
 
+import { getAliceBridge, hasAliceBridge } from '../alice-bridge'
 import { useConsciousnessStore } from './consciousness'
 import { useSpeechStore } from './speech'
 
@@ -54,8 +55,9 @@ export interface AiriCard extends Card {
 }
 
 export const useAiriCardStore = defineStore('airi-card', () => {
+  const defaultCardId = 'default'
   const cards = useLocalStorageManualReset<Map<string, AiriCard>>('airi-cards', new Map())
-  const activeCardId = useLocalStorageManualReset<string>('airi-card-active-id', 'default')
+  const activeCardId = useLocalStorageManualReset<string>('airi-card-active-id', defaultCardId)
 
   const activeCard = computed(() => cards.value.get(activeCardId.value))
 
@@ -79,8 +81,29 @@ export const useAiriCardStore = defineStore('airi-card', () => {
     return newCardId
   }
 
-  const removeCard = (id: string) => {
+  const removeCard = async (id: string) => {
+    if (!cards.value.has(id))
+      return false
+
+    if (hasAliceBridge()) {
+      const bridge = getAliceBridge()
+      if (bridge.deleteCardScope) {
+        await bridge.deleteCardScope({ cardId: id })
+      }
+    }
+
     cards.value.delete(id)
+
+    if (activeCardId.value === id) {
+      if (cards.value.has(defaultCardId)) {
+        activeCardId.value = defaultCardId
+      }
+      else {
+        const next = cards.value.keys().next()
+        activeCardId.value = next.done ? defaultCardId : next.value
+      }
+    }
+    return true
   }
 
   const updateCard = (id: string, updates: AiriCard | Card | ccv3.CharacterCardV3) => {
@@ -200,15 +223,15 @@ export const useAiriCardStore = defineStore('airi-card', () => {
   }
 
   function initialize() {
-    if (cards.value.has('default'))
-      return
-    cards.value.set('default', newAiriCard({
-      name: 'ReLU',
-      version: '1.0.0',
-      description: '',
-    }))
-    if (!activeCardId.value)
-      activeCardId.value = 'default'
+    if (!cards.value.has(defaultCardId)) {
+      cards.value.set(defaultCardId, newAiriCard({
+        name: 'ReLU',
+        version: '1.0.0',
+        description: '',
+      }))
+    }
+    if (!activeCardId.value || !cards.value.has(activeCardId.value))
+      activeCardId.value = defaultCardId
   }
 
   watch(activeCard, (newCard: AiriCard | undefined) => {

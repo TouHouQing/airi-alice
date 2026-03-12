@@ -97,7 +97,7 @@ pages:
     delete: 削除
     delete_card: カードを削除
     delete_confirmation: このカードを削除してもよろしいですか？
-    description: AIRIキャラクターカードプリセットを使用する
+    description: Alicizationキャラクターカードプリセットを使用する
     description_label: 説明
     drop_here: アップロードするにはここにドラッグ
     create_card: 新しいカードを作成
@@ -164,7 +164,7 @@ pages:
       model: 発話/モデル
       voice: 発話/音声
     systemprompt: システムプロンプト
-    title: AIRIカード
+    title: Alicizationカード
     try_different_search: 別の検索ワードを試してください
     upload: アップロード
     upload_desc: ファイルをアップロードするにはクリックまたはドラッグ

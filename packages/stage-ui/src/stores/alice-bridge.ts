@@ -1,5 +1,9 @@
 export type AliceKillSwitchState = 'ACTIVE' | 'SUSPENDED'
 
+export interface AliceCardScope {
+  cardId: string
+}
+
 export interface AlicePersonalityState {
   obedience: number
   liveliness: number
@@ -235,6 +239,7 @@ export interface AliceDialogueStructuredPayload {
 }
 
 export interface AliceDialogueRespondedPayload {
+  cardId: string
   turnId: string
   sessionId: string
   structured: AliceDialogueStructuredPayload
@@ -245,6 +250,7 @@ export interface AliceDialogueRespondedPayload {
 export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
 
 export interface AliceSafetyPermissionRequest {
+  cardId: string
   requestId: string
   token: string
   riskLevel: AliceToolRiskLevel
@@ -277,6 +283,7 @@ interface AliceBridge {
   appendAuditLog: (payload: AliceAuditLogInput) => Promise<void>
   realtimeExecute: (payload: AliceRealtimeExecutePayload) => Promise<AliceRealtimeExecuteResult>
   getSensorySnapshot: () => Promise<AliceSensoryCacheSnapshot>
+  deleteCardScope?: (scope: AliceCardScope) => Promise<void>
 }
 
 let bridge: AliceBridge | undefined
