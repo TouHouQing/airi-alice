@@ -1,7 +1,7 @@
 edition:
-  desktop: Desktop ver.
-  mobile: Mobile ver.
-  web: Web ver.
+  desktop: 桌面版本
+  mobile: 手機版本
+  web: 網頁版本
 prompt:
   prefix: ''
   suffix: ''
