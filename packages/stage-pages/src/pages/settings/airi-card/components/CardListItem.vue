@@ -51,7 +51,7 @@ const emit = defineEmits<{
         <div flex shrink-0 items-center gap-2>
           <button
             rounded-lg p-1 text-neutral-500 transition-colors dark:text-neutral-400 hover="bg-neutral-200 dark:bg-neutral-700/50"
-            title="Edit card"
+            title="编辑模块绑定"
             @click.stop="emit('edit')"
           >
             <div i-solar:pen-2-bold-duotone text-sm />

@@ -300,13 +300,9 @@ export const useAiriCardStore = defineStore('airi-card', () => {
       if (!card)
         return ''
 
-      const components = [
-        card.systemPrompt,
-        card.description,
-        card.personality,
-      ].filter(Boolean)
-
-      return components.join('\n')
+      // NOTICE: Alicization personality is sourced from SOUL/alice.db only.
+      // Keep card-level prompt aggregation minimal to avoid dual-source persona conflicts.
+      return card.systemPrompt?.trim() || ''
     }),
   }
 })

@@ -65,7 +65,7 @@ type ExternalPipelineAborter = (reason: AliceAbortReason) => Promise<void> | voi
 const assistantLeakFallbackReply = '我刚才的检索结果混入了内部调用片段，已自动过滤。请你再说一次你的问题，我会直接给你整理后的结果。'
 const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外部数据。请稍后重试，或在设置里检查 MCP 实时工具是否可用。'
 const assistantEpoch1StrictFallbackReply = '抱歉，当前是 Epoch 1 受限模式，我无法访问外部实时数据源。你可以继续和我进行本地对话、设定与记忆整理。'
-const assistantStructuredContractFallbackReply = '我刚才没有稳定产出结构化结果，这一轮先按安全模式回复。'
+const assistantStructuredContractFallbackReply = '我在。你可以继续说，我会尽量给你稳定清晰的回复。'
 const aliceEpoch1StrictModeEnabled = false
 const runtimeContractAnchorHeader = 'Output contract (must-follow, highest priority):'
 const structuredRetrySystemPrompt = [
@@ -181,6 +181,26 @@ function replaceAssistantTextSlices(slices: ChatSlices[], text: string): ChatSli
   }
 
   return nextSlices
+}
+
+function looksLikeStructuredPayloadText(text: string) {
+  const normalized = text.trimStart()
+  if (!normalized)
+    return false
+
+  const hasThought = /\\?"thought\\?"\s*:/.test(normalized)
+  const hasEmotion = /\\?"emotion\\?"\s*:/.test(normalized)
+  const hasReply = /\\?"reply\\?"\s*:/.test(normalized)
+
+  if (/^```(?:json)?/i.test(normalized)) {
+    return hasThought && hasEmotion && hasReply
+  }
+
+  if (normalized.startsWith('{') || normalized.startsWith('"{') || normalized.startsWith('\'{')) {
+    return hasThought && hasEmotion && hasReply
+  }
+
+  return false
 }
 
 function stringifyAssistantContent(content: unknown) {
@@ -561,6 +581,29 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       let streamPosition = 0
       let finalAssistantDisplayText = ''
       let turnPersonalityState: AlicePersonalityState | null = null
+      let streamSpeechMode: 'undecided' | 'plain' | 'structured-json' = 'undecided'
+      let streamSpeechPrelude = ''
+
+      const appendSpeechLiteral = async (speechLiteral: string) => {
+        if (!speechLiteral.trim())
+          return
+
+        buildingMessage.content += speechLiteral
+
+        await hooks.emitTokenLiteralHooks(speechLiteral, streamingMessageContext)
+
+        const lastSlice = buildingMessage.slices.at(-1)
+        if (lastSlice?.type === 'text') {
+          lastSlice.text += speechLiteral
+        }
+        else {
+          buildingMessage.slices.push({
+            type: 'text',
+            text: speechLiteral,
+          })
+        }
+        updateUI()
+      }
 
       const getPreviousAssistantEmotion = () => {
         const previousAssistant = [...sessionMessagesForSend]
@@ -766,7 +809,11 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           }
         }
 
-        const fallback = createStructuredFallback(createContractFallbackReply(turnPersonalityState))
+        const candidateReply = candidate.reply?.trim() ?? ''
+        const fallbackReply = candidateReply && !looksLikeStructuredPayloadText(candidateReply)
+          ? candidateReply
+          : createContractFallbackReply(turnPersonalityState)
+        const fallback = createStructuredFallback(fallbackReply)
         await appendAliceAuditLog({
           level: 'warning',
           category: 'structured-output',
@@ -890,23 +937,41 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           const speechOnly = categorizer.filterToSpeech(literal, streamPosition)
           streamPosition += literal.length
 
-          if (speechOnly.trim()) {
-            buildingMessage.content += speechOnly
+          if (!speechOnly.trim())
+            return
 
-            await hooks.emitTokenLiteralHooks(speechOnly, streamingMessageContext)
+          if (streamSpeechMode === 'undecided') {
+            streamSpeechPrelude += speechOnly
+            const trimmedPrelude = streamSpeechPrelude.trimStart()
+            if (!trimmedPrelude)
+              return
 
-            const lastSlice = buildingMessage.slices.at(-1)
-            if (lastSlice?.type === 'text') {
-              lastSlice.text += speechOnly
+            if (looksLikeStructuredPayloadText(trimmedPrelude)) {
+              streamSpeechMode = 'structured-json'
+              streamSpeechPrelude = ''
+              return
             }
-            else {
-              buildingMessage.slices.push({
-                type: 'text',
-                text: speechOnly,
-              })
-            }
-            updateUI()
+
+            const isPotentialStructuredPrefix
+              = trimmedPrelude.startsWith('{')
+                || trimmedPrelude.startsWith('"')
+                || trimmedPrelude.startsWith('\'')
+                || trimmedPrelude.startsWith('```')
+
+            if (isPotentialStructuredPrefix && trimmedPrelude.length < 160)
+              return
+
+            streamSpeechMode = 'plain'
+            const prelude = streamSpeechPrelude
+            streamSpeechPrelude = ''
+            await appendSpeechLiteral(prelude)
+            return
           }
+
+          if (streamSpeechMode === 'structured-json')
+            return
+
+          await appendSpeechLiteral(speechOnly)
         },
         onSpecial: async (special) => {
           if (shouldAbort())

@@ -41,6 +41,44 @@ describe('alice structured output', () => {
     expect(result.repairTimedOut).toBe(false)
   })
 
+  it('parses structured payload from markdown json fences', () => {
+    const result = normalizeStructuredOutput({
+      fullText: '```json\n{"thought":"fenced","emotion":"neutral","reply":"你好，我在。"}\n```',
+      thought: 'fallback-thought',
+      reply: 'fallback-reply',
+    })
+
+    expect(result.parsePath).toBe('json')
+    expect(result.thought).toBe('fenced')
+    expect(result.emotion).toBe('neutral')
+    expect(result.reply).toBe('你好，我在。')
+  })
+
+  it('rescues escaped json string payload and extracts reply', () => {
+    const result = normalizeStructuredOutput({
+      fullText: '"{\\"thought\\":\\"检测到友好问候\\",\\"emotion\\":\\"happy\\",\\"reply\\":\\"你好！很高兴见到你。\\"}"',
+      thought: 'fallback-thought',
+      reply: 'fallback-reply',
+    })
+
+    expect(result.parsePath).toBe('repair-json')
+    expect(result.thought).toContain('友好问候')
+    expect(result.emotion).toBe('happy')
+    expect(result.reply).toContain('你好')
+  })
+
+  it('falls back to parsing reply field when fullText is empty', () => {
+    const result = normalizeStructuredOutput({
+      fullText: '',
+      thought: 'fallback-thought',
+      reply: '{"thought":"from-reply","emotion":"neutral","reply":"通过 reply 解析成功。"}',
+    })
+
+    expect(result.parsePath).toBe('json')
+    expect(result.thought).toBe('from-reply')
+    expect(result.reply).toBe('通过 reply 解析成功。')
+  })
+
   it('falls back safely for oversized malformed text', () => {
     const oversized = `{${'x'.repeat(40_000)}}`
     const result = normalizeStructuredOutput({

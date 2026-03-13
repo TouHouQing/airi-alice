@@ -81,10 +81,22 @@ function toFiniteNumber(value: unknown): number | undefined {
   return undefined
 }
 
-function parseObjectCandidate(candidate: string): Record<string, unknown> | null {
+function parseObjectCandidate(candidate: string, depth = 0): Record<string, unknown> | null {
+  if (depth > 2)
+    return null
+
+  const parseNestedString = (value: unknown): Record<string, unknown> | null => {
+    if (typeof value !== 'string')
+      return null
+    const nested = value.trim()
+    if (!nested)
+      return null
+    return parseObjectCandidate(nested, depth + 1)
+  }
+
   try {
     const parsed = JSON.parse(candidate) as unknown
-    return toObjectRecord(parsed)
+    return toObjectRecord(parsed) || parseNestedString(parsed)
   }
   catch {
     const normalizedCandidate = candidate
@@ -95,9 +107,23 @@ function parseObjectCandidate(candidate: string): Record<string, unknown> | null
 
     try {
       const repaired = JSON.parse(normalizedCandidate) as unknown
-      return toObjectRecord(repaired)
+      return toObjectRecord(repaired) || parseNestedString(repaired)
     }
     catch {
+      if (/\\"(?:thought|emotion|reply)\\"/i.test(normalizedCandidate)) {
+        const unescapedCandidate = normalizedCandidate
+          .replace(/\\r/g, '\r')
+          .replace(/\\n/g, '\n')
+          .replace(/\\t/g, '\t')
+          .replace(/\\"/g, '"')
+        try {
+          const rescued = JSON.parse(unescapedCandidate) as unknown
+          return toObjectRecord(rescued) || parseNestedString(rescued)
+        }
+        catch {
+          return null
+        }
+      }
       return null
     }
   }
@@ -135,11 +161,26 @@ function parseLastActPayload(content: string): ActPayload | null {
   return null
 }
 
-function parseStrictJsonPayload(content: string): Record<string, unknown> | null {
+function stripJsonFence(content: string): string {
   const trimmed = content.trim()
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}'))
+  if (!trimmed.startsWith('```'))
+    return trimmed
+
+  const lines = trimmed.split('\n')
+  const firstLine = (lines[0] ?? '').trim().toLowerCase()
+  const lastLine = (lines.at(-1) ?? '').trim()
+  if ((firstLine !== '```' && firstLine !== '```json') || lastLine !== '```') {
+    return trimmed
+  }
+
+  return lines.slice(1, -1).join('\n').trim()
+}
+
+function parseStrictJsonPayload(content: string): Record<string, unknown> | null {
+  const stripped = stripJsonFence(content)
+  if (!stripped.startsWith('{') || !stripped.endsWith('}'))
     return null
-  return parseObjectCandidate(trimmed)
+  return parseObjectCandidate(stripped)
 }
 
 function extractJsonWindow(content: string, maxChars: number, startedAt: number): { candidate?: string, timedOut: boolean } {
@@ -426,7 +467,10 @@ export function validateStructuredContract(
 }
 
 export function normalizeStructuredOutput(input: StructuredOutputInput): StructuredOutputResult {
-  const parsed = parseStructuredPayloadFromText(input.fullText)
+  const parsedFromFullText = parseStructuredPayloadFromText(input.fullText)
+  const parsed = parsedFromFullText.payload || parsedFromFullText.repairTimedOut
+    ? parsedFromFullText
+    : parseStructuredPayloadFromText(input.reply)
   const payload = parsed.payload
   const actPayload = parseLastActPayload(input.fullText)
 

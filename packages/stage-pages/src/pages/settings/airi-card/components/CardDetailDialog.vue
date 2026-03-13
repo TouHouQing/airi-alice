@@ -1,12 +1,7 @@
 <script setup lang="ts">
 import type { AiriCard } from '@proj-airi/stage-ui/stores/modules/airi-card'
 
-import DOMPurify from 'dompurify'
-
-import { isStageTamagotchi } from '@proj-airi/stage-shared'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
-import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
-import { useSpeechStore } from '@proj-airi/stage-ui/stores/modules/speech'
 import { Button } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
 import {
@@ -34,53 +29,14 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const cardStore = useAiriCardStore()
-const consciousnessStore = useConsciousnessStore()
-const speechStore = useSpeechStore()
 const { removeCard } = cardStore
 const { activeCardId } = storeToRefs(cardStore)
-const { activeProvider: consciousnessProvider, activeModel: defaultConsciousnessModel } = storeToRefs(consciousnessStore)
-const { activeSpeechProvider: speechProvider, activeSpeechModel: defaultSpeechModel, activeSpeechVoiceId: defaultVoiceId } = storeToRefs(speechStore)
 
 // Get selected card data
 const selectedCard = computed<AiriCard | undefined>(() => {
   if (!props.cardId)
     return undefined
   return cardStore.getCard(props.cardId)
-})
-
-// Get module settings
-const moduleSettings = computed(() => {
-  if (!selectedCard.value || !selectedCard.value.extensions?.airi?.modules) {
-    return {
-      consciousnessProvider: '',
-      consciousness: '',
-      speechProvider: '',
-      speech: '',
-      voice: '',
-    }
-  }
-
-  const airiExt = selectedCard.value.extensions.airi.modules
-  return {
-    consciousnessProvider: airiExt.consciousness?.provider || '',
-    consciousness: airiExt.consciousness?.model || '',
-    speechProvider: airiExt.speech?.provider || '',
-    speech: airiExt.speech?.model || '',
-    voice: airiExt.speech?.voice_id || '',
-  }
-})
-
-// Get character settings
-const characterSettings = computed(() => {
-  if (!selectedCard.value)
-    return {}
-
-  return {
-    personality: selectedCard.value.personality,
-    scenario: selectedCard.value.scenario,
-    systemPrompt: selectedCard.value.systemPrompt,
-    postHistoryInstructions: selectedCard.value.postHistoryInstructions,
-  }
 })
 
 // Check if card is active
@@ -95,10 +51,6 @@ function handleActivate() {
     activeCardId.value = props.cardId
     isActivating.value = false
   }, 300)
-}
-
-function highlightTagToHtml(text: string) {
-  return DOMPurify.sanitize(text?.replace(/\{\{(.*?)\}\}/g, '<span class="bg-primary-500/20 inline-block">{{ $1 }}</span>').trim())
 }
 
 // Delete confirmation
@@ -127,91 +79,6 @@ async function handleDeleteConfirm() {
 function handleDeleteCancel() {
   showDeleteConfirm.value = false
   deleteErrorMessage.value = ''
-}
-
-// Tab type definition
-interface Tab {
-  id: string
-  label: string
-  icon: string
-}
-
-// Active tab ID state
-const activeTabId = ref('')
-const isDesktopRuntime = computed(() => isStageTamagotchi())
-
-// Tabs for card details
-const tabs = computed<Tab[]>(() => {
-  const availableTabs: Tab[] = []
-
-  // Description tab - always show if there's description
-  if (selectedCard.value?.description) {
-    availableTabs.push({
-      id: 'description',
-      label: t('settings.pages.card.description_label'),
-      icon: 'i-solar:document-text-linear',
-    })
-  }
-
-  // Notes tab - only show if there are creator notes
-  if (selectedCard.value?.notes) {
-    availableTabs.push({
-      id: 'notes',
-      label: t('settings.pages.card.creator_notes'),
-      icon: 'i-solar:notes-linear',
-    })
-  }
-
-  // Character tab - only show if there are character settings
-  if (Object.values(characterSettings.value).some(value => !!value)) {
-    availableTabs.push({
-      id: 'character',
-      label: t('settings.pages.card.character'),
-      icon: 'i-solar:user-rounded-linear',
-    })
-  }
-
-  // Modules tab - always show
-  availableTabs.push({
-    id: 'modules',
-    label: t('settings.pages.card.modules'),
-    icon: 'i-solar:tuning-square-linear',
-  })
-
-  if (isDesktopRuntime.value) {
-    availableTabs.push({
-      id: 'alicization',
-      label: 'Alicization',
-      icon: 'i-solar:atom-linear',
-    })
-  }
-
-  return availableTabs
-})
-
-// Active tab state - set to first available tab by default
-const activeTab = computed({
-  get: () => {
-    // If current active tab is not in available tabs, reset to first tab
-    if (!tabs.value.find(tab => tab.id === activeTabId.value))
-      return tabs.value[0]?.id || ''
-    return activeTabId.value
-  },
-  set: (value: string) => {
-    activeTabId.value = value
-  },
-})
-
-// Helper function to generate placeholder text for default values
-function getDefaultPlaceholder(defaultValue: string | undefined): string {
-  return defaultValue
-    ? `${t('settings.pages.card.creation.use_default')} (${defaultValue})`
-    : t('settings.pages.card.creation.use_default_not_configured')
-}
-
-// Helper function to get display value for module settings
-function getModuleDisplayValue(value: string | undefined, defaultValue: string | undefined): string {
-  return value || getDefaultPlaceholder(defaultValue)
 }
 </script>
 
@@ -256,164 +123,7 @@ function getModuleDisplayValue(value: string | undefined, defaultValue: string |
               </div>
             </div>
 
-            <!-- Card content tabs -->
             <div class="mt-4">
-              <div class="border-b border-neutral-200 dark:border-neutral-700">
-                <div class="flex justify-center -mb-px sm:justify-start space-x-1">
-                  <button
-                    v-for="tab in tabs"
-                    :key="tab.id"
-                    class="px-4 py-2 text-sm font-medium"
-                    :class="[
-                      activeTab === tab.id
-                        ? 'text-primary-600 dark:text-primary-400 border-b-2 border-primary-500 dark:border-primary-400'
-                        : 'text-neutral-500 dark:text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-300',
-                    ]"
-                    @click="activeTab = tab.id"
-                  >
-                    <div class="flex items-center gap-1">
-                      <div :class="tab.icon" />
-                      {{ tab.label }}
-                    </div>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Creator notes -->
-            <div v-if="activeTab === 'notes' && selectedCard.notes">
-              <div
-                bg="white/60 dark:black/30"
-                border="~ neutral-200/50 dark:neutral-700/30"
-                max-h-60 overflow-auto whitespace-pre-line rounded-lg p-4 text-neutral-700 sm:max-h-80 dark:text-neutral-300 transition="all duration-200"
-                hover="bg-white/80 dark:bg-black/40"
-                v-html="highlightTagToHtml(selectedCard.notes)"
-              />
-            </div>
-
-            <!-- Description section -->
-            <div v-if="activeTab === 'description' && selectedCard.description">
-              <div
-                bg="white/60 dark:black/30"
-                max-h-60 overflow-auto whitespace-pre-line rounded-lg p-4 sm:max-h-80
-                text="neutral-600 dark:neutral-300"
-                border="~ neutral-200/50 dark:neutral-700/30"
-                v-html="highlightTagToHtml(selectedCard.description)"
-              />
-            </div>
-
-            <!-- Character -->
-            <div v-if="activeTab === 'character' && Object.values(characterSettings).some(value => !!value)">
-              <div flex="~ col" max-h-60 gap-4 overflow-auto pr-1 sm:max-h-80>
-                <template v-for="(value, key) in characterSettings" :key="key">
-                  <div v-if="value" flex="~ col" gap-2>
-                    <h2 text-lg text-neutral-500 font-medium dark:text-neutral-400>
-                      {{ t(`settings.pages.card.${key.toLowerCase()}`) }}
-                    </h2>
-                    <div
-                      bg="white/60 dark:black/30"
-                      border="~ neutral-200/50 dark:neutral-700/30"
-                      transition="all duration-200"
-                      hover="bg-white/80 dark:bg-black/40"
-                      max-h-none overflow-auto whitespace-pre-line rounded-lg p-3 text-neutral-700 dark:text-neutral-300
-                      v-html="highlightTagToHtml(value)"
-                    />
-                  </div>
-                </template>
-              </div>
-            </div>
-
-            <!-- Modules -->
-            <div v-if="activeTab === 'modules'">
-              <div grid="~ cols-1 sm:cols-2" gap-4>
-                <div
-                  flex="~ col"
-                  bg="white/60 dark:black/30"
-                  gap-1 rounded-lg p-3
-                  border="~ neutral-200/50 dark:neutral-700/30"
-                  transition="all duration-200"
-                  hover="bg-white/80 dark:bg-black/40"
-                >
-                  <span flex="~ row" items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400>
-                    <div i-lucide:brain />
-                    {{ t('settings.pages.card.chat.provider') }}
-                  </span>
-                  <div truncate font-medium>
-                    {{ getModuleDisplayValue(moduleSettings.consciousnessProvider, consciousnessProvider) }}
-                  </div>
-                </div>
-
-                <div
-                  flex="~ col"
-                  bg="white/60 dark:black/30"
-                  gap-1 rounded-lg p-3
-                  border="~ neutral-200/50 dark:neutral-700/30"
-                  transition="all duration-200"
-                  hover="bg-white/80 dark:bg-black/40"
-                >
-                  <span flex="~ row" items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400>
-                    <div i-lucide:ghost />
-                    {{ t('settings.pages.card.consciousness.model') }}
-                  </span>
-                  <div truncate font-medium>
-                    {{ getModuleDisplayValue(moduleSettings.consciousness, defaultConsciousnessModel) }}
-                  </div>
-                </div>
-
-                <div
-                  flex="~ col"
-                  bg="white/60 dark:black/30"
-                  gap-1 rounded-lg p-3
-                  border="~ neutral-200/50 dark:neutral-700/30"
-                  transition="all duration-200"
-                  hover="bg-white/80 dark:bg-black/40"
-                >
-                  <span flex="~ row" items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400>
-                    <div i-lucide:radio />
-                    {{ t('settings.pages.card.speech.provider') }}
-                  </span>
-                  <div truncate font-medium>
-                    {{ getModuleDisplayValue(moduleSettings.speechProvider, speechProvider) }}
-                  </div>
-                </div>
-
-                <div
-                  flex="~ col"
-                  bg="white/60 dark:black/30"
-                  gap-2 rounded-lg p-3
-                  border="~ neutral-200/50 dark:neutral-700/30"
-                  transition="all duration-200"
-                  hover="bg-white/80 dark:bg-black/40"
-                >
-                  <span flex="~ row" items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400>
-                    <div i-lucide:mic />
-                    {{ t('settings.pages.card.speech.model') }}
-                  </span>
-                  <div truncate font-medium>
-                    {{ getModuleDisplayValue(moduleSettings.speech, defaultSpeechModel) }}
-                  </div>
-                </div>
-
-                <div
-                  flex="~ col"
-                  bg="white/60 dark:black/30"
-                  gap-2 rounded-lg p-3
-                  border="~ neutral-200/50 dark:neutral-700/30"
-                  transition="all duration-200"
-                  hover="bg-white/80 dark:bg-black/40"
-                >
-                  <span flex="~ row" items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400>
-                    <div i-lucide:music />
-                    {{ t('settings.pages.card.speech.voice') }}
-                  </span>
-                  <div truncate font-medium>
-                    {{ getModuleDisplayValue(moduleSettings.voice, defaultVoiceId) }}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div v-if="activeTab === 'alicization'">
               <div
                 v-if="deleteErrorMessage"
                 class="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
@@ -429,7 +139,7 @@ function getModuleDisplayValue(value: string | undefined, defaultValue: string |
                 rounded-xl p-4 text-sm text-neutral-500
                 border="~ neutral-200/50 dark:neutral-700/30"
               >
-                请先激活这张角色卡，再编辑其 Alicization 人格与记忆。
+                请先激活这张 Alicization 角色卡，再编辑其人格与记忆。
               </div>
             </div>
           </div>

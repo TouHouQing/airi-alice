@@ -5,6 +5,18 @@ import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/charac
 import { storeToRefs } from 'pinia'
 import { computed, ref, watch } from 'vue'
 
+interface Props {
+  section?: 'all' | 'runtime' | 'persona'
+  showTitle?: boolean
+  showPersonaSaveButton?: boolean
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  section: 'all',
+  showTitle: true,
+  showPersonaSaveButton: true,
+})
+
 const aliceEpoch1Store = useAliceEpoch1Store()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
 const {
@@ -96,13 +108,19 @@ const killSwitchUpdatedLabel = computed(() => formatDateTime(aliceKillSwitch.val
 const killSwitchSuspended = computed(() => aliceKillSwitch.value.state === 'SUSPENDED')
 
 const killSwitchReasonMap: Record<string, string> = {
-  'manual': '手动触发',
-  'epoch1-ui-status-panel': '状态面板操作',
+  'manual': '手动切换',
+  'epoch1-ui-status-panel': '面板操作',
+  'global-shortcut': '全局急停快捷键',
+  'bootstrap': '运行时初始化',
 }
 const killSwitchReason = computed(() => {
   const raw = aliceKillSwitch.value.reason || 'manual'
-  return killSwitchReasonMap[raw] ?? raw
+  if (killSwitchReasonMap[raw])
+    return killSwitchReasonMap[raw]
+  return `系统事件(${raw})`
 })
+const showRuntimeSection = computed(() => props.section === 'all' || props.section === 'runtime')
+const showPersonaSection = computed(() => props.section === 'all' || props.section === 'persona')
 
 async function toggleKillSwitch() {
   if (killSwitchLoading.value)
@@ -161,7 +179,7 @@ async function savePersona() {
       relationship: personaDraft.value.relationship,
       personaNotes: personaDraft.value.personaNotes,
       mindAge: personaDraft.value.mindAge,
-      allowOverwrite: false,
+      allowOverwrite: true,
       personality: {
         obedience: personaDraft.value.obedience,
         liveliness: personaDraft.value.liveliness,
@@ -176,14 +194,21 @@ async function savePersona() {
     personaSaving.value = false
   }
 }
+
+defineExpose({
+  savePersona,
+})
 </script>
 
 <template>
   <div v-if="supported" flex="~ col gap-6" p-2 font-normal>
-    <div class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
+    <div v-if="showTitle" class="text-sm text-neutral-500 dark:text-neutral-400">
+      Alicization 中枢
+    </div>
+    <div v-if="showRuntimeSection" class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
       <div class="mb-3 flex items-center justify-between">
         <div class="text-sm font-semibold">
-          Kill Switch 状态
+          执行熔断开关
         </div>
         <span
           :class="[
@@ -211,9 +236,9 @@ async function savePersona() {
       </button>
     </div>
 
-    <div class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
+    <div v-if="showRuntimeSection" class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
       <div class="mb-3 text-sm font-semibold">
-        Memory Stats
+        记忆体状态
       </div>
       <div class="grid grid-cols-3 gap-2 text-center text-xs">
         <div class="rounded-lg bg-neutral-100 px-2 py-2 dark:bg-neutral-800">
@@ -285,12 +310,9 @@ async function savePersona() {
       </div>
     </div>
 
-    <div class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
+    <div v-if="showPersonaSection" class="border border-neutral-200 rounded-xl p-4 dark:border-neutral-700">
       <div class="mb-2 text-sm font-semibold">
-        Persona 编辑器
-      </div>
-      <div class="mb-3 text-xs text-neutral-500 dark:text-neutral-400">
-        保存后将通过 Genesis 重新生成 SOUL（Frontmatter + Persona Notes）。
+        人格设定
       </div>
 
       <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -361,18 +383,18 @@ async function savePersona() {
         />
       </label>
 
-      <div class="mt-3 flex justify-end">
+      <div v-if="showPersonaSaveButton" class="mt-3 flex justify-end">
         <button
           class="border border-neutral-300 rounded-lg px-3 py-2 text-xs transition-colors disabled:cursor-not-allowed dark:border-neutral-600 disabled:opacity-60"
           :disabled="personaSaving"
           @click="savePersona()"
         >
-          {{ personaSaving ? '保存中...' : '保存 Persona 到 SOUL' }}
+          {{ personaSaving ? '保存中...' : '保存人格到 SOUL' }}
         </button>
       </div>
     </div>
   </div>
   <div v-else class="border border-neutral-200 rounded-lg p-4 text-sm text-neutral-500 dark:border-neutral-700 dark:text-neutral-400">
-    Alicization 仅在桌面端可用。
+    Alicization 面板仅在桌面端可用。
   </div>
 </template>
