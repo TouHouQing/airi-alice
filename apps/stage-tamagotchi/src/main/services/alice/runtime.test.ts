@@ -16,6 +16,7 @@ import {
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
   electronAliceUpdatePersonality,
+  electronAliceUpdateSoul,
 } from '../../../shared/eventa'
 import { setAliceKillSwitchState } from './state'
 
@@ -240,6 +241,52 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(nextSoul.content).toContain(`- 服从度：${nextSoul.frontmatter.personality.obedience.toFixed(2)}`)
     expect(nextSoul.content).toContain(`- 活泼度：${nextSoul.frontmatter.personality.liveliness.toFixed(2)}`)
     expect(nextSoul.content).toContain(`- 感性度：${nextSoul.frontmatter.personality.sensibility.toFixed(2)}`)
+  })
+
+  it('enforces personality baseline sync when updateSoul writes conflicting body text', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const updateSoul = invokeHandlers.get(electronAliceUpdateSoul)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(updateSoul).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      ownerName: '测试主人',
+      hostName: '主人',
+      aliceName: 'A.L.I.C.E.',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.11,
+        liveliness: 0.22,
+        sensibility: 0.33,
+      },
+      personaNotes: '请保持克制和诚实。',
+      allowOverwrite: true,
+    })
+
+    const currentSoul = await getSoul!({ cardId: 'default' })
+    const nextContent = currentSoul.content
+      .replace(/- 服从度：[0-9.]+/u, '- 服从度：0.99')
+      .replace(/- 活泼度：[0-9.]+/u, '- 活泼度：0.99')
+      .replace(/- 感性度：[0-9.]+/u, '- 感性度：0.99')
+
+    await updateSoul!({
+      cardId: 'default',
+      content: nextContent,
+    })
+
+    const synced = await getSoul!({ cardId: 'default' })
+    expect(synced.content).toContain(`- 服从度：${synced.frontmatter.personality.obedience.toFixed(2)}`)
+    expect(synced.content).toContain(`- 活泼度：${synced.frontmatter.personality.liveliness.toFixed(2)}`)
+    expect(synced.content).toContain(`- 感性度：${synced.frontmatter.personality.sensibility.toFixed(2)}`)
   })
 
   it('isolates SOUL state across card scopes', async () => {

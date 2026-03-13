@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { AliceSafetyPermissionRequest } from '../shared/eventa'
+
 import { defineInvokeHandler } from '@moeru/eventa'
 import { useElectronEventaContext, useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { themeColorFromValue, useThemeColor } from '@proj-airi/stage-layouts/composables/theme-color'
@@ -20,16 +22,19 @@ import { listProvidersForPluginHost, shouldPublishPluginHostCapabilities } from 
 import { useSettings } from '@proj-airi/stage-ui/stores/settings'
 import { useTheme } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
-import { onMounted, onUnmounted, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import { toast, Toaster } from 'vue-sonner'
 
+import AliceHitlModal from './components/AliceHitlModal.vue'
 import ResizeHandler from './components/ResizeHandler.vue'
 
 import {
   aliceDialogueResponded,
   aliceKillSwitchStateChanged,
+
+  aliceSafetyPermissionRequested,
   aliceSoulChanged,
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
@@ -47,6 +52,7 @@ import {
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
   electronAliceRunMemoryPrune,
+  electronAliceSafetyResolvePermission,
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
@@ -124,9 +130,44 @@ const aliceAppendAuditLog = useElectronEventaInvoke(electronAliceAppendAuditLog)
 const aliceRealtimeExecute = useElectronEventaInvoke(electronAliceRealtimeExecute)
 const aliceGetSensorySnapshot = useElectronEventaInvoke(electronAliceGetSensorySnapshot)
 const aliceDeleteCardScope = useElectronEventaInvoke(electronAliceDeleteCardScope)
+const aliceResolvePermission = useElectronEventaInvoke(electronAliceSafetyResolvePermission)
 
 const resolveAliceScope = () => ({ cardId: activeCardId.value || 'default' })
 const isCurrentAliceCard = (cardId: string) => cardId === (activeCardId.value || 'default')
+const currentHitlRequest = ref<AliceSafetyPermissionRequest | null>(null)
+const pendingHitlRequests = ref<AliceSafetyPermissionRequest[]>([])
+const hitlResolving = ref(false)
+
+function popNextHitlRequest() {
+  if (currentHitlRequest.value || pendingHitlRequests.value.length === 0)
+    return
+  const [next, ...rest] = pendingHitlRequests.value
+  pendingHitlRequests.value = rest
+  currentHitlRequest.value = next ?? null
+}
+
+async function resolveHitlDecision(payload: { allow: boolean, rememberSession: boolean }) {
+  const request = currentHitlRequest.value
+  if (!request || hitlResolving.value)
+    return
+
+  hitlResolving.value = true
+  try {
+    await aliceResolvePermission({
+      cardId: request.cardId,
+      token: request.token,
+      requestId: request.requestId,
+      allow: payload.allow,
+      rememberSession: payload.allow ? payload.rememberSession : false,
+      reason: payload.allow ? 'user-approved' : 'user-denied',
+    })
+  }
+  finally {
+    hitlResolving.value = false
+    currentHitlRequest.value = null
+    popNextHitlRequest()
+  }
+}
 
 setAliceBridge({
   bootstrap: async () => await aliceBootstrap(resolveAliceScope()),
@@ -173,6 +214,14 @@ context.value.on(aliceDialogueResponded, (event) => {
   void alicePresenceDispatcherStore.dispatchDialogueResponded(payload)
 })
 
+context.value.on(aliceSafetyPermissionRequested, (event) => {
+  const payload = event?.body
+  if (!payload || !isCurrentAliceCard(payload.cardId))
+    return
+  pendingHitlRequests.value = [...pendingHitlRequests.value, payload]
+  popNextHitlRequest()
+})
+
 // NOTICE: register plugin host bridge during setup to avoid race with pages using it in immediate watchers.
 pluginHostInspectorStore.setBridge({
   list: () => listPlugins(),
@@ -199,6 +248,9 @@ watch(language, () => {
 })
 
 watch(activeCardId, () => {
+  currentHitlRequest.value = null
+  pendingHitlRequests.value = []
+  hitlResolving.value = false
   void aliceEpoch1Store.refreshSoul()
   void aliceEpoch1Store.syncKillSwitchState()
   void aliceEpoch1Store.refreshMemoryStats()
@@ -271,6 +323,11 @@ onUnmounted(() => {
   <ToasterRoot @close="id => toast.dismiss(id)">
     <Toaster />
   </ToasterRoot>
+  <AliceHitlModal
+    :request="currentHitlRequest"
+    :resolving="hitlResolving"
+    @decide="resolveHitlDecision"
+  />
   <ResizeHandler />
   <RouterView />
 </template>

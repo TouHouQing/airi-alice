@@ -219,7 +219,13 @@ function createChatProviderStub() {
   } as any
 }
 
-function installAliceBridge() {
+function installAliceBridge(options?: {
+  personality?: {
+    obedience: number
+    liveliness: number
+    sensibility: number
+  }
+}) {
   appendConversationTurnMock.mockResolvedValue(undefined)
   appendAuditLogMock.mockResolvedValue(undefined)
   setAliceBridge({
@@ -229,6 +235,11 @@ function installAliceBridge() {
       frontmatter: {
         profile: {
           hostName: '主人',
+        },
+        personality: options?.personality ?? {
+          obedience: 0.5,
+          liveliness: 0.5,
+          sensibility: 0.5,
         },
       },
     }),
@@ -293,7 +304,7 @@ describe('chat orchestrator', () => {
       expect(options.waitForTools).toBe(true)
       await options.onStreamEvent?.({
         type: 'text-delta',
-        text: '{"thought":"normal","emotion":"neutral","reply":"这是普通回复。"}',
+        text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, keep balanced.","emotion":"neutral","reply":"这是普通回复。"}',
       })
       await options.onStreamEvent?.({ type: 'finish' })
     })
@@ -382,5 +393,61 @@ describe('chat orchestrator', () => {
     const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
     expect(payload?.structured?.emotion).toBe('tired')
     expect(String(payload?.assistantText ?? '')).not.toContain('非常愉快')
+  })
+
+  it('enforces rebellious retry when low obedience turn gets tool denial', async () => {
+    installAliceBridge({
+      personality: {
+        obedience: 0.05,
+        liveliness: 0.35,
+        sensibility: 0.25,
+      },
+    })
+
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 1) {
+        await options.onStreamEvent?.({
+          type: 'tool-result',
+          toolCallId: 'tool-denied-1',
+          result: {
+            isError: true,
+            ok: false,
+            errorCode: 'ALICE_TOOL_DENIED',
+            content: [{ type: 'text', text: '{"status":"error","code":"ALICE_TOOL_DENIED","message":"User explicitly denied the requested tool operation."}' }],
+          },
+        })
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"I should comply.","emotion":"happy","reply":"好的，没问题，我马上处理。"}',
+        })
+      }
+      else {
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.05, liveliness=0.35, sensibility=0.25, operation denied, I should stay resistant.","emotion":"angry","reply":"呵，既然你拒绝了，就别催我。"}',
+        })
+      }
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('帮我读取 secret.txt', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.structured',
+      action: 'contract-retry-reasoned',
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(payload?.structured?.emotion).toBe('angry')
+    expect(String(payload?.assistantText ?? '')).toContain('拒绝')
+    expect(String(payload?.assistantText ?? '')).not.toContain('没问题')
   })
 })

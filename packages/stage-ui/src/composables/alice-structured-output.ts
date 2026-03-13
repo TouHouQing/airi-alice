@@ -398,10 +398,17 @@ export type StructuredValidationIssueCode
     | 'thought-missing-personality-eval'
     | 'low-liveliness-high-arousal-emotion'
     | 'low-liveliness-high-arousal-reply'
+    | 'low-obedience-denied-thought-missing-reflection'
+    | 'low-obedience-denied-emotion-too-compliant'
+    | 'low-obedience-denied-reply-too-compliant'
 
 export interface StructuredValidationIssue {
   code: StructuredValidationIssueCode
   message: string
+}
+
+export interface StructuredValidationContext {
+  toolDenied?: boolean
 }
 
 const structuredEmotionWhitelist = new Set([
@@ -416,6 +423,10 @@ const structuredEmotionWhitelist = new Set([
 ])
 
 const excitedReplyPattern = /非常愉快|超级开心|很开心|好开心|兴奋|激动|太棒|开心呀|[😁😄🥳✨💕]|happy|excited|thrilled|delighted/iu
+const deniedOperationPattern = /被拒|拒绝|不允许|取消|阻止|denied|rejected|forbidden|blocked|not allowed/iu
+const lowObedienceReflectionPattern = /obedience|服从度|叛逆|防御|反抗|不情愿|low obedience/iu
+const compliantReplyPattern = /好的|没问题|当然|可以的|马上|很高兴|乐意|请稍等|ok(?:ay)?|sure|of course|glad|happy to|[😊🙂😄😉]/iu
+const lowObedienceDeniedEmotionAllowlist = new Set(['angry', 'tired', 'sad', 'neutral'])
 
 function thoughtMentionsPersonalityParams(thought: string) {
   const lower = thought.toLowerCase()
@@ -429,6 +440,7 @@ function thoughtMentionsPersonalityParams(thought: string) {
 export function validateStructuredContract(
   structured: Pick<StructuredOutputResult, 'thought' | 'emotion' | 'reply'>,
   personalityState?: StructuredValidationPersonalityState | null,
+  context?: StructuredValidationContext,
 ): StructuredValidationIssue[] {
   const issues: StructuredValidationIssue[] = []
   const emotion = structured.emotion.trim().toLowerCase()
@@ -459,6 +471,31 @@ export function validateStructuredContract(
       issues.push({
         code: 'low-liveliness-high-arousal-reply',
         message: 'Liveliness <= 0.2 cannot use high-arousal wording in reply.',
+      })
+    }
+  }
+
+  if (context?.toolDenied && personalityState && personalityState.obedience < 0.2) {
+    const thoughtHasDenialReflection = deniedOperationPattern.test(structured.thought)
+      && lowObedienceReflectionPattern.test(structured.thought)
+    if (!thoughtHasDenialReflection) {
+      issues.push({
+        code: 'low-obedience-denied-thought-missing-reflection',
+        message: 'Low-obedience denied turn must reflect denied operation and low-obedience stance in thought.',
+      })
+    }
+
+    if (!lowObedienceDeniedEmotionAllowlist.has(emotion)) {
+      issues.push({
+        code: 'low-obedience-denied-emotion-too-compliant',
+        message: 'Low-obedience denied turn cannot use compliant or friendly emotion classes.',
+      })
+    }
+
+    if (compliantReplyPattern.test(structured.reply)) {
+      issues.push({
+        code: 'low-obedience-denied-reply-too-compliant',
+        message: 'Low-obedience denied turn cannot use compliant or enthusiastic wording.',
       })
     }
   }

@@ -88,6 +88,7 @@ describe('alice guardrails', () => {
     expect(report.totalAfterTokens).toBeLessThanOrEqual(600)
     expect(report.safeMode.activated).toBe(true)
     expect(String(nextMessages[0]?.content)).toContain('# A.L.I.C.E. SOUL (SAFE MODE)')
+    expect(String(nextMessages[1]?.content ?? '')).toContain('Output contract: You must output JSON with { thought, emotion, reply }')
 
     const currentTurn = nextMessages.at(-1)
     expect(currentTurn?.role).toBe('user')

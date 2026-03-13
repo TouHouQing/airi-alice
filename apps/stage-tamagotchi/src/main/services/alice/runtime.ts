@@ -1612,7 +1612,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         }
 
         const parsed = parseSoul(updatePayload.content)
-        const content = toSoulContent(parsed.frontmatter, parsed.body)
+        const syncedBody = syncPersonalityBaselineInBody(parsed.body, parsed.frontmatter.personality)
+        const content = toSoulContent(parsed.frontmatter, syncedBody)
         return snapshotFromContent(content)
       })
     })

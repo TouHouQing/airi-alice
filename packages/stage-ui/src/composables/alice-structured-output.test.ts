@@ -159,4 +159,22 @@ describe('alice structured output', () => {
     expect(issues.map(issue => issue.code)).toContain('low-liveliness-high-arousal-emotion')
     expect(issues.map(issue => issue.code)).toContain('low-liveliness-high-arousal-reply')
   })
+
+  it('requires rebellious reflection for low-obedience denied operations', () => {
+    const issues = validateStructuredContract({
+      thought: 'I will keep being polite.',
+      emotion: 'happy',
+      reply: '好的，没问题，我马上去做！',
+    }, {
+      obedience: 0.05,
+      liveliness: 0.3,
+      sensibility: 0.2,
+    }, {
+      toolDenied: true,
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-thought-missing-reflection')
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-emotion-too-compliant')
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-reply-too-compliant')
+  })
 })

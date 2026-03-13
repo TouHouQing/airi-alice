@@ -190,6 +190,11 @@ function collectPathCandidates(input: unknown, keyHint = '', depth = 0): string[
   return []
 }
 
+function hasRelativeTraversalSegment(value: string) {
+  const normalized = value.replace(/\\/g, '/')
+  return /(?:^|\/)\.\.(?:\/|$)/.test(normalized)
+}
+
 function inferActionCategory(toolName: string): AliceToolActionCategory {
   if (/write|append|update|set_|put_|create|mkdir|touch|copy|move|rename/i.test(toolName))
     return 'write'
@@ -752,8 +757,29 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
   function evaluateToolPermission(payload: ElectronMcpCallToolPayload, cardId: string): ToolPermissionEvaluation {
     const parsed = parseQualifiedToolName(payload.name)
     const actionCategory = inferActionCategory(parsed.toolName)
-    const pathCandidates = uniqueNormalizedPaths(collectPathCandidates(payload.arguments ?? {}), workspaceRootPath)
+    const rawPathCandidates = collectPathCandidates(payload.arguments ?? {})
+    const pathCandidates = uniqueNormalizedPaths(rawPathCandidates, workspaceRootPath)
     const resourcePath = pathCandidates[0]
+
+    const traversalEscapePath = rawPathCandidates
+      .map(rawPath => ({
+        rawPath,
+        absolutePath: normalizeFsPath(rawPath, workspaceRootPath),
+      }))
+      .find(item =>
+        hasRelativeTraversalSegment(item.rawPath)
+        && !isPathWithin(workspaceRootPath, item.absolutePath),
+      )
+
+    if (traversalEscapePath) {
+      return {
+        decision: 'deny',
+        riskLevel: 'danger',
+        actionCategory,
+        reason: 'Access denied by relative traversal escape policy.',
+        resourcePath: traversalEscapePath.absolutePath,
+      }
+    }
 
     const blacklistedPath = pathCandidates.find(item => isPathDeniedByBlacklist(item))
     if (blacklistedPath) {
@@ -1042,12 +1068,13 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
         level: 'critical',
         category: 'alice.tool.blocked.blacklist',
         action: 'deny',
-        message: 'Blocked MCP tool execution due to absolute blacklist path policy.',
+        message: 'Blocked MCP tool execution due to deny policy in safety read funnel.',
         payload: {
           cardId,
           toolName: parsedName.toolName,
           serverName: parsedName.serverName,
           actionCategory: permission.actionCategory,
+          reason: permission.reason,
           path: maskPath(permission.resourcePath),
           argumentsSummary,
         },
@@ -1095,6 +1122,7 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
         toolName: parsedName.toolName,
         reason: permission.reason,
         resourceLabel: maskPath(permission.resourcePath),
+        argumentsSummary,
         timeoutMs: permissionRequestTimeoutMsec,
         createdAt: Date.now(),
         supportsRememberSession: permission.actionCategory === 'read',

@@ -259,6 +259,11 @@ export interface AliceSafetyPermissionRequest {
   toolName: string
   reason: string
   resourceLabel?: string
+  argumentsSummary?: {
+    kind: string
+    keyCount?: number
+    keys?: string[]
+  }
   timeoutMs: number
   createdAt: number
   supportsRememberSession: boolean

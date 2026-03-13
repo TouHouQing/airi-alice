@@ -82,6 +82,14 @@ const defaultPromptBudget: Required<PromptBudgetOptions> = {
 
 const runtimeSensoryHeader = aliceFixedSensoryContextHeader
 const runtimeContractAnchorHeader = aliceFixedStructuredContractHeader
+const safeModeRuntimeContractNotice = [
+  '[SYSTEM NOTICE] Memory and history are skipped for this turn due to SOUL overflow safe mode.',
+  '',
+  'Output contract (must-follow, highest priority):',
+  '- Return exactly one strict JSON object with keys: thought, emotion, reply.',
+  '- No markdown fences, no extra keys, no prose outside JSON.',
+  'Output contract: You must output JSON with { thought, emotion, reply }',
+].join('\n')
 
 const defaultSanitizeOptions: Required<SanitizeOptions> = {
   timeBudgetMs: 50,
@@ -476,7 +484,7 @@ export function applyPromptBudget(messages: Message[], options?: PromptBudgetOpt
     }
     minimalMessages.push({
       role: 'system',
-      content: '[SYSTEM NOTICE] Memory and history are skipped for this turn due to SOUL overflow safe mode.',
+      content: safeModeRuntimeContractNotice,
     })
 
     if (currentTurnIndex >= 0 && result[currentTurnIndex]) {

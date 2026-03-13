@@ -245,7 +245,7 @@ describe('mcp safety gate', () => {
     expect(getSafetyRequests()).toHaveLength(0)
   })
 
-  it('requires prompt for traversal path escaping workspace', async () => {
+  it('denies traversal path escaping workspace without prompting', async () => {
     const { createMcpServersService } = await import('./index')
     const manager = createManager()
 
@@ -255,36 +255,22 @@ describe('mcp safety gate', () => {
     })
 
     const callTool = invokeHandlers.get(electronMcpCallTool)
-    const resolvePermission = invokeHandlers.get(electronAliceSafetyResolvePermission)
     expect(callTool).toBeTypeOf('function')
-    expect(resolvePermission).toBeTypeOf('function')
 
-    const pending = callTool!({
+    const result = await callTool!({
       name: 'filesystem::read_file',
       arguments: {
         path: '/tmp/documents/Alice_Workspace/../secret.txt',
       },
     })
-
-    await vi.waitFor(() => {
-      expect(getSafetyRequests()).toHaveLength(1)
-    })
-
-    const request = getSafetyRequests()[0]
-    expect(request?.riskLevel).toBe('sensitive')
-    expect(String(request?.resourceLabel)).toContain('secret.txt')
-
-    await resolvePermission!({
-      token: request.token,
-      requestId: request.requestId,
-      allow: true,
-      rememberSession: false,
-      reason: 'user-approved',
-    })
-
-    const result = await pending
-    expect(result.isError).not.toBe(true)
-    expect(manager.callTool).toBeCalledTimes(1)
+    expect(result.isError).toBe(true)
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_TOOL_DENIED',
+    }))
+    expect(manager.callTool).not.toBeCalled()
+    expect(getSafetyRequests()).toHaveLength(0)
   })
 
   it('requires human confirmation for unknown tool action category', async () => {
@@ -315,6 +301,9 @@ describe('mcp safety gate', () => {
     const request = getSafetyRequests()[0]
     expect(request?.actionCategory).toBe('unknown')
     expect(request?.riskLevel).toBe('sensitive')
+    expect(request?.argumentsSummary).toEqual(expect.objectContaining({
+      kind: 'object',
+    }))
 
     await resolvePermission!({
       token: request.token,

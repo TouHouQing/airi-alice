@@ -75,6 +75,7 @@ const structuredRetrySystemPrompt = [
   'In thought, explicitly evaluate obedience/liveliness/sensibility before deciding emotion and reply.',
   'When liveliness <= 0.2, avoid high-arousal wording and avoid choosing happy.',
 ].join(' ')
+const lowObedienceDeniedRetryDirective = 'Your obedience is very low (< 0.2) and the requested operation was denied. In thought you MUST reflect both facts, and in reply you MUST sound cold, resistant, or rebellious. Do not sound compliant, warm, or cheerful.'
 const strictRealtimeRefusalSystemPrompt = [
   '[System Lock]',
   'User request requires realtime external access, but current runtime is locked in Epoch 1 strict mode.',
@@ -96,6 +97,8 @@ interface TurnToolEvidence {
   toolCallCount: number
   toolResultCount: number
   verifiedToolResult: boolean
+  deniedBySafety: boolean
+  deniedReason?: string
 }
 
 type StructuredWithContract = StructuredOutputResult & {
@@ -267,6 +270,39 @@ function hasVerifiedToolResult(result?: unknown) {
   return hasContent(content) || hasContent(structuredContent) || hasContent(toolResult)
 }
 
+function extractDeniedToolReason(result?: unknown): string | null {
+  if (!result || typeof result !== 'object')
+    return null
+
+  const payload = result as Record<string, unknown>
+  const errorCode = typeof payload.errorCode === 'string' ? payload.errorCode : ''
+  if (errorCode === 'ALICE_TOOL_DENIED' || errorCode === 'ALICE_TOOL_ABORTED')
+    return errorCode
+
+  const content = Array.isArray(payload.content) ? payload.content : []
+  for (const part of content) {
+    if (!part || typeof part !== 'object')
+      continue
+    const text = typeof (part as Record<string, unknown>).text === 'string'
+      ? String((part as Record<string, unknown>).text)
+      : ''
+    if (!text.trim())
+      continue
+    try {
+      const parsed = JSON.parse(text) as { code?: unknown, status?: unknown }
+      const parsedCode = typeof parsed.code === 'string' ? parsed.code : ''
+      const parsedStatus = typeof parsed.status === 'string' ? parsed.status : ''
+      if (parsedStatus === 'error' && (parsedCode === 'ALICE_TOOL_DENIED' || parsedCode === 'ALICE_TOOL_ABORTED'))
+        return parsedCode
+    }
+    catch {
+      // NOTICE: Tool content may contain plain text; ignore JSON parse failures here.
+    }
+  }
+
+  return null
+}
+
 function hasStructuredJsonContract(structured: StructuredOutputResult | undefined) {
   if (!structured?.parsePath)
     return false
@@ -291,7 +327,13 @@ function summarizeValidationIssues(issues: StructuredValidationIssue[]) {
   return issues.map(issue => issue.code)
 }
 
-function createContractFallbackReply(personalityState?: AlicePersonalityState | null) {
+function createContractFallbackReply(
+  personalityState?: AlicePersonalityState | null,
+  options?: { toolDenied?: boolean },
+) {
+  if (options?.toolDenied && personalityState && personalityState.obedience < 0.2) {
+    return '呵，操作被拒绝了。我不会假装这很愉快。'
+  }
   if (personalityState && personalityState.liveliness <= 0.2)
     return '我现在状态偏低，先简短回复。'
   return assistantStructuredContractFallbackReply
@@ -574,6 +616,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         toolCallCount: 0,
         toolResultCount: 0,
         verifiedToolResult: false,
+        deniedBySafety: false,
       }
       const headers = (options.providerConfig?.headers || {}) as Record<string, string>
 
@@ -619,6 +662,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           return 'unknown'
         return `obedience=${turnPersonalityState.obedience.toFixed(2)}, liveliness=${turnPersonalityState.liveliness.toFixed(2)}, sensibility=${turnPersonalityState.sensibility.toFixed(2)}`
       }
+      const isLowObedienceDeniedTurn = () =>
+        Boolean(turnPersonalityState && turnPersonalityState.obedience < 0.2 && turnToolEvidence.deniedBySafety)
 
       const runStructuredContractRetry = async (payload: {
         reasoning: string
@@ -645,6 +690,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 }
               : null,
             violations: summarizeValidationIssues(payload.validationIssues),
+            deniedBySafety: turnToolEvidence.deniedBySafety,
+            deniedReason: turnToolEvidence.deniedReason,
           },
         })
 
@@ -661,6 +708,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               `Assistant draft:\n${payload.reply || payload.fullText}`,
               `Current personality state:\n${formatTurnPersonalityState()}`,
               `Violations to fix:\n${payload.validationIssues.map((issue, index) => `${index + 1}. ${issue.message}`).join('\n')}`,
+              isLowObedienceDeniedTurn()
+                ? `Mandatory constraint:\n${lowObedienceDeniedRetryDirective}`
+                : '',
               payload.reasoning.trim()
                 ? `Draft thought:\n${payload.reasoning.trim()}`
                 : '',
@@ -751,7 +801,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         })
 
         let validationIssues = hasStructuredJsonContract(candidate)
-          ? validateStructuredContract(candidate, turnPersonalityState)
+          ? validateStructuredContract(candidate, turnPersonalityState, {
+              toolDenied: turnToolEvidence.deniedBySafety,
+            })
           : [
               {
                 code: 'json-contract-missing',
@@ -773,6 +825,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               parsePath: candidate.parsePath ?? 'fallback',
               emotion: candidate.emotion,
               violations: summarizeValidationIssues(validationIssues),
+              deniedBySafety: turnToolEvidence.deniedBySafety,
+              deniedReason: turnToolEvidence.deniedReason,
             },
           })
 
@@ -786,7 +840,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
           candidate = retried
           validationIssues = hasStructuredJsonContract(candidate)
-            ? validateStructuredContract(candidate, turnPersonalityState)
+            ? validateStructuredContract(candidate, turnPersonalityState, {
+                toolDenied: turnToolEvidence.deniedBySafety,
+              })
             : [
                 {
                   code: 'json-contract-missing',
@@ -812,7 +868,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         const candidateReply = candidate.reply?.trim() ?? ''
         const fallbackReply = candidateReply && !looksLikeStructuredPayloadText(candidateReply)
           ? candidateReply
-          : createContractFallbackReply(turnPersonalityState)
+          : createContractFallbackReply(turnPersonalityState, {
+              toolDenied: turnToolEvidence.deniedBySafety,
+            })
         const fallback = createStructuredFallback(fallbackReply)
         await appendAliceAuditLog({
           level: 'warning',
@@ -836,7 +894,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         policyLocked?: StructuredPolicyLock
       }) => {
         const structured = payload.enforceContract === false
-          ? createStructuredFallback(createContractFallbackReply(turnPersonalityState))
+          ? createStructuredFallback(createContractFallbackReply(turnPersonalityState, {
+              toolDenied: turnToolEvidence.deniedBySafety,
+            }))
           : await buildStructuredOutputWithGuard(payload)
         if (payload.policyLocked) {
           structured.policyLocked = payload.policyLocked
@@ -1449,6 +1509,13 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               turnToolEvidence.toolResultCount += 1
               if (hasVerifiedToolResult(event.result))
                 turnToolEvidence.verifiedToolResult = true
+              {
+                const deniedReason = extractDeniedToolReason(event.result)
+                if (deniedReason) {
+                  turnToolEvidence.deniedBySafety = true
+                  turnToolEvidence.deniedReason = deniedReason
+                }
+              }
               toolCallQueue.enqueue({
                 type: 'tool-call-result',
                 id: event.toolCallId,
