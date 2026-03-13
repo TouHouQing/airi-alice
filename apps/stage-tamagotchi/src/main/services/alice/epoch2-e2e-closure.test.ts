@@ -241,7 +241,7 @@ describe('epoch2 closure e2e', () => {
       expect(deniedResult.isError).toBe(true)
       expect(parseToolError(deniedResult)).toEqual(expect.objectContaining({
         status: 'error',
-        code: 'ALICE_TOOL_DENIED',
+        code: 'ALICE_TOOL_DENIED_BY_HOST',
       }))
 
       await appendConversationTurn!({

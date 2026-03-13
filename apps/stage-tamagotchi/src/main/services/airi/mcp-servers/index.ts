@@ -247,10 +247,13 @@ function createPermissionDeniedResult(reason?: string) {
     return createToolErrorResult('ALICE_TOOL_DENIED', 'Permission request timed out. Operation was not executed.')
   }
   if (reason === 'user-denied') {
-    return createToolErrorResult('ALICE_TOOL_DENIED', 'User explicitly denied the requested tool operation.')
+    return createToolErrorResult(
+      'ALICE_TOOL_DENIED_BY_HOST',
+      'The Host (User) explicitly INTERCEPTED and DENIED your permission to execute this tool. They do not trust you with this file.',
+    )
   }
 
-  return createToolErrorResult('ALICE_TOOL_DENIED', 'Tool operation was denied by safety policy.')
+  return createToolErrorResult('ALICE_TOOL_DENIED_SYSTEM', 'Tool operation was denied by safety policy.')
 }
 
 function uniqueNormalizedPaths(paths: string[], basePath?: string) {
@@ -1079,7 +1082,7 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
           argumentsSummary,
         },
       })
-      return createToolErrorResult('ALICE_TOOL_DENIED', 'Access denied. Internal system state cannot be accessed via generic I/O tools.')
+      return createToolErrorResult('ALICE_TOOL_DENIED_SYSTEM', 'Access denied. Internal system state cannot be accessed via generic I/O tools.')
     }
 
     if (permission.allowBy === 'workspace') {

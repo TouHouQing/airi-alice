@@ -130,10 +130,10 @@ describe('mcp safety gate', () => {
     })
 
     expect(result.isError).toBe(true)
-    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED_SYSTEM')
     expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
       status: 'error',
-      code: 'ALICE_TOOL_DENIED',
+      code: 'ALICE_TOOL_DENIED_SYSTEM',
     }))
     expect(manager.callTool).not.toBeCalled()
     expect(contextEmitMock).not.toBeCalledWith(aliceSafetyPermissionRequested, expect.anything())
@@ -166,7 +166,7 @@ describe('mcp safety gate', () => {
     })
 
     expect(result.isError).toBe(true)
-    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED_SYSTEM')
     expect(manager.callTool).not.toBeCalled()
   })
 
@@ -190,10 +190,10 @@ describe('mcp safety gate', () => {
     })
 
     expect(result.isError).toBe(true)
-    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED_SYSTEM')
     expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
       status: 'error',
-      code: 'ALICE_TOOL_DENIED',
+      code: 'ALICE_TOOL_DENIED_SYSTEM',
     }))
     expect(manager.callTool).not.toBeCalled()
     expect(getSafetyRequests()).toHaveLength(0)
@@ -264,10 +264,10 @@ describe('mcp safety gate', () => {
       },
     })
     expect(result.isError).toBe(true)
-    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED_SYSTEM')
     expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
       status: 'error',
-      code: 'ALICE_TOOL_DENIED',
+      code: 'ALICE_TOOL_DENIED_SYSTEM',
     }))
     expect(manager.callTool).not.toBeCalled()
     expect(getSafetyRequests()).toHaveLength(0)
@@ -451,7 +451,7 @@ describe('mcp safety gate', () => {
     })
     const thirdResult = await thirdPending
     expect(thirdResult.isError).toBe(true)
-    expect(thirdResult.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(thirdResult.errorCode).toBe('ALICE_TOOL_DENIED_BY_HOST')
     expect(manager.callTool).toBeCalledTimes(2)
   })
 
@@ -500,7 +500,7 @@ describe('mcp safety gate', () => {
     })
     const denied = await pending
     expect(denied.isError).toBe(true)
-    expect(denied.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(denied.errorCode).toBe('ALICE_TOOL_DENIED_BY_HOST')
   })
 
   it('rejects permission resolution when requestId does not match token context', async () => {
@@ -586,12 +586,12 @@ describe('mcp safety gate', () => {
 
     const result = await pending
     expect(result.isError).toBe(true)
-    expect(result.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(result.errorCode).toBe('ALICE_TOOL_DENIED_BY_HOST')
     expect(parseToolErrorJson(result)).toEqual(expect.objectContaining({
       status: 'error',
-      code: 'ALICE_TOOL_DENIED',
+      code: 'ALICE_TOOL_DENIED_BY_HOST',
     }))
-    expect(String(result.errorMessage)).toContain('User explicitly denied')
+    expect(String(result.errorMessage)).toContain('Host (User) explicitly INTERCEPTED')
     expect(manager.callTool).not.toBeCalled()
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
       action: 'alice.safety.permission.denied',
@@ -636,7 +636,7 @@ describe('mcp safety gate', () => {
 
     const deniedResult = await deniedPending
     expect(deniedResult.isError).toBe(true)
-    expect(deniedResult.errorCode).toBe('ALICE_TOOL_DENIED')
+    expect(deniedResult.errorCode).toBe('ALICE_TOOL_DENIED_BY_HOST')
     expect(manager.callTool).not.toBeCalled()
 
     contextEmitMock.mockReset()

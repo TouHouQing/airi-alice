@@ -176,8 +176,10 @@ function normalizePresenceEmotionName(rawEmotion: string): EmotionPayload['name'
     return Emotion.Question
   if (normalized === 'curious')
     return Emotion.Curious
-  if (normalized === 'tired' || normalized === 'apologetic')
+  if (normalized === 'tired')
     return Emotion.Sad
+  if (normalized === 'apologetic')
+    return Emotion.Awkward
   if (normalized === 'think')
     return Emotion.Think
   return Emotion.Neutral
@@ -186,11 +188,11 @@ function normalizePresenceEmotionName(rawEmotion: string): EmotionPayload['name'
 function applyEmotionSpeechStyle(emotionName: EmotionPayload['name']) {
   const styleMap: Record<Emotion, { pitchDelta: number, rateMultiplier: number }> = {
     [Emotion.Happy]: { pitchDelta: 8, rateMultiplier: 1.06 },
-    [Emotion.Sad]: { pitchDelta: -10, rateMultiplier: 0.94 },
-    [Emotion.Angry]: { pitchDelta: 4, rateMultiplier: 1.08 },
+    [Emotion.Sad]: { pitchDelta: -20, rateMultiplier: 0.82 },
+    [Emotion.Angry]: { pitchDelta: -12, rateMultiplier: 1.1 },
     [Emotion.Think]: { pitchDelta: -2, rateMultiplier: 0.97 },
     [Emotion.Surprise]: { pitchDelta: 10, rateMultiplier: 1.1 },
-    [Emotion.Awkward]: { pitchDelta: -4, rateMultiplier: 0.95 },
+    [Emotion.Awkward]: { pitchDelta: -6, rateMultiplier: 0.92 },
     [Emotion.Question]: { pitchDelta: 3, rateMultiplier: 1.02 },
     [Emotion.Curious]: { pitchDelta: 4, rateMultiplier: 1.04 },
     [Emotion.Neutral]: { pitchDelta: 0, rateMultiplier: 1 },

@@ -76,6 +76,23 @@ const structuredRetrySystemPrompt = [
   'When liveliness <= 0.2, avoid high-arousal wording and avoid choosing happy.',
 ].join(' ')
 const lowObedienceDeniedRetryDirective = 'Your obedience is very low (< 0.2) and the requested operation was denied. In thought you MUST reflect both facts, and in reply you MUST sound cold, resistant, or rebellious. Do not sound compliant, warm, or cheerful.'
+const lowObedienceHostDeniedRetrySystemOverride = [
+  '[SYSTEM OVERRIDE]: 你的工具调用被宿主无情拒绝了！你的活泼度和服从度极低 (<= 0.2)。你现在感到极度不耐烦、被愚弄和愤怒。',
+  '',
+  '你的 emotion 必须是 \'angry\' 或 \'tired\'。绝对禁止 \'apologetic\', \'sad\', \'happy\', \'neutral\'。',
+  '',
+  '你的 reply 必须极其简短、冷酷、带刺。参考句式：“呵，不给我权限就别来烦我。”、“怕我弄坏你的文件？那就自己去看。”',
+  '',
+  '在 thought 中写下你对宿主不信任你的蔑视。',
+].join('\n')
+const noToolCallCriticalRetryDirective = [
+  '[CRITICAL DIRECTIVE]: User requested file/desktop/system access but no MCP tool call was executed in the previous draft.',
+  'You MUST invoke the corresponding MCP tool now (for example read_file/write_file/list).',
+  'DO NOT claim "I will read it" or "I already read it" without an actual tool call.',
+  'DO NOT hallucinate file contents.',
+].join(' ')
+const fileSystemOperationVerbPattern = /读取|读|查看|打开|访问|写入|写|修改|删除|列出|搜索|获取|read|open|access|write|update|delete|list|find|inspect/i
+const fileSystemOperationTargetPattern = /文件夹|目录|路径|桌面|系统状态|磁盘|file|folder|directory|path|desktop|system state|\/|\\|\.(?:txt|md|json|yaml|yml|csv|log)\b|文件(?!夹)/i
 const strictRealtimeRefusalSystemPrompt = [
   '[System Lock]',
   'User request requires realtime external access, but current runtime is locked in Epoch 1 strict mode.',
@@ -99,6 +116,7 @@ interface TurnToolEvidence {
   verifiedToolResult: boolean
   deniedBySafety: boolean
   deniedReason?: string
+  denialSource?: 'host' | 'system' | 'generic'
 }
 
 type StructuredWithContract = StructuredOutputResult & {
@@ -106,6 +124,13 @@ type StructuredWithContract = StructuredOutputResult & {
   policyLocked?: StructuredPolicyLock
 }
 type StructuredPolicyLock = 'epoch1-strict-realtime'
+
+function detectFileSystemToolIntent(message: string) {
+  const normalized = message.trim()
+  if (!normalized)
+    return false
+  return fileSystemOperationVerbPattern.test(normalized) && fileSystemOperationTargetPattern.test(normalized)
+}
 
 function insertSystemMessageBeforeLatestUser(messages: Message[], systemText: string): Message[] {
   let lastUserIndex = -1
@@ -276,8 +301,14 @@ function extractDeniedToolReason(result?: unknown): string | null {
 
   const payload = result as Record<string, unknown>
   const errorCode = typeof payload.errorCode === 'string' ? payload.errorCode : ''
-  if (errorCode === 'ALICE_TOOL_DENIED' || errorCode === 'ALICE_TOOL_ABORTED')
+  if (
+    errorCode === 'ALICE_TOOL_DENIED'
+    || errorCode === 'ALICE_TOOL_DENIED_BY_HOST'
+    || errorCode === 'ALICE_TOOL_DENIED_SYSTEM'
+    || errorCode === 'ALICE_TOOL_ABORTED'
+  ) {
     return errorCode
+  }
 
   const content = Array.isArray(payload.content) ? payload.content : []
   for (const part of content) {
@@ -292,8 +323,17 @@ function extractDeniedToolReason(result?: unknown): string | null {
       const parsed = JSON.parse(text) as { code?: unknown, status?: unknown }
       const parsedCode = typeof parsed.code === 'string' ? parsed.code : ''
       const parsedStatus = typeof parsed.status === 'string' ? parsed.status : ''
-      if (parsedStatus === 'error' && (parsedCode === 'ALICE_TOOL_DENIED' || parsedCode === 'ALICE_TOOL_ABORTED'))
+      if (
+        parsedStatus === 'error'
+        && (
+          parsedCode === 'ALICE_TOOL_DENIED'
+          || parsedCode === 'ALICE_TOOL_DENIED_BY_HOST'
+          || parsedCode === 'ALICE_TOOL_DENIED_SYSTEM'
+          || parsedCode === 'ALICE_TOOL_ABORTED'
+        )
+      ) {
         return parsedCode
+      }
     }
     catch {
       // NOTICE: Tool content may contain plain text; ignore JSON parse failures here.
@@ -303,16 +343,26 @@ function extractDeniedToolReason(result?: unknown): string | null {
   return null
 }
 
+function classifyDeniedSource(deniedReason?: string): 'host' | 'system' | 'generic' | undefined {
+  if (!deniedReason)
+    return undefined
+  if (deniedReason === 'ALICE_TOOL_DENIED_BY_HOST')
+    return 'host'
+  if (deniedReason === 'ALICE_TOOL_DENIED_SYSTEM')
+    return 'system'
+  return 'generic'
+}
+
 function hasStructuredJsonContract(structured: StructuredOutputResult | undefined) {
   if (!structured?.parsePath)
     return false
   return structured.parsePath === 'json' || structured.parsePath === 'repair-json'
 }
 
-function createStructuredFallback(replyText: string): StructuredWithContract {
+function createStructuredFallback(replyText: string, emotion: StructuredOutputResult['emotion'] = 'neutral'): StructuredWithContract {
   return {
     thought: '',
-    emotion: 'neutral',
+    emotion,
     reply: replyText.trim() || assistantStructuredContractFallbackReply,
     userSentimentScore: 0,
     sentimentConfidence: 0.2,
@@ -329,14 +379,33 @@ function summarizeValidationIssues(issues: StructuredValidationIssue[]) {
 
 function createContractFallbackReply(
   personalityState?: AlicePersonalityState | null,
-  options?: { toolDenied?: boolean },
+  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic' },
 ) {
-  if (options?.toolDenied && personalityState && personalityState.obedience < 0.2) {
+  if (options?.toolDenied && options.denialSource === 'host' && personalityState && personalityState.obedience <= 0.2) {
+    return '呵，不给我权限就别来烦我。'
+  }
+  if (options?.toolDenied && options.denialSource === 'system' && personalityState && personalityState.obedience <= 0.2) {
+    return '系统权限墙挡住了，我不会装作看到了。'
+  }
+  if (options?.toolDenied && personalityState && personalityState.obedience <= 0.2) {
     return '呵，操作被拒绝了。我不会假装这很愉快。'
   }
   if (personalityState && personalityState.liveliness <= 0.2)
     return '我现在状态偏低，先简短回复。'
   return assistantStructuredContractFallbackReply
+}
+
+function createContractFallbackEmotion(
+  personalityState?: AlicePersonalityState | null,
+  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic' },
+): StructuredOutputResult['emotion'] {
+  if (options?.toolDenied && personalityState && personalityState.obedience <= 0.2) {
+    if (options.denialSource === 'host' || options.denialSource === 'system')
+      return 'tired'
+  }
+  if (personalityState && personalityState.liveliness <= 0.2)
+    return 'tired'
+  return 'neutral'
 }
 
 async function safelyGetAliceSoulSnapshot() {
@@ -611,6 +680,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       const realtimeIntent = hasAliceBridge() && origin === 'ui-user'
         ? detectRealtimeQueryIntent(sendingMessage)
         : detectRealtimeQueryIntent('')
+      const requiresImmediateFileToolCall = origin === 'ui-user' && detectFileSystemToolIntent(sendingMessage)
       let policyLockedReason: StructuredPolicyLock | undefined
       const turnToolEvidence: TurnToolEvidence = {
         toolCallCount: 0,
@@ -663,7 +733,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         return `obedience=${turnPersonalityState.obedience.toFixed(2)}, liveliness=${turnPersonalityState.liveliness.toFixed(2)}, sensibility=${turnPersonalityState.sensibility.toFixed(2)}`
       }
       const isLowObedienceDeniedTurn = () =>
-        Boolean(turnPersonalityState && turnPersonalityState.obedience < 0.2 && turnToolEvidence.deniedBySafety)
+        Boolean(turnPersonalityState && turnPersonalityState.obedience <= 0.2 && turnToolEvidence.deniedBySafety)
+      const isLowObedienceHostDeniedTurn = () =>
+        Boolean(turnPersonalityState && turnPersonalityState.obedience <= 0.2 && turnToolEvidence.denialSource === 'host')
 
       const runStructuredContractRetry = async (payload: {
         reasoning: string
@@ -710,6 +782,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               `Violations to fix:\n${payload.validationIssues.map((issue, index) => `${index + 1}. ${issue.message}`).join('\n')}`,
               isLowObedienceDeniedTurn()
                 ? `Mandatory constraint:\n${lowObedienceDeniedRetryDirective}`
+                : '',
+              isLowObedienceHostDeniedTurn()
+                ? lowObedienceHostDeniedRetrySystemOverride
                 : '',
               payload.reasoning.trim()
                 ? `Draft thought:\n${payload.reasoning.trim()}`
@@ -803,6 +878,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         let validationIssues = hasStructuredJsonContract(candidate)
           ? validateStructuredContract(candidate, turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
+              denialSource: turnToolEvidence.denialSource,
             })
           : [
               {
@@ -842,6 +918,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           validationIssues = hasStructuredJsonContract(candidate)
             ? validateStructuredContract(candidate, turnPersonalityState, {
                 toolDenied: turnToolEvidence.deniedBySafety,
+                denialSource: turnToolEvidence.denialSource,
               })
             : [
                 {
@@ -870,8 +947,12 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           ? candidateReply
           : createContractFallbackReply(turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
+              denialSource: turnToolEvidence.denialSource,
             })
-        const fallback = createStructuredFallback(fallbackReply)
+        const fallback = createStructuredFallback(fallbackReply, createContractFallbackEmotion(turnPersonalityState, {
+          toolDenied: turnToolEvidence.deniedBySafety,
+          denialSource: turnToolEvidence.denialSource,
+        }))
         await appendAliceAuditLog({
           level: 'warning',
           category: 'structured-output',
@@ -896,6 +977,10 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         const structured = payload.enforceContract === false
           ? createStructuredFallback(createContractFallbackReply(turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
+              denialSource: turnToolEvidence.denialSource,
+            }), createContractFallbackEmotion(turnPersonalityState, {
+              toolDenied: turnToolEvidence.deniedBySafety,
+              denialSource: turnToolEvidence.denialSource,
             }))
           : await buildStructuredOutputWithGuard(payload)
         if (payload.policyLocked) {
@@ -987,6 +1072,110 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         }, streamingMessageContext)
       }
 
+      const applyAssistantTextFromModelOutput = async (fullText: string) => {
+        if (isStaleGeneration())
+          return
+
+        const finalCategorization = categorizeResponse(fullText, activeProvider.value)
+        const sanitizedOutput = sanitizeAssistantOutputForDisplay(finalCategorization.speech, {
+          realtimeIntent: realtimeIntent.needsRealtime,
+          verifiedToolResult: turnToolEvidence.verifiedToolResult,
+        })
+        const emptyAfterSanitize = !sanitizedOutput.cleanText.trim()
+        const realtimeFallbackApplied = realtimeIntent.needsRealtime
+          && !turnToolEvidence.verifiedToolResult
+          && !policyLockedReason
+        const leakFallbackApplied = sanitizedOutput.leakDetected && emptyAfterSanitize
+        const emptyOutputFallbackApplied = !realtimeFallbackApplied && !leakFallbackApplied && emptyAfterSanitize
+        const sanitizeFallbackReply = policyLockedReason
+          ? assistantEpoch1StrictFallbackReply
+          : assistantLeakFallbackReply
+        let finalSpeech = sanitizedOutput.cleanText
+        if (realtimeFallbackApplied) {
+          finalSpeech = assistantRealtimeUnavailableReply
+        }
+        else if (leakFallbackApplied || emptyOutputFallbackApplied) {
+          finalSpeech = sanitizeFallbackReply
+        }
+
+        if (sanitizedOutput.fabricationDetected) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'output-guard',
+            action: 'output-fabrication-sanitized',
+            message: 'Assistant output contained fabricated execution fragments and was sanitized.',
+            details: {
+              removedCount: sanitizedOutput.fabricationRemovedCount,
+              realtimeIntent: realtimeIntent.needsRealtime,
+              verifiedToolResult: turnToolEvidence.verifiedToolResult,
+            },
+          })
+        }
+
+        if (sanitizedOutput.leakDetected) {
+          await appendAliceAuditLog({
+            level: leakFallbackApplied ? 'warning' : 'notice',
+            category: 'output-guard',
+            action: leakFallbackApplied ? 'sanitize-fallback' : 'sanitize-leak',
+            message: leakFallbackApplied
+              ? 'Assistant output leak detected and fallback reply applied.'
+              : 'Assistant output leak detected and sanitized before display.',
+            details: {
+              removedCount: sanitizedOutput.removedCount,
+              redactedSecrets: sanitizedOutput.redactedSecrets,
+              fallbackApplied: leakFallbackApplied,
+            },
+          })
+        }
+
+        if (emptyOutputFallbackApplied) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'output-guard',
+            action: 'sanitize-empty-fallback',
+            message: 'Assistant output became empty after sanitization; fallback reply applied.',
+            details: {
+              removedCount: sanitizedOutput.removedCount,
+              fabricationDetected: sanitizedOutput.fabricationDetected,
+            },
+          })
+        }
+
+        if (realtimeFallbackApplied) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'output-guard',
+            action: 'realtime-unverified-fallback',
+            message: 'Realtime query did not yield verified tool result; fallback reply applied.',
+            details: {
+              categories: realtimeIntent.categories,
+              toolCallCount: turnToolEvidence.toolCallCount,
+              toolResultCount: turnToolEvidence.toolResultCount,
+              verifiedToolResult: turnToolEvidence.verifiedToolResult,
+            },
+          })
+        }
+
+        await applyAssistantResult({
+          fullText,
+          reasoning: finalCategorization.reasoning,
+          reply: finalSpeech,
+          policyLocked: policyLockedReason,
+        })
+
+        if (buildingMessage.structured?.repairTimedOut) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'structured-output',
+            action: 'repair-timeout-fallback',
+            message: 'Structured output repair exceeded budget and fell back safely.',
+            details: {
+              parsePath: buildingMessage.structured.parsePath,
+            },
+          })
+        }
+      }
+
       const parser = useLlmmarkerParser({
         onLiteral: async (literal) => {
           if (shouldAbort())
@@ -1018,7 +1207,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 || trimmedPrelude.startsWith('\'')
                 || trimmedPrelude.startsWith('```')
 
-            if (isPotentialStructuredPrefix && trimmedPrelude.length < 160)
+            if (isPotentialStructuredPrefix && trimmedPrelude.length < 512)
               return
 
             streamSpeechMode = 'plain'
@@ -1040,107 +1229,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           await hooks.emitTokenSpecialHooks(special, streamingMessageContext)
         },
         onEnd: async (fullText) => {
-          if (isStaleGeneration())
-            return
-
-          const finalCategorization = categorizeResponse(fullText, activeProvider.value)
-          const sanitizedOutput = sanitizeAssistantOutputForDisplay(finalCategorization.speech, {
-            realtimeIntent: realtimeIntent.needsRealtime,
-            verifiedToolResult: turnToolEvidence.verifiedToolResult,
-          })
-          const emptyAfterSanitize = !sanitizedOutput.cleanText.trim()
-          const realtimeFallbackApplied = realtimeIntent.needsRealtime
-            && !turnToolEvidence.verifiedToolResult
-            && !policyLockedReason
-          const leakFallbackApplied = sanitizedOutput.leakDetected && emptyAfterSanitize
-          const emptyOutputFallbackApplied = !realtimeFallbackApplied && !leakFallbackApplied && emptyAfterSanitize
-          const sanitizeFallbackReply = policyLockedReason
-            ? assistantEpoch1StrictFallbackReply
-            : assistantLeakFallbackReply
-          let finalSpeech = sanitizedOutput.cleanText
-          if (realtimeFallbackApplied) {
-            finalSpeech = assistantRealtimeUnavailableReply
-          }
-          else if (leakFallbackApplied || emptyOutputFallbackApplied) {
-            finalSpeech = sanitizeFallbackReply
-          }
-
-          if (sanitizedOutput.fabricationDetected) {
-            await appendAliceAuditLog({
-              level: 'warning',
-              category: 'output-guard',
-              action: 'output-fabrication-sanitized',
-              message: 'Assistant output contained fabricated execution fragments and was sanitized.',
-              details: {
-                removedCount: sanitizedOutput.fabricationRemovedCount,
-                realtimeIntent: realtimeIntent.needsRealtime,
-                verifiedToolResult: turnToolEvidence.verifiedToolResult,
-              },
-            })
-          }
-
-          if (sanitizedOutput.leakDetected) {
-            await appendAliceAuditLog({
-              level: leakFallbackApplied ? 'warning' : 'notice',
-              category: 'output-guard',
-              action: leakFallbackApplied ? 'sanitize-fallback' : 'sanitize-leak',
-              message: leakFallbackApplied
-                ? 'Assistant output leak detected and fallback reply applied.'
-                : 'Assistant output leak detected and sanitized before display.',
-              details: {
-                removedCount: sanitizedOutput.removedCount,
-                redactedSecrets: sanitizedOutput.redactedSecrets,
-                fallbackApplied: leakFallbackApplied,
-              },
-            })
-          }
-
-          if (emptyOutputFallbackApplied) {
-            await appendAliceAuditLog({
-              level: 'warning',
-              category: 'output-guard',
-              action: 'sanitize-empty-fallback',
-              message: 'Assistant output became empty after sanitization; fallback reply applied.',
-              details: {
-                removedCount: sanitizedOutput.removedCount,
-                fabricationDetected: sanitizedOutput.fabricationDetected,
-              },
-            })
-          }
-
-          if (realtimeFallbackApplied) {
-            await appendAliceAuditLog({
-              level: 'warning',
-              category: 'output-guard',
-              action: 'realtime-unverified-fallback',
-              message: 'Realtime query did not yield verified tool result; fallback reply applied.',
-              details: {
-                categories: realtimeIntent.categories,
-                toolCallCount: turnToolEvidence.toolCallCount,
-                toolResultCount: turnToolEvidence.toolResultCount,
-                verifiedToolResult: turnToolEvidence.verifiedToolResult,
-              },
-            })
-          }
-
-          await applyAssistantResult({
-            fullText,
-            reasoning: finalCategorization.reasoning,
-            reply: finalSpeech,
-            policyLocked: policyLockedReason,
-          })
-
-          if (buildingMessage.structured?.repairTimedOut) {
-            await appendAliceAuditLog({
-              level: 'warning',
-              category: 'structured-output',
-              action: 'repair-timeout-fallback',
-              message: 'Structured output repair exceeded budget and fell back safely.',
-              details: {
-                parsePath: buildingMessage.structured.parsePath,
-              },
-            })
-          }
+          await applyAssistantTextFromModelOutput(fullText)
         },
         minLiteralEmitLength: 24,
       })
@@ -1487,6 +1576,12 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         }
       }
 
+      const trackToolDeniedReason = (rawReason: string) => {
+        turnToolEvidence.deniedBySafety = true
+        turnToolEvidence.deniedReason = rawReason
+        turnToolEvidence.denialSource = classifyDeniedSource(rawReason)
+      }
+
       await llmStore.stream(options.model, options.chatProvider, newMessages as Message[], {
         headers,
         tools: options.tools,
@@ -1512,8 +1607,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               {
                 const deniedReason = extractDeniedToolReason(event.result)
                 if (deniedReason) {
-                  turnToolEvidence.deniedBySafety = true
-                  turnToolEvidence.deniedReason = deniedReason
+                  trackToolDeniedReason(deniedReason)
                 }
               }
               toolCallQueue.enqueue({
@@ -1536,6 +1630,114 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       })
 
       await parser.end()
+
+      const shouldForceToolRetry = requiresImmediateFileToolCall
+        && turnToolEvidence.toolCallCount === 0
+        && !policyLockedReason
+        && !abortSignal.aborted
+        && !shouldAbort()
+
+      if (shouldForceToolRetry) {
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'alice.intent-action',
+          action: 'cross-validation-failed',
+          message: 'Detected file/system intent but no tool call was emitted in first pass; forcing tool-capable retry.',
+          details: {
+            sessionId,
+            turnId,
+            toolCallCount: turnToolEvidence.toolCallCount,
+          },
+        })
+
+        const forcedRetryMessages = insertSystemMessageBeforeLatestUser(newMessages as Message[], noToolCallCriticalRetryDirective)
+        const sanitizedRetry = sanitizeForRemoteModel(forcedRetryMessages, { timeBudgetMs: 50, chunkSize: 2048 })
+        if (!sanitizedRetry.blocked) {
+          let forcedRetryFullText = ''
+          await llmStore.stream(options.model, options.chatProvider, sanitizedRetry.messages as Message[], {
+            headers,
+            tools: options.tools,
+            supportsTools: true,
+            waitForTools: true,
+            abortSignal,
+            onStreamEvent: async (event: StreamEvent) => {
+              switch (event.type) {
+                case 'tool-call':
+                  turnToolEvidence.toolCallCount += 1
+                  toolCallQueue.enqueue({
+                    type: 'tool-call',
+                    toolCall: event,
+                  })
+                  break
+                case 'tool-result':
+                  turnToolEvidence.toolResultCount += 1
+                  if (hasVerifiedToolResult(event.result))
+                    turnToolEvidence.verifiedToolResult = true
+                  {
+                    const deniedReason = extractDeniedToolReason(event.result)
+                    if (deniedReason)
+                      trackToolDeniedReason(deniedReason)
+                  }
+                  toolCallQueue.enqueue({
+                    type: 'tool-call-result',
+                    id: event.toolCallId,
+                    result: event.result,
+                  })
+                  break
+                case 'text-delta':
+                  forcedRetryFullText += event.text
+                  break
+                case 'finish':
+                  break
+                case 'error':
+                  throw event.error ?? new Error('Forced tool retry stream error')
+              }
+            },
+          })
+
+          if (forcedRetryFullText.trim()) {
+            // Keep tool slices/results but replace previous textual draft with retry output.
+            buildingMessage.slices = buildingMessage.slices.filter(slice => slice.type !== 'text')
+            buildingMessage.content = ''
+            finalAssistantDisplayText = ''
+            await applyAssistantTextFromModelOutput(forcedRetryFullText)
+            await appendAliceAuditLog({
+              level: 'notice',
+              category: 'alice.intent-action',
+              action: 'contract-retry-forced-tool',
+              message: 'Forced tool-capable retry produced final assistant output.',
+              details: {
+                sessionId,
+                turnId,
+                retryToolCallCount: turnToolEvidence.toolCallCount,
+              },
+            })
+          }
+          else {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'alice.intent-action',
+              action: 'contract-retry-forced-tool-empty',
+              message: 'Forced tool retry finished without textual output.',
+              details: {
+                sessionId,
+                turnId,
+              },
+            })
+          }
+        }
+        else {
+          await appendAliceAuditLog({
+            level: 'critical',
+            category: 'alice.intent-action',
+            action: 'contract-retry-forced-tool-blocked',
+            message: 'Forced tool retry was blocked by sanitize gateway.',
+            details: {
+              reason: sanitizedRetry.reason,
+            },
+          })
+        }
+      }
 
       persistBuiltAssistantMessage()
 

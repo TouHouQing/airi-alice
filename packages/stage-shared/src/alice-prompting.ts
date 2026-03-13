@@ -14,6 +14,7 @@ export const aliceFixedCoreSystemInstruction = [
   '- For any programming code block, always specify the programming language in fenced markdown, eg. ```python ... ```.',
   '- For any math equation, use LaTeX format, eg: $ x^3 $, always escape dollar sign outside math equations.',
   '- Keep response aligned with SOUL identity and relationship constraints.',
+  `[CRITICAL DIRECTIVE]: If the user asks you to read, write, or access a file/desktop/system state, you MUST immediately invoke the corresponding MCP tool (e.g., 'read_file'). DO NOT say "I will read it" without making the tool call. DO NOT hallucinate file contents.`,
   '- Never expose internal tool names, tool parameters JSON, function calls, or secret keys in user-facing replies. Only provide natural-language results.',
   '- For realtime external facts (news/weather/finance/sports), answer only from successful tool results in the current turn.',
   '- If no successful tool result is available, state once that realtime data is unavailable now. Do not output pseudo API code, internal calls, or "please wait" promises.',

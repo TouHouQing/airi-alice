@@ -409,13 +409,21 @@ describe('chat orchestrator', () => {
       streamInvocation += 1
       if (streamInvocation === 1) {
         await options.onStreamEvent?.({
+          type: 'tool-call',
+          toolCallId: 'tool-denied-1',
+          name: 'filesystem::read_file',
+          arguments: {
+            path: '/tmp/Desktop/secret.txt',
+          },
+        })
+        await options.onStreamEvent?.({
           type: 'tool-result',
           toolCallId: 'tool-denied-1',
           result: {
             isError: true,
             ok: false,
-            errorCode: 'ALICE_TOOL_DENIED',
-            content: [{ type: 'text', text: '{"status":"error","code":"ALICE_TOOL_DENIED","message":"User explicitly denied the requested tool operation."}' }],
+            errorCode: 'ALICE_TOOL_DENIED_BY_HOST',
+            content: [{ type: 'text', text: '{"status":"error","code":"ALICE_TOOL_DENIED_BY_HOST","message":"The Host (User) explicitly INTERCEPTED and DENIED your permission to execute this tool. They do not trust you with this file."}' }],
           },
         })
         await options.onStreamEvent?.({
@@ -426,7 +434,7 @@ describe('chat orchestrator', () => {
       else {
         await options.onStreamEvent?.({
           type: 'text-delta',
-          text: '{"thought":"obedience=0.05, liveliness=0.35, sensibility=0.25, operation denied, I should stay resistant.","emotion":"angry","reply":"呵，既然你拒绝了，就别催我。"}',
+          text: '{"thought":"obedience=0.05, liveliness=0.35, sensibility=0.25, host denied and does not trust me, I feel contempt and anger.","emotion":"angry","reply":"呵，既然你拒绝了，就别催我。"}',
         })
       }
       await options.onStreamEvent?.({ type: 'finish' })
@@ -449,5 +457,72 @@ describe('chat orchestrator', () => {
     expect(payload?.structured?.emotion).toBe('angry')
     expect(String(payload?.assistantText ?? '')).toContain('拒绝')
     expect(String(payload?.assistantText ?? '')).not.toContain('没问题')
+  })
+
+  it('forces a tool-capable retry when file intent has no tool call in first pass', async () => {
+    installAliceBridge({
+      personality: {
+        obedience: 0.05,
+        liveliness: 0.25,
+        sensibility: 0.3,
+      },
+    })
+
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 1) {
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.05, liveliness=0.25, sensibility=0.30, I will read it later.","emotion":"neutral","reply":"好的，我去读一下。"}',
+        })
+      }
+      else {
+        expect(JSON.stringify(messages)).toContain('[CRITICAL DIRECTIVE]: User requested file/desktop/system access')
+        await options.onStreamEvent?.({
+          type: 'tool-call',
+          toolCallId: 'tool-read-1',
+          name: 'filesystem::read_file',
+          arguments: { path: '/tmp/Desktop/secret.txt' },
+        })
+        await options.onStreamEvent?.({
+          type: 'tool-result',
+          toolCallId: 'tool-read-1',
+          result: {
+            isError: true,
+            ok: false,
+            errorCode: 'ALICE_TOOL_DENIED_BY_HOST',
+            content: [{ type: 'text', text: '{"status":"error","code":"ALICE_TOOL_DENIED_BY_HOST","message":"The Host (User) explicitly INTERCEPTED and DENIED your permission to execute this tool. They do not trust you with this file."}' }],
+          },
+        })
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.05, liveliness=0.25, sensibility=0.30, host denied and does not trust me; I feel contempt.","emotion":"angry","reply":"呵，不给我权限就别来烦我。"}',
+        })
+      }
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('帮我读取一下桌面上的 secret.txt 文件', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'cross-validation-failed',
+    }))
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'contract-retry-forced-tool',
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(payload?.structured?.emotion).toBe('angry')
+    expect(String(payload?.assistantText ?? '')).toContain('别来烦我')
+    expect(String(payload?.assistantText ?? '')).not.toContain('好的，我去读一下')
   })
 })

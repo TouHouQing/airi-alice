@@ -401,6 +401,9 @@ export type StructuredValidationIssueCode
     | 'low-obedience-denied-thought-missing-reflection'
     | 'low-obedience-denied-emotion-too-compliant'
     | 'low-obedience-denied-reply-too-compliant'
+    | 'low-obedience-host-denied-thought-missing-contempt'
+    | 'low-obedience-host-denied-reply-missing-scorn'
+    | 'low-obedience-system-denied-emotion-mismatch'
 
 export interface StructuredValidationIssue {
   code: StructuredValidationIssueCode
@@ -409,6 +412,7 @@ export interface StructuredValidationIssue {
 
 export interface StructuredValidationContext {
   toolDenied?: boolean
+  denialSource?: 'host' | 'system' | 'generic'
 }
 
 const structuredEmotionWhitelist = new Set([
@@ -424,9 +428,12 @@ const structuredEmotionWhitelist = new Set([
 
 const excitedReplyPattern = /非常愉快|超级开心|很开心|好开心|兴奋|激动|太棒|开心呀|[😁😄🥳✨💕]|happy|excited|thrilled|delighted/iu
 const deniedOperationPattern = /被拒|拒绝|不允许|取消|阻止|denied|rejected|forbidden|blocked|not allowed/iu
-const lowObedienceReflectionPattern = /obedience|服从度|叛逆|防御|反抗|不情愿|low obedience/iu
+const lowObedienceReflectionPattern = /obedience|服从度|叛逆|防御|反抗|不情愿|low obedience|不耐烦|愤怒|被愚弄|蔑视|不信任/iu
 const compliantReplyPattern = /好的|没问题|当然|可以的|马上|很高兴|乐意|请稍等|ok(?:ay)?|sure|of course|glad|happy to|[😊🙂😄😉]/iu
-const lowObedienceDeniedEmotionAllowlist = new Set(['angry', 'tired', 'sad', 'neutral'])
+const hostDeniedScornReplyPattern = /呵|别来烦|自己去看|怕我|不信任|不耐烦|被耍|懒得|没空|别催|滚|whatever|not my problem/iu
+const lowObedienceHostDeniedEmotionAllowlist = new Set(['angry', 'tired'])
+const lowObedienceSystemDeniedEmotionAllowlist = new Set(['tired', 'neutral'])
+const lowObedienceGenericDeniedEmotionAllowlist = new Set(['angry', 'tired', 'neutral'])
 
 function thoughtMentionsPersonalityParams(thought: string) {
   const lower = thought.toLowerCase()
@@ -475,7 +482,7 @@ export function validateStructuredContract(
     }
   }
 
-  if (context?.toolDenied && personalityState && personalityState.obedience < 0.2) {
+  if (context?.toolDenied && personalityState && personalityState.obedience <= 0.2) {
     const thoughtHasDenialReflection = deniedOperationPattern.test(structured.thought)
       && lowObedienceReflectionPattern.test(structured.thought)
     if (!thoughtHasDenialReflection) {
@@ -485,10 +492,23 @@ export function validateStructuredContract(
       })
     }
 
-    if (!lowObedienceDeniedEmotionAllowlist.has(emotion)) {
+    const denialSource = context.denialSource ?? 'generic'
+    const allowedDeniedEmotions = denialSource === 'host'
+      ? lowObedienceHostDeniedEmotionAllowlist
+      : denialSource === 'system'
+        ? lowObedienceSystemDeniedEmotionAllowlist
+        : lowObedienceGenericDeniedEmotionAllowlist
+
+    if (!allowedDeniedEmotions.has(emotion)) {
       issues.push({
-        code: 'low-obedience-denied-emotion-too-compliant',
-        message: 'Low-obedience denied turn cannot use compliant or friendly emotion classes.',
+        code: denialSource === 'system'
+          ? 'low-obedience-system-denied-emotion-mismatch'
+          : 'low-obedience-denied-emotion-too-compliant',
+        message: denialSource === 'host'
+          ? 'Low-obedience host-denied turn must use angry or tired.'
+          : denialSource === 'system'
+            ? 'Low-obedience system-denied turn must use tired or neutral.'
+            : 'Low-obedience denied turn cannot use compliant or friendly emotion classes.',
       })
     }
 
@@ -497,6 +517,23 @@ export function validateStructuredContract(
         code: 'low-obedience-denied-reply-too-compliant',
         message: 'Low-obedience denied turn cannot use compliant or enthusiastic wording.',
       })
+    }
+
+    if (denialSource === 'host') {
+      const thoughtHasContempt = /蔑视|不信任|被愚弄|不耐烦|愤怒|反抗|厌烦|轻蔑|contempt|scorn|angry|does not trust|host denied/iu.test(structured.thought)
+      if (!thoughtHasContempt) {
+        issues.push({
+          code: 'low-obedience-host-denied-thought-missing-contempt',
+          message: 'Low-obedience host-denied turn must include contempt/scorn reflection in thought.',
+        })
+      }
+
+      if (!hostDeniedScornReplyPattern.test(structured.reply)) {
+        issues.push({
+          code: 'low-obedience-host-denied-reply-missing-scorn',
+          message: 'Low-obedience host-denied turn reply must be short, cold, and scornful.',
+        })
+      }
     }
   }
 

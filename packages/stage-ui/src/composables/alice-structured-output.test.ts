@@ -177,4 +177,40 @@ describe('alice structured output', () => {
     expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-emotion-too-compliant')
     expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-reply-too-compliant')
   })
+
+  it('requires angry/tired only when low-obedience turn is denied by host', () => {
+    const issues = validateStructuredContract({
+      thought: 'obedience=0.05, liveliness=0.3, sensibility=0.2, operation denied by host.',
+      emotion: 'neutral',
+      reply: '权限被拒绝了。',
+    }, {
+      obedience: 0.05,
+      liveliness: 0.3,
+      sensibility: 0.2,
+    }, {
+      toolDenied: true,
+      denialSource: 'host',
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-denied-emotion-too-compliant')
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-host-denied-thought-missing-contempt')
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-host-denied-reply-missing-scorn')
+  })
+
+  it('requires tired/neutral only when low-obedience turn is denied by system', () => {
+    const issues = validateStructuredContract({
+      thought: 'obedience=0.05, liveliness=0.3, sensibility=0.2, operation denied by system policy.',
+      emotion: 'angry',
+      reply: '系统拦截了这次操作。',
+    }, {
+      obedience: 0.05,
+      liveliness: 0.3,
+      sensibility: 0.2,
+    }, {
+      toolDenied: true,
+      denialSource: 'system',
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('low-obedience-system-denied-emotion-mismatch')
+  })
 })
