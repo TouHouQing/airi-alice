@@ -4,6 +4,7 @@ import type { InferOutput } from 'valibot'
 import type { I18n } from '../../libs/i18n'
 import type { ServerChannel } from '../../services/airi/channel-server'
 import type { NoticeWindowManager } from '../notice'
+import type { SettingsWindowManager } from '../settings'
 
 import { dirname, join, resolve } from 'node:path'
 import { env } from 'node:process'
@@ -43,7 +44,7 @@ type AppConfig = InferOutput<typeof appConfigSchema>
 const dashboardWindowTitle = 'ALICIZATION Dashboard'
 
 export async function setupDashboardWindow(params: {
-  settingsWindow: () => Promise<BrowserWindow>
+  settingsWindow: SettingsWindowManager
   chatWindow: () => Promise<BrowserWindow>
   noticeWindow: NoticeWindowManager
   onWindowCreated?: (window: BrowserWindow) => void

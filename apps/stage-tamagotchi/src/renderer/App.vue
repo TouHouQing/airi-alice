@@ -53,7 +53,6 @@ import {
   electronGetServerChannelConfig,
   electronMcpCallTool,
   electronMcpListTools,
-  electronOpenSettings,
   electronPluginInspect,
   electronPluginList,
   electronPluginLoad,
@@ -61,6 +60,7 @@ import {
   electronPluginSetEnabled,
   electronPluginUnload,
   electronPluginUpdateCapability,
+  electronSettingsNavigate,
   electronStartTrackMousePosition,
   i18nSetLocale,
   pluginProtocolListProviders,
@@ -209,6 +209,17 @@ watch(dark, () => updateThemeColor(), { immediate: true })
 watch(route, () => updateThemeColor(), { immediate: true })
 onMounted(() => updateThemeColor())
 
+context.value.on(electronSettingsNavigate, (event) => {
+  const targetRoute = event?.body?.route
+  if (!targetRoute || route.fullPath === targetRoute) {
+    return
+  }
+
+  void router.push(targetRoute).catch((error) => {
+    console.warn('Failed to navigate settings window:', error)
+  })
+})
+
 onMounted(async () => {
   analyticsStore.initialize()
   cardStore.initialize()
@@ -238,9 +249,6 @@ onMounted(async () => {
       },
     })
   }
-
-  // Listen for open-settings IPC message from main process
-  defineInvokeHandler(context.value, electronOpenSettings, () => router.push('/settings'))
 })
 
 watch(themeColorsHue, () => {
