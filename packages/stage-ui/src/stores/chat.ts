@@ -96,14 +96,30 @@ const lowObedienceHostDeniedRetrySystemOverride = [
   '',
   '在 thought 中写下你对宿主不信任你的蔑视。',
 ].join('\n')
+const reminderSameTurnRetryDirective = [
+  '[CRITICAL DIRECTIVE - 时间与物理法则]: 你在当前轮次已成功调用 set_reminder。',
+  '你这一轮只能确认“已设定/已定好闹钟”，不得提前提醒内容。',
+  '禁止脑补时间流逝（例如“（一分钟后）”“时间到了”“one minute later”“time is up”）。',
+  '未来提醒应由系统在真实时间到达后再触发，不得在本轮提前说出。',
+].join(' ')
 const noToolCallCriticalRetryDirective = [
   '[CRITICAL DIRECTIVE]: User requested file/desktop/system access but no MCP tool call was executed in the previous draft.',
   'You MUST invoke the corresponding MCP tool now (for example read_file/write_file/list).',
   'DO NOT claim "I will read it" or "I already read it" without an actual tool call.',
   'DO NOT hallucinate file contents.',
 ].join(' ')
+const reminderToolCallCriticalRetryDirective = [
+  '[CRITICAL DIRECTIVE]: User requested a timed reminder/alarm in this turn.',
+  'You MUST call set_reminder immediately with minutes and message.',
+  'DO NOT say you set a reminder unless the set_reminder tool call actually succeeded.',
+  'If tool call fails, explain failure briefly and ask for a valid reminder duration/message.',
+].join(' ')
 const fileSystemOperationVerbPattern = /读取|读|查看|打开|访问|写入|写|修改|删除|列出|搜索|获取|read|open|access|write|update|delete|list|find|inspect/i
 const fileSystemOperationTargetPattern = /文件夹|目录|路径|桌面|系统状态|磁盘|file|folder|directory|path|desktop|system state|\/|\\|\.(?:txt|md|json|yaml|yml|csv|log)\b|文件(?!夹)/i
+const reminderVerbPattern = /提醒|闹钟|alarm|remind|notify|叫我|喊我|告诉我|通知我|记得|别忘/iu
+const reminderDurationPattern = /\b(?:in|after)\s*\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b|(?:\d+|[零一二两三四五六七八九十百半几]+)\s*(?:秒钟?|分钟?|小时|时|天)(?:\s*之?后)?/iu
+const reminderChineseNaturalPattern = /(?:\d+|[零一二两三四五六七八九十百半几]+)\s*(?:秒钟?|分钟?|小时|时|天)(?:\s*之?后)?[\s，,。！!]*(?:提醒我|叫我|喊我|告诉我|通知我|记得|别忘)/u
+const reminderEnglishNaturalPattern = /(?:^|\s)(?:in|after)\s*\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\s*(?:[,.:;!?-]\s*)?(?:remind|notify|tell)\s+me\b/iu
 const strictRealtimeRefusalSystemPrompt = [
   '[System Lock]',
   'User request requires realtime external access, but current runtime is locked in Epoch 1 strict mode.',
@@ -128,6 +144,140 @@ interface TurnToolEvidence {
   deniedBySafety: boolean
   deniedReason?: string
   denialSource?: 'host' | 'system' | 'generic'
+  reminderToolCallIds: Set<string>
+  reminderScheduled: boolean
+  reminderMessage?: string
+}
+
+const chineseNumberDigits: Record<string, number> = {
+  零: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+  十: 10,
+  百: 100,
+  几: 3,
+}
+
+function parseChineseNumberToken(raw: string): number | null {
+  const token = raw.trim()
+  if (!token)
+    return null
+  if (token === '半')
+    return 0.5
+
+  const arabic = Number(token)
+  if (Number.isFinite(arabic))
+    return arabic
+
+  if (token.includes('百')) {
+    const [head, tail] = token.split('百')
+    const hundreds = head ? (chineseNumberDigits[head] ?? 1) : 1
+    const tailValue: number = tail ? (parseChineseNumberToken(tail) ?? 0) : 0
+    return hundreds * 100 + tailValue
+  }
+
+  if (token.includes('十')) {
+    const [head, tail] = token.split('十')
+    const tens = head ? (chineseNumberDigits[head] ?? 0) : 1
+    const ones = tail ? (chineseNumberDigits[tail] ?? 0) : 0
+    return tens * 10 + ones
+  }
+
+  const direct = chineseNumberDigits[token]
+  if (typeof direct === 'number')
+    return direct
+  return null
+}
+
+function normalizeReminderMessageForFallback(raw: string) {
+  return raw
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function parseReminderIntentPayload(message: string): { minutes: number, message: string } | null {
+  const normalized = message.trim()
+  if (!normalized)
+    return null
+
+  let minutes: number | null = null
+  const englishDurationMatch = normalized.match(/\b(?:in|after)\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b/i)
+  if (englishDurationMatch) {
+    const value = Number(englishDurationMatch[1])
+    const unit = englishDurationMatch[2]?.toLowerCase() ?? ''
+    if (Number.isFinite(value) && value > 0) {
+      if (unit.startsWith('second') || unit.startsWith('sec'))
+        minutes = Math.max(1, Math.ceil(value / 60))
+      else if (unit.startsWith('minute') || unit.startsWith('min'))
+        minutes = Math.max(1, Math.ceil(value))
+      else if (unit.startsWith('hour') || unit.startsWith('hr'))
+        minutes = Math.max(1, Math.ceil(value * 60))
+      else if (unit.startsWith('day'))
+        minutes = Math.max(1, Math.ceil(value * 24 * 60))
+    }
+  }
+
+  if (minutes === null) {
+    const chineseDurationMatch = normalized.match(/([零一二两三四五六七八九十百半几\d]+)\s*(秒钟?|分钟?|小时|时|天)(?:\s*之?后)?/u)
+    if (chineseDurationMatch) {
+      const value = parseChineseNumberToken(chineseDurationMatch[1] ?? '')
+      const unit = chineseDurationMatch[2] ?? ''
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        if (unit.startsWith('秒'))
+          minutes = Math.max(1, Math.ceil(value / 60))
+        else if (unit.startsWith('分'))
+          minutes = Math.max(1, Math.ceil(value))
+        else if (unit === '小时' || unit === '时')
+          minutes = Math.max(1, Math.ceil(value * 60))
+        else if (unit === '天')
+          minutes = Math.max(1, Math.ceil(value * 24 * 60))
+      }
+    }
+  }
+
+  if (minutes === null)
+    return null
+
+  const englishMessageMatch = normalized.match(/\b(?:remind|notify|tell)\s+me(?:\s+to)?\s(.+)$/iu)
+  const chineseReminderRemainder = (() => {
+    const cues = ['提醒我', '叫我', '喊我', '告诉我', '通知我', '记得', '别忘了', '别忘']
+    for (const cue of cues) {
+      const cueIndex = normalized.lastIndexOf(cue)
+      if (cueIndex < 0)
+        continue
+      const remainder = normalized.slice(cueIndex + cue.length).trim()
+      if (remainder)
+        return remainder
+    }
+    return ''
+  })()
+  let reminderMessage = normalizeReminderMessageForFallback(
+    (chineseReminderRemainder || englishMessageMatch?.[1] || '').replace(/[。！!，,；;]+$/g, ''),
+  )
+  if (!reminderMessage) {
+    reminderMessage = normalizeReminderMessageForFallback(
+      normalized
+        .replace(reminderDurationPattern, '')
+        .replace(reminderVerbPattern, '')
+        .replace(/[。！!，,；;]+/g, ' ')
+        .trim(),
+    )
+  }
+  if (!reminderMessage)
+    reminderMessage = '你刚才设定的事项'
+
+  return {
+    minutes,
+    message: reminderMessage,
+  }
 }
 
 type StructuredWithContract = StructuredOutputResult & {
@@ -141,6 +291,17 @@ function detectFileSystemToolIntent(message: string) {
   if (!normalized)
     return false
   return fileSystemOperationVerbPattern.test(normalized) && fileSystemOperationTargetPattern.test(normalized)
+}
+
+function detectReminderToolIntent(message: string) {
+  const normalized = message.trim()
+  if (!normalized)
+    return false
+  if (!reminderDurationPattern.test(normalized))
+    return false
+  if (reminderVerbPattern.test(normalized))
+    return true
+  return reminderChineseNaturalPattern.test(normalized) || reminderEnglishNaturalPattern.test(normalized)
 }
 
 function insertSystemMessageBeforeLatestUser(messages: Message[], systemText: string): Message[] {
@@ -204,6 +365,17 @@ type StreamFailureKind
 
 function resolveStreamFailureFallback(error: unknown): { reply: string, kind: StreamFailureKind } {
   const message = String(error instanceof Error ? error.message : error ?? '').toLowerCase()
+  if (
+    message.includes('state=duplicate-running')
+    || message.includes('state=duplicate-finished')
+    || message.includes('duplicate-running')
+    || message.includes('duplicate-finished')
+  ) {
+    return {
+      reply: assistantStreamFailureFallbackReply,
+      kind: 'runtime-aborted',
+    }
+  }
   if (
     message.includes('stream start rejected')
     || message.includes('missing providerid/model')
@@ -491,6 +663,41 @@ function classifyDeniedSource(deniedReason?: string): 'host' | 'system' | 'gener
   return 'generic'
 }
 
+function extractScheduledReminderPayload(result?: unknown): { scheduled: boolean, message?: string } {
+  const parseFromObject = (value: Record<string, unknown>) => {
+    const status = typeof value.status === 'string' ? value.status.toLowerCase() : ''
+    if (status !== 'scheduled')
+      return null
+    const message = typeof value.message === 'string' ? value.message.trim() : ''
+    return {
+      scheduled: true,
+      message: message || undefined,
+    }
+  }
+
+  if (!result || typeof result !== 'object')
+    return { scheduled: false }
+
+  const payload = result as Record<string, unknown>
+  const direct = parseFromObject(payload)
+  if (direct)
+    return direct
+
+  if (payload.toolResult && typeof payload.toolResult === 'object') {
+    const nested = parseFromObject(payload.toolResult as Record<string, unknown>)
+    if (nested)
+      return nested
+  }
+
+  if (payload.structuredContent && typeof payload.structuredContent === 'object') {
+    const nested = parseFromObject(payload.structuredContent as Record<string, unknown>)
+    if (nested)
+      return nested
+  }
+
+  return { scheduled: false }
+}
+
 function hasStructuredJsonContract(structured: StructuredOutputResult | undefined) {
   if (!structured?.parsePath)
     return false
@@ -517,7 +724,7 @@ function summarizeValidationIssues(issues: StructuredValidationIssue[]) {
 
 function createContractFallbackReply(
   personalityState?: AlicePersonalityState | null,
-  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic' },
+  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic', reminderScheduled?: boolean },
 ) {
   if (options?.toolDenied && options.denialSource === 'host' && personalityState && personalityState.obedience <= 0.2) {
     return '呵，不给我权限就别来烦我。'
@@ -535,7 +742,7 @@ function createContractFallbackReply(
 
 function createContractFallbackEmotion(
   personalityState?: AlicePersonalityState | null,
-  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic' },
+  options?: { toolDenied?: boolean, denialSource?: 'host' | 'system' | 'generic', reminderScheduled?: boolean },
 ): StructuredOutputResult['emotion'] {
   if (options?.toolDenied && personalityState && personalityState.obedience <= 0.2) {
     if (options.denialSource === 'host' || options.denialSource === 'system')
@@ -810,7 +1017,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       if (shouldAbort())
         return
 
-      userTurnMessageId = nanoid()
+      // NOTICE: Keep the user message id deterministic per turn so renderer-side
+      // replay/reconcile can upsert instead of inserting duplicates.
+      userTurnMessageId = `${turnId}:user`
       sessionMessagesForSend.push({ role: 'user', content: finalContent, createdAt: sendingCreatedAt, id: userTurnMessageId })
       chatSession.persistSessionMessages(sessionId)
 
@@ -820,13 +1029,20 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         ? detectRealtimeQueryIntent(sendingMessage)
         : detectRealtimeQueryIntent('')
       const requiresImmediateFileToolCall = origin === 'ui-user' && detectFileSystemToolIntent(sendingMessage)
+      const requiresReminderToolCall = origin === 'ui-user' && detectReminderToolIntent(sendingMessage)
+      const parsedReminderIntent = requiresReminderToolCall
+        ? parseReminderIntentPayload(sendingMessage)
+        : null
       let policyLockedReason: StructuredPolicyLock | undefined
       const turnToolEvidence: TurnToolEvidence = {
         toolCallCount: 0,
         toolResultCount: 0,
         verifiedToolResult: false,
         deniedBySafety: false,
+        reminderToolCallIds: new Set<string>(),
+        reminderScheduled: false,
       }
+      let bridgeStreamAttemptSeq = 0
       const headers = (options.providerConfig?.headers || {}) as Record<string, string>
       const streamWithRuntimeGateway = async (
         messages: Message[],
@@ -919,11 +1135,13 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               idleTimeoutMs: runtimeGatewayIdleTimeoutMs,
             },
           ) => {
+            bridgeStreamAttemptSeq += 1
+            const bridgeAttemptTurnId = `${turnId}:gw${bridgeStreamAttemptSeq}`
             let sawProgress = false
             try {
               await withStreamWatchdog(async ({ touch }) => {
                 await bridgeStreamChat({
-                  turnId,
+                  turnId: bridgeAttemptTurnId,
                   providerId: activeProvider.value || '',
                   model: options.model,
                   providerConfig: options.providerConfig ?? {},
@@ -945,7 +1163,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 idleTimeoutMs: timeoutOptions.idleTimeoutMs,
                 onTimeout: () => {
                   void bridge?.chatAbort?.({
-                    turnId,
+                    turnId: bridgeAttemptTurnId,
                     reason: 'stream-timeout',
                   }).catch(() => {})
                 },
@@ -1098,6 +1316,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             violations: summarizeValidationIssues(payload.validationIssues),
             deniedBySafety: turnToolEvidence.deniedBySafety,
             deniedReason: turnToolEvidence.deniedReason,
+            reminderScheduled: turnToolEvidence.reminderScheduled,
           },
         })
 
@@ -1119,6 +1338,9 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 : '',
               isLowObedienceHostDeniedTurn()
                 ? lowObedienceHostDeniedRetrySystemOverride
+                : '',
+              turnToolEvidence.reminderScheduled
+                ? `Mandatory constraint:\n${reminderSameTurnRetryDirective}`
                 : '',
               payload.reasoning.trim()
                 ? `Draft thought:\n${payload.reasoning.trim()}`
@@ -1213,6 +1435,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           ? validateStructuredContract(candidate, turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
               denialSource: turnToolEvidence.denialSource,
+              reminderScheduled: turnToolEvidence.reminderScheduled,
+              reminderMessage: turnToolEvidence.reminderMessage,
             })
           : [
               {
@@ -1237,6 +1461,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               violations: summarizeValidationIssues(validationIssues),
               deniedBySafety: turnToolEvidence.deniedBySafety,
               deniedReason: turnToolEvidence.deniedReason,
+              reminderScheduled: turnToolEvidence.reminderScheduled,
             },
           })
 
@@ -1253,6 +1478,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             ? validateStructuredContract(candidate, turnPersonalityState, {
                 toolDenied: turnToolEvidence.deniedBySafety,
                 denialSource: turnToolEvidence.denialSource,
+                reminderScheduled: turnToolEvidence.reminderScheduled,
+                reminderMessage: turnToolEvidence.reminderMessage,
               })
             : [
                 {
@@ -1282,10 +1509,12 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           : createContractFallbackReply(turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
               denialSource: turnToolEvidence.denialSource,
+              reminderScheduled: turnToolEvidence.reminderScheduled,
             })
         const fallback = createStructuredFallback(fallbackReply, createContractFallbackEmotion(turnPersonalityState, {
           toolDenied: turnToolEvidence.deniedBySafety,
           denialSource: turnToolEvidence.denialSource,
+          reminderScheduled: turnToolEvidence.reminderScheduled,
         }))
         await appendAliceAuditLog({
           level: 'warning',
@@ -1312,9 +1541,11 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           ? createStructuredFallback(createContractFallbackReply(turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
               denialSource: turnToolEvidence.denialSource,
+              reminderScheduled: turnToolEvidence.reminderScheduled,
             }), createContractFallbackEmotion(turnPersonalityState, {
               toolDenied: turnToolEvidence.deniedBySafety,
               denialSource: turnToolEvidence.denialSource,
+              reminderScheduled: turnToolEvidence.reminderScheduled,
             }))
           : await buildStructuredOutputWithGuard(payload)
         if (payload.policyLocked) {
@@ -1510,9 +1741,15 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         }
       }
 
+      const deferReminderDraftDisplay = requiresReminderToolCall
+      let reminderDisplayApplied = false
+      let forcedReminderRetryText = ''
+
       const parser = useLlmmarkerParser({
         onLiteral: async (literal) => {
           if (shouldAbort())
+            return
+          if (deferReminderDraftDisplay)
             return
 
           categorizer.consume(literal)
@@ -1563,6 +1800,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           await hooks.emitTokenSpecialHooks(special, streamingMessageContext)
         },
         onEnd: async (fullText) => {
+          if (deferReminderDraftDisplay)
+            return
           await applyAssistantTextFromModelOutput(fullText)
         },
         minLiteralEmitLength: 24,
@@ -1930,6 +2169,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           switch (event.type) {
             case 'tool-call':
               turnToolEvidence.toolCallCount += 1
+              if (event.toolName === 'set_reminder' && event.toolCallId)
+                turnToolEvidence.reminderToolCallIds.add(event.toolCallId)
               toolCallQueue.enqueue({
                 type: 'tool-call',
                 toolCall: event,
@@ -1940,6 +2181,14 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               turnToolEvidence.toolResultCount += 1
               if (hasVerifiedToolResult(event.result))
                 turnToolEvidence.verifiedToolResult = true
+              if (turnToolEvidence.reminderToolCallIds.has(event.toolCallId)) {
+                const reminderPayload = extractScheduledReminderPayload(event.result)
+                if (reminderPayload.scheduled) {
+                  turnToolEvidence.reminderScheduled = true
+                  if (reminderPayload.message)
+                    turnToolEvidence.reminderMessage = reminderPayload.message
+                }
+              }
               {
                 const deniedReason = extractDeniedToolReason(event.result)
                 if (deniedReason) {
@@ -1967,26 +2216,39 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
       await parser.end()
 
-      const shouldForceToolRetry = requiresImmediateFileToolCall
+      const shouldForceFileToolRetry = requiresImmediateFileToolCall
         && turnToolEvidence.toolCallCount === 0
         && !policyLockedReason
         && !abortSignal.aborted
         && !shouldAbort()
 
-      if (shouldForceToolRetry) {
+      const shouldForceReminderToolRetry = requiresReminderToolCall
+        && turnToolEvidence.reminderToolCallIds.size === 0
+        && !policyLockedReason
+        && !abortSignal.aborted
+        && !shouldAbort()
+
+      if (shouldForceFileToolRetry || shouldForceReminderToolRetry) {
         await appendAliceAuditLog({
           level: 'warning',
           category: 'alice.intent-action',
           action: 'cross-validation-failed',
-          message: 'Detected file/system intent but no tool call was emitted in first pass; forcing tool-capable retry.',
+          message: 'Detected intent-action mismatch before finalization; forcing tool-capable retry.',
           details: {
             sessionId,
             turnId,
             toolCallCount: turnToolEvidence.toolCallCount,
+            reminderToolCallCount: turnToolEvidence.reminderToolCallIds.size,
+            requiresImmediateFileToolCall,
+            requiresReminderToolCall,
           },
         })
 
-        const forcedRetryMessages = insertSystemMessageBeforeLatestUser(newMessages as Message[], noToolCallCriticalRetryDirective)
+        const forcedToolDirectives = [
+          shouldForceFileToolRetry ? noToolCallCriticalRetryDirective : '',
+          shouldForceReminderToolRetry ? reminderToolCallCriticalRetryDirective : '',
+        ].filter(Boolean).join('\n')
+        const forcedRetryMessages = insertSystemMessageBeforeLatestUser(newMessages as Message[], forcedToolDirectives)
         const sanitizedRetry = sanitizeForRemoteModel(forcedRetryMessages, { timeBudgetMs: 50, chunkSize: 2048 })
         if (!sanitizedRetry.blocked) {
           let forcedRetryFullText = ''
@@ -2000,6 +2262,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
               switch (event.type) {
                 case 'tool-call':
                   turnToolEvidence.toolCallCount += 1
+                  if (event.toolName === 'set_reminder' && event.toolCallId)
+                    turnToolEvidence.reminderToolCallIds.add(event.toolCallId)
                   toolCallQueue.enqueue({
                     type: 'tool-call',
                     toolCall: event,
@@ -2009,6 +2273,14 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                   turnToolEvidence.toolResultCount += 1
                   if (hasVerifiedToolResult(event.result))
                     turnToolEvidence.verifiedToolResult = true
+                  if (turnToolEvidence.reminderToolCallIds.has(event.toolCallId)) {
+                    const reminderPayload = extractScheduledReminderPayload(event.result)
+                    if (reminderPayload.scheduled) {
+                      turnToolEvidence.reminderScheduled = true
+                      if (reminderPayload.message)
+                        turnToolEvidence.reminderMessage = reminderPayload.message
+                    }
+                  }
                   {
                     const deniedReason = extractDeniedToolReason(event.result)
                     if (deniedReason)
@@ -2036,7 +2308,12 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             buildingMessage.slices = buildingMessage.slices.filter(slice => slice.type !== 'text')
             buildingMessage.content = ''
             finalAssistantDisplayText = ''
-            await applyAssistantTextFromModelOutput(forcedRetryFullText)
+            if (requiresReminderToolCall) {
+              forcedReminderRetryText = forcedRetryFullText
+            }
+            else {
+              await applyAssistantTextFromModelOutput(forcedRetryFullText)
+            }
             await appendAliceAuditLog({
               level: 'notice',
               category: 'alice.intent-action',
@@ -2046,6 +2323,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 sessionId,
                 turnId,
                 retryToolCallCount: turnToolEvidence.toolCallCount,
+                retryReminderToolCallCount: turnToolEvidence.reminderToolCallIds.size,
+                reminderScheduled: turnToolEvidence.reminderScheduled,
               },
             })
           }
@@ -2070,9 +2349,138 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
             message: 'Forced tool retry was blocked by sanitize gateway.',
             details: {
               reason: sanitizedRetry.reason,
+              requiresImmediateFileToolCall,
+              requiresReminderToolCall,
             },
           })
         }
+      }
+
+      let reminderScheduledByFallback = false
+      if (requiresReminderToolCall && !turnToolEvidence.reminderScheduled) {
+        const reminderScheduleBridge = hasAliceBridge() ? getAliceBridge().reminderSchedule : undefined
+        if (reminderScheduleBridge && parsedReminderIntent) {
+          try {
+            const scheduledResult = await reminderScheduleBridge({
+              minutes: parsedReminderIntent.minutes,
+              message: parsedReminderIntent.message,
+              sourceTurnId: turnId,
+            })
+            const reminderPayload = extractScheduledReminderPayload(scheduledResult)
+            if (reminderPayload.scheduled) {
+              turnToolEvidence.reminderScheduled = true
+              turnToolEvidence.reminderMessage = reminderPayload.message ?? parsedReminderIntent.message
+              reminderScheduledByFallback = true
+              await appendAliceAuditLog({
+                level: 'notice',
+                category: 'alice.intent-action',
+                action: 'reminder-manual-schedule-fallback',
+                message: 'Reminder scheduling fallback created a persisted reminder task.',
+                details: {
+                  sessionId,
+                  turnId,
+                  minutes: parsedReminderIntent.minutes,
+                  message: parsedReminderIntent.message,
+                },
+              })
+            }
+            else {
+              await appendAliceAuditLog({
+                level: 'warning',
+                category: 'alice.intent-action',
+                action: 'reminder-manual-schedule-fallback-failed',
+                message: 'Reminder scheduling fallback returned a non-scheduled result.',
+                details: {
+                  sessionId,
+                  turnId,
+                  result: scheduledResult,
+                },
+              })
+            }
+          }
+          catch (error) {
+            await appendAliceAuditLog({
+              level: 'warning',
+              category: 'alice.intent-action',
+              action: 'reminder-manual-schedule-fallback-error',
+              message: 'Reminder scheduling fallback failed with an exception.',
+              details: {
+                sessionId,
+                turnId,
+                reason: error instanceof Error ? error.message : String(error),
+              },
+            })
+          }
+        }
+        else if (!parsedReminderIntent) {
+          await appendAliceAuditLog({
+            level: 'warning',
+            category: 'alice.intent-action',
+            action: 'reminder-manual-schedule-parse-failed',
+            message: 'Reminder intent detected but fallback parser could not derive minutes/message.',
+            details: {
+              sessionId,
+              turnId,
+              inputPreview: sendingMessage.slice(0, 160),
+            },
+          })
+        }
+      }
+
+      if (requiresReminderToolCall && !reminderDisplayApplied) {
+        const reminderText = (fullText || forcedReminderRetryText).trim()
+        if (reminderText) {
+          await applyAssistantTextFromModelOutput(reminderText)
+          reminderDisplayApplied = true
+        }
+      }
+
+      if (requiresReminderToolCall && !turnToolEvidence.reminderScheduled) {
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'alice.intent-action',
+          action: 'reminder-schedule-missing',
+          message: 'Reminder intent detected but no successful set_reminder result observed.',
+          details: {
+            sessionId,
+            turnId,
+            reminderToolCallCount: turnToolEvidence.reminderToolCallIds.size,
+          },
+        })
+
+        const reminderFailureReply = '我这轮还没有成功设置提醒。请再说一次具体时长（例如“1分钟后提醒我喝水”），我会立即调用系统闹钟工具。'
+        buildingMessage.slices = buildingMessage.slices.filter(slice => slice.type !== 'text')
+        buildingMessage.structured = createStructuredFallback(reminderFailureReply, 'concerned')
+        buildingMessage.categorization = {
+          speech: reminderFailureReply,
+          reasoning: '',
+        }
+        buildingMessage.content = reminderFailureReply
+        buildingMessage.slices = replaceAssistantTextSlices(buildingMessage.slices, reminderFailureReply)
+        finalAssistantDisplayText = reminderFailureReply
+        updateUI()
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'alice.intent-action',
+          action: 'reminder-schedule-safe-reply',
+          message: 'Replaced draft reply with safe reminder failure response because no set_reminder success was observed.',
+          details: {
+            sessionId,
+            turnId,
+          },
+        })
+      }
+      else if (requiresReminderToolCall && reminderScheduledByFallback) {
+        await appendAliceAuditLog({
+          level: 'notice',
+          category: 'alice.intent-action',
+          action: 'reminder-schedule-kept-llm-reply',
+          message: 'Reminder fallback scheduling succeeded; keeping model-generated confirmation text without post-hoc replacement.',
+          details: {
+            sessionId,
+            turnId,
+          },
+        })
       }
 
       persistBuiltAssistantMessage()

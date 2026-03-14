@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AliceBridgeChatStreamEvent } from '@proj-airi/stage-ui/stores/alice-bridge'
 
-import type { AliceChatAbortPayload, AliceChatAbortResult, AliceChatErrorEvent, AliceChatFinishEvent, AliceChatStartPayload, AliceChatStartResult, AliceChatStreamChunkEvent, AliceChatStreamDispatchPayload, AliceChatToolCallEvent, AliceChatToolResultEvent, AliceSafetyPermissionRequest } from '../shared/eventa'
+import type { AliceChatAbortPayload, AliceChatAbortResult, AliceChatErrorEvent, AliceChatFinishEvent, AliceChatStartPayload, AliceChatStartResult, AliceChatStreamChunkEvent, AliceChatStreamDispatchPayload, AliceChatToolCallEvent, AliceChatToolResultEvent, AliceDialogueRespondedPayload, AliceLlmConfigPayload, AliceSafetyPermissionRequest } from '../shared/eventa'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import { useElectronEventaContext, useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
@@ -49,11 +49,14 @@ import {
 
   aliceSafetyPermissionRequested,
   aliceSoulChanged,
+  electronAliceAckDialogue,
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
   electronAliceChatAbort,
   electronAliceChatStart,
+  electronAliceClearAllConversations,
+  electronAliceDeleteAllData,
   electronAliceDeleteCardScope,
   electronAliceGetMemoryStats,
   electronAliceGetSensorySnapshot,
@@ -62,12 +65,15 @@ import {
   electronAliceKillSwitchGetState,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceListConversationTurns,
   electronAliceLlmGetConfig,
   electronAliceLlmSyncConfig,
   electronAliceMemoryImportLegacy,
   electronAliceMemoryRetrieveFacts,
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
+  electronAliceReminderSchedule,
+  electronAliceReplayDialogues,
   electronAliceRunMemoryPrune,
   electronAliceSafetyResolvePermission,
   electronAliceSetActiveSession,
@@ -145,6 +151,7 @@ const aliceUpdatePersonality = useElectronEventaInvoke(electronAliceUpdatePerson
 const aliceGetKillSwitchState = useElectronEventaInvoke(electronAliceKillSwitchGetState)
 const aliceSuspendKillSwitch = useElectronEventaInvoke(electronAliceKillSwitchSuspend)
 const aliceResumeKillSwitch = useElectronEventaInvoke(electronAliceKillSwitchResume)
+const aliceListConversationTurns = useElectronEventaInvoke(electronAliceListConversationTurns)
 const aliceGetMemoryStats = useElectronEventaInvoke(electronAliceGetMemoryStats)
 const aliceRunMemoryPrune = useElectronEventaInvoke(electronAliceRunMemoryPrune)
 const aliceUpdateMemoryStats = useElectronEventaInvoke(electronAliceUpdateMemoryStats)
@@ -161,9 +168,14 @@ const aliceForceSubconsciousTick = useElectronEventaInvoke(electronAliceSubconsc
 const aliceForceDreaming = useElectronEventaInvoke(electronAliceSubconsciousForceDream)
 const aliceSyncLlmConfig = useElectronEventaInvoke(electronAliceLlmSyncConfig)
 const aliceGetLlmConfig = useElectronEventaInvoke(electronAliceLlmGetConfig)
+const aliceAckDialogue = useElectronEventaInvoke(electronAliceAckDialogue)
+const aliceReplayDialogues = useElectronEventaInvoke(electronAliceReplayDialogues)
 const aliceChatStart = useElectronEventaInvoke(electronAliceChatStart)
 const aliceChatAbort = useElectronEventaInvoke(electronAliceChatAbort)
+const aliceReminderSchedule = useElectronEventaInvoke(electronAliceReminderSchedule)
+const aliceClearAllConversations = useElectronEventaInvoke(electronAliceClearAllConversations)
 const aliceDeleteCardScope = useElectronEventaInvoke(electronAliceDeleteCardScope)
+const aliceDeleteAllData = useElectronEventaInvoke(electronAliceDeleteAllData)
 const aliceResolvePermission = useElectronEventaInvoke(electronAliceSafetyResolvePermission)
 
 const resolveAliceScope = () => ({ cardId: activeCardId.value || 'default' })
@@ -173,11 +185,18 @@ const pendingHitlRequests = ref<AliceSafetyPermissionRequest[]>([])
 const hitlResolving = ref(false)
 let llmSyncTimer: ReturnType<typeof setTimeout> | undefined
 let lastLlmSyncSignature = ''
+let llmConfigHydrating = false
+const llmConfigHydrated = ref(false)
 const pendingAliceChatStreams = new Map<string, {
   onStreamEvent?: (event: AliceBridgeChatStreamEvent) => Promise<void> | void
   resolve: () => void
   reject: (error: unknown) => void
 }>()
+const proactiveBackfillInFlight = new Set<string>()
+const sessionReconcileInFlight = new Set<string>()
+const handledDialogueRespondedKeys = new Set<string>()
+const handledDialogueRespondedQueue: string[] = []
+const handledDialogueRespondedMax = 600
 
 function aliceChatStreamKey(cardId: string, turnId: string) {
   return `${cardId}:${turnId}`
@@ -201,6 +220,422 @@ function estimateJsonPayloadBytes(value: unknown) {
   }
   catch {
     return null
+  }
+}
+
+function cloneProviderCredentials() {
+  return JSON.parse(JSON.stringify(providers.value || {})) as Record<string, Record<string, unknown>>
+}
+
+function createLlmConfigPayload(): AliceLlmConfigPayload {
+  return {
+    activeProviderId: activeProvider.value || '',
+    activeModelId: activeModel.value || '',
+    providerCredentials: cloneProviderCredentials(),
+  }
+}
+
+function normalizeCreatedAt(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : Date.now()
+}
+
+async function acknowledgeDialogueDelivery(sessionIdRaw: string, turnIdRaw: string, createdAtRaw: unknown) {
+  const sessionId = sessionIdRaw.trim()
+  const turnId = turnIdRaw.trim()
+  if (!sessionId || !turnId)
+    return
+  const createdAt = normalizeCreatedAt(createdAtRaw)
+  try {
+    await aliceAckDialogue({
+      ...resolveAliceScope(),
+      sessionId,
+      turnId,
+      createdAt,
+    })
+  }
+  catch (error) {
+    console.warn('[alice-renderer] failed to ack proactive dialogue delivery:', error)
+  }
+}
+
+async function upsertProactiveAssistantTurn(payload: {
+  sessionId: string
+  turnId: string
+  assistantText: string
+  structured?: Record<string, unknown> | null
+  createdAt: number
+  setActive?: boolean
+}) {
+  const sessionId = payload.sessionId.trim()
+  const turnId = payload.turnId.trim()
+  const assistantText = payload.assistantText.trim()
+  if (!sessionId || !turnId || !assistantText)
+    return
+
+  const ensuredSessionId = await chatSessionStore.ensureExternalSession(sessionId, {
+    setActive: payload.setActive === true,
+  })
+  if (!ensuredSessionId)
+    return
+
+  const normalizedCreatedAt = normalizeCreatedAt(payload.createdAt)
+  const structuredThought = typeof payload.structured?.thought === 'string'
+    ? payload.structured.thought.trim()
+    : ''
+  const structuredEmotion = typeof payload.structured?.emotion === 'string'
+    ? payload.structured.emotion.trim()
+    : 'neutral'
+  const structuredFormat: 'epoch1-v1' | 'fallback-v1'
+    = payload.structured?.format === 'epoch1-v1'
+      ? 'epoch1-v1'
+      : 'fallback-v1'
+
+  const sessionMessages = chatSessionStore.getSessionMessages(ensuredSessionId)
+  const existing = sessionMessages.find(message => message.id === turnId && message.role === 'assistant')
+  if (existing) {
+    const existingAssistant = existing as any
+    existingAssistant.content = assistantText
+    existingAssistant.createdAt = normalizedCreatedAt
+    existingAssistant.slices = [{ type: 'text', text: assistantText }]
+    existingAssistant.tool_results = []
+    existingAssistant.structured = {
+      thought: structuredThought,
+      emotion: structuredEmotion,
+      reply: assistantText,
+      format: structuredFormat,
+    }
+    existingAssistant.categorization = {
+      speech: assistantText,
+      reasoning: structuredThought,
+    }
+  }
+  else {
+    sessionMessages.push({
+      id: turnId,
+      role: 'assistant',
+      content: assistantText,
+      createdAt: normalizedCreatedAt,
+      slices: [{ type: 'text', text: assistantText }],
+      tool_results: [],
+      structured: {
+        thought: structuredThought,
+        emotion: structuredEmotion,
+        reply: assistantText,
+        format: structuredFormat,
+      },
+      categorization: {
+        speech: assistantText,
+        reasoning: structuredThought,
+      },
+    })
+  }
+
+  chatSessionStore.persistSessionMessages(ensuredSessionId)
+  await acknowledgeDialogueDelivery(ensuredSessionId, turnId, normalizedCreatedAt)
+}
+
+function normalizeContentText(raw: unknown) {
+  return String(raw ?? '').trim()
+}
+
+function getMessageText(message: any) {
+  if (!message)
+    return ''
+  if (typeof message.content === 'string')
+    return message.content.trim()
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((part: unknown) => {
+        if (typeof part === 'string')
+          return part
+        if (part && typeof part === 'object' && 'text' in part)
+          return String((part as { text?: unknown }).text ?? '')
+        return ''
+      })
+      .join('')
+      .trim()
+  }
+  return ''
+}
+
+function sortSessionMessagesInPlace(messages: any[]) {
+  messages.sort((left, right) => {
+    const leftAt = normalizeCreatedAt(left?.createdAt)
+    const rightAt = normalizeCreatedAt(right?.createdAt)
+    if (leftAt !== rightAt)
+      return leftAt - rightAt
+    const leftRole = String(left?.role ?? '')
+    const rightRole = String(right?.role ?? '')
+    if (leftRole === rightRole)
+      return 0
+    if (leftRole === 'user')
+      return -1
+    if (rightRole === 'user')
+      return 1
+    return leftRole.localeCompare(rightRole)
+  })
+}
+
+function findReplayMessageIndex(messages: any[], options: {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  createdAt: number
+}) {
+  const byIdIndex = messages.findIndex(item => item?.id === options.id && item?.role === options.role)
+  if (byIdIndex >= 0)
+    return byIdIndex
+
+  const toleranceMs = options.role === 'assistant' ? 15_000 : 6_000
+  return messages.findIndex((item) => {
+    if (!item || item.role !== options.role)
+      return false
+    const itemText = getMessageText(item)
+    if (itemText !== options.text)
+      return false
+    const itemCreatedAt = normalizeCreatedAt(item.createdAt)
+    return Math.abs(itemCreatedAt - options.createdAt) <= toleranceMs
+  })
+}
+
+async function reconcileSessionTurnsFromMain(sessionIdRaw: string) {
+  const sessionId = sessionIdRaw.trim()
+  if (!sessionId || sessionReconcileInFlight.has(sessionId))
+    return
+
+  sessionReconcileInFlight.add(sessionId)
+  try {
+    const ensuredSessionId = await chatSessionStore.ensureExternalSession(sessionId, {
+      setActive: sessionId === activeSessionId.value,
+    })
+    if (!ensuredSessionId)
+      return
+
+    const rows = await aliceListConversationTurns({
+      ...resolveAliceScope(),
+      sessionId: ensuredSessionId,
+      limit: 500,
+    })
+    if (!rows.length)
+      return
+
+    const sessionMessages = chatSessionStore.getSessionMessages(ensuredSessionId)
+    let changed = false
+    const orderedRows = [...rows].sort((a, b) => normalizeCreatedAt(a.createdAt) - normalizeCreatedAt(b.createdAt))
+    for (const row of orderedRows) {
+      const createdAt = normalizeCreatedAt(row.createdAt)
+      const turnId = String(row.turnId ?? '').trim()
+      if (!turnId)
+        continue
+
+      const userText = normalizeContentText(row.userText)
+      if (userText) {
+        const userId = `${turnId}:user`
+        const userIndex = findReplayMessageIndex(sessionMessages as any[], {
+          id: userId,
+          role: 'user',
+          text: userText,
+          createdAt,
+        })
+        if (userIndex >= 0) {
+          const existing = sessionMessages[userIndex] as any
+          const beforeSignature = JSON.stringify({
+            id: existing.id,
+            content: existing.content,
+            createdAt: existing.createdAt,
+          })
+          existing.id = userId
+          existing.content = userText
+          existing.createdAt = createdAt
+          const afterSignature = JSON.stringify({
+            id: existing.id,
+            content: existing.content,
+            createdAt: existing.createdAt,
+          })
+          if (beforeSignature !== afterSignature)
+            changed = true
+        }
+        else {
+          sessionMessages.push({
+            id: userId,
+            role: 'user',
+            content: userText,
+            createdAt,
+          } as any)
+          changed = true
+        }
+      }
+
+      const assistantText = normalizeContentText(row.assistantText)
+      if (assistantText) {
+        const structured = row.structured && typeof row.structured === 'object'
+          ? row.structured as Record<string, unknown>
+          : {}
+        const structuredThought = typeof structured.thought === 'string' ? structured.thought.trim() : ''
+        const structuredEmotion = typeof structured.emotion === 'string' ? structured.emotion.trim() : 'neutral'
+        const structuredFormat: 'epoch1-v1' | 'fallback-v1'
+          = structured.format === 'epoch1-v1'
+            ? 'epoch1-v1'
+            : 'fallback-v1'
+        const assistantIndex = findReplayMessageIndex(sessionMessages as any[], {
+          id: turnId,
+          role: 'assistant',
+          text: assistantText,
+          createdAt,
+        })
+        if (assistantIndex >= 0) {
+          const existing = sessionMessages[assistantIndex] as any
+          const beforeSignature = JSON.stringify({
+            id: existing.id,
+            content: existing.content,
+            createdAt: existing.createdAt,
+            thought: existing.structured?.thought,
+            emotion: existing.structured?.emotion,
+          })
+          existing.id = turnId
+          existing.content = assistantText
+          existing.createdAt = createdAt
+          existing.slices = [{ type: 'text', text: assistantText }]
+          existing.tool_results = Array.isArray(existing.tool_results) ? existing.tool_results : []
+          existing.structured = {
+            thought: structuredThought,
+            emotion: structuredEmotion,
+            reply: assistantText,
+            format: structuredFormat,
+          }
+          existing.categorization = {
+            speech: assistantText,
+            reasoning: structuredThought,
+          }
+          const afterSignature = JSON.stringify({
+            id: existing.id,
+            content: existing.content,
+            createdAt: existing.createdAt,
+            thought: existing.structured?.thought,
+            emotion: existing.structured?.emotion,
+          })
+          if (beforeSignature !== afterSignature)
+            changed = true
+        }
+        else {
+          sessionMessages.push({
+            id: turnId,
+            role: 'assistant',
+            content: assistantText,
+            createdAt,
+            slices: [{ type: 'text', text: assistantText }],
+            tool_results: [],
+            structured: {
+              thought: structuredThought,
+              emotion: structuredEmotion,
+              reply: assistantText,
+              format: structuredFormat,
+            },
+            categorization: {
+              speech: assistantText,
+              reasoning: structuredThought,
+            },
+          } as any)
+          changed = true
+        }
+      }
+    }
+
+    if (changed) {
+      sortSessionMessagesInPlace(sessionMessages as any[])
+      chatSessionStore.persistSessionMessages(ensuredSessionId)
+    }
+  }
+  catch (error) {
+    console.warn('[alice-renderer] failed to reconcile session turns from main:', error)
+  }
+  finally {
+    sessionReconcileInFlight.delete(sessionId)
+  }
+}
+
+async function backfillProactiveTurnsForSession(sessionIdRaw: string) {
+  const sessionId = sessionIdRaw.trim()
+  if (!sessionId || proactiveBackfillInFlight.has(sessionId))
+    return
+
+  proactiveBackfillInFlight.add(sessionId)
+  try {
+    const dialogues = await aliceReplayDialogues({
+      ...resolveAliceScope(),
+      sessionId,
+      limit: 200,
+    })
+    const sorted = [...dialogues].sort((a, b) => normalizeCreatedAt(a.createdAt) - normalizeCreatedAt(b.createdAt))
+    for (const row of sorted) {
+      if (row.origin !== 'subconscious-proactive')
+        continue
+      const assistantText = row.structured?.reply?.trim()
+      if (!assistantText)
+        continue
+      await upsertProactiveAssistantTurn({
+        sessionId,
+        turnId: row.turnId,
+        assistantText,
+        structured: row.structured as unknown as Record<string, unknown>,
+        createdAt: normalizeCreatedAt(row.createdAt),
+      })
+    }
+  }
+  catch (error) {
+    console.warn('[alice-renderer] failed to backfill proactive turns:', error)
+  }
+  finally {
+    proactiveBackfillInFlight.delete(sessionId)
+  }
+}
+
+function scheduleMainLlmConfigSync() {
+  if (!llmConfigHydrated.value)
+    return
+  const payload = createLlmConfigPayload()
+  const signature = JSON.stringify(payload)
+  if (signature === lastLlmSyncSignature)
+    return
+
+  if (llmSyncTimer)
+    clearTimeout(llmSyncTimer)
+  llmSyncTimer = setTimeout(() => {
+    lastLlmSyncSignature = signature
+    void aliceSyncLlmConfig(payload)
+  }, 120)
+}
+
+async function hydrateMainLlmConfig() {
+  if (llmConfigHydrating)
+    return
+  llmConfigHydrating = true
+  try {
+    const remote = await aliceGetLlmConfig()
+    const remoteCredentials = remote.providerCredentials && typeof remote.providerCredentials === 'object'
+      ? remote.providerCredentials
+      : {}
+    if (Object.keys(remoteCredentials).length > 0) {
+      providers.value = JSON.parse(JSON.stringify(remoteCredentials))
+    }
+    if (remote.activeProviderId?.trim()) {
+      activeProvider.value = remote.activeProviderId.trim()
+    }
+    if (remote.activeModelId?.trim()) {
+      activeModel.value = remote.activeModelId.trim()
+    }
+    lastLlmSyncSignature = JSON.stringify({
+      activeProviderId: remote.activeProviderId || '',
+      activeModelId: remote.activeModelId || '',
+      providerCredentials: remoteCredentials,
+    } satisfies AliceLlmConfigPayload)
+  }
+  catch (error) {
+    console.warn('[alice-renderer] failed to hydrate llm config from main process:', error)
+  }
+  finally {
+    llmConfigHydrating = false
+    llmConfigHydrated.value = true
   }
 }
 
@@ -291,6 +726,55 @@ function handleAliceChatStreamFinish(payload?: AliceChatFinishEvent) {
   pending.reject(new Error(error))
 }
 
+function createDialogueRespondedDedupKey(payload: AliceDialogueRespondedPayload) {
+  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : ''
+  const turnId = typeof payload.turnId === 'string' ? payload.turnId.trim() : ''
+  const createdAt = typeof payload.createdAt === 'number' && Number.isFinite(payload.createdAt)
+    ? Math.floor(payload.createdAt)
+    : 0
+  return `${payload.cardId}::${sessionId}::${turnId}::${createdAt}`
+}
+
+function registerHandledDialogueResponded(payload: AliceDialogueRespondedPayload) {
+  const key = createDialogueRespondedDedupKey(payload)
+  if (handledDialogueRespondedKeys.has(key))
+    return false
+  handledDialogueRespondedKeys.add(key)
+  handledDialogueRespondedQueue.push(key)
+  if (handledDialogueRespondedQueue.length > handledDialogueRespondedMax) {
+    const dropped = handledDialogueRespondedQueue.shift()
+    if (dropped)
+      handledDialogueRespondedKeys.delete(dropped)
+  }
+  return true
+}
+
+function handleAliceDialogueRespondedPayload(payload?: AliceDialogueRespondedPayload) {
+  if (!payload || !isCurrentAliceCard(payload.cardId))
+    return
+  if (!registerHandledDialogueResponded(payload))
+    return
+
+  const targetSessionId = payload.sessionId?.trim() || activeSessionId.value
+  if (targetSessionId)
+    void reconcileSessionTurnsFromMain(targetSessionId)
+
+  if (payload.origin === 'subconscious-proactive' && payload.structured?.reply?.trim()) {
+    if (targetSessionId) {
+      void upsertProactiveAssistantTurn({
+        sessionId: targetSessionId,
+        turnId: payload.turnId,
+        assistantText: payload.structured.reply,
+        structured: payload.structured as unknown as Record<string, unknown>,
+        createdAt: payload.createdAt,
+        setActive: targetSessionId === activeSessionId.value,
+      })
+    }
+  }
+
+  void alicePresenceDispatcherStore.dispatchDialogueResponded(payload)
+}
+
 function handleAliceChatStreamDispatch(payload?: AliceChatStreamDispatchPayload) {
   if (!payload)
     return
@@ -309,6 +793,9 @@ function handleAliceChatStreamDispatch(payload?: AliceChatStreamDispatchPayload)
       return
     case 'error':
       handleAliceChatStreamError(payload.body)
+      return
+    case 'dialogue-responded':
+      handleAliceDialogueRespondedPayload(payload.body)
   }
 }
 
@@ -355,8 +842,8 @@ setAliceBridge({
   updateSoul: async payload => await aliceUpdateSoul({ ...resolveAliceScope(), ...payload }),
   updatePersonality: async payload => await aliceUpdatePersonality({ ...resolveAliceScope(), ...payload }),
   getKillSwitchState: async () => await aliceGetKillSwitchState(resolveAliceScope()),
-  suspendKillSwitch: async payload => await aliceSuspendKillSwitch({ ...resolveAliceScope(), ...(payload ?? {}) }),
-  resumeKillSwitch: async payload => await aliceResumeKillSwitch({ ...resolveAliceScope(), ...(payload ?? {}) }),
+  suspendKillSwitch: async payload => await aliceSuspendKillSwitch({ ...resolveAliceScope(), ...payload }),
+  resumeKillSwitch: async payload => await aliceResumeKillSwitch({ ...resolveAliceScope(), ...payload }),
   getMemoryStats: async () => await aliceGetMemoryStats(resolveAliceScope()),
   runMemoryPrune: async () => await aliceRunMemoryPrune(resolveAliceScope()),
   updateMemoryStats: async payload => await aliceUpdateMemoryStats({ ...resolveAliceScope(), ...payload }),
@@ -370,11 +857,12 @@ setAliceBridge({
   getSensorySnapshot: async () => await aliceGetSensorySnapshot(resolveAliceScope()),
   getSubconsciousState: async () => await aliceGetSubconsciousState(resolveAliceScope()),
   forceSubconsciousTick: async () => await aliceForceSubconsciousTick(resolveAliceScope()),
-  forceDreaming: async payload => await aliceForceDreaming({ ...resolveAliceScope(), ...(payload ?? {}) }),
+  forceDreaming: async payload => await aliceForceDreaming({ ...resolveAliceScope(), ...payload }),
   syncLlmConfig: async payload => await aliceSyncLlmConfig(payload),
   getLlmConfig: async () => await aliceGetLlmConfig(),
   chatStart: async payload => await invokeAliceChatStartTransport({ ...resolveAliceScope(), ...payload }),
   chatAbort: async payload => await invokeAliceChatAbortTransport({ ...resolveAliceScope(), ...payload }),
+  reminderSchedule: async payload => await aliceReminderSchedule({ ...resolveAliceScope(), ...payload }),
   streamChat: async (payload, options) => await new Promise<void>(async (resolve, reject) => {
     const scope = resolveAliceScope()
     const key = aliceChatStreamKey(scope.cardId, payload.turnId)
@@ -521,7 +1009,9 @@ setAliceBridge({
       rejectAndDispose(error)
     }
   }),
+  clearAllConversations: async () => await aliceClearAllConversations(),
   deleteCardScope: async scope => await aliceDeleteCardScope(scope),
+  deleteAllData: async () => await aliceDeleteAllData(),
 })
 
 context.value.on(aliceSoulChanged, (event) => {
@@ -540,12 +1030,7 @@ context.value.on(aliceKillSwitchStateChanged, (event) => {
   aliceEpoch1Store.setKillSwitchSnapshot(snapshot)
 })
 
-context.value.on(aliceDialogueResponded, (event) => {
-  const payload = event?.body
-  if (!payload || !isCurrentAliceCard(payload.cardId))
-    return
-  void alicePresenceDispatcherStore.dispatchDialogueResponded(payload)
-})
+context.value.on(aliceDialogueResponded, event => handleAliceDialogueRespondedPayload(event?.body))
 
 context.value.on(aliceSafetyPermissionRequested, (event) => {
   const payload = event?.body
@@ -604,9 +1089,16 @@ watch(activeCardId, () => {
   currentHitlRequest.value = null
   pendingHitlRequests.value = []
   hitlResolving.value = false
+  proactiveBackfillInFlight.clear()
   void aliceEpoch1Store.refreshSoul()
   void aliceEpoch1Store.syncKillSwitchState()
   void aliceEpoch1Store.refreshMemoryStats()
+  if (activeSessionId.value?.trim()) {
+    void Promise.all([
+      backfillProactiveTurnsForSession(activeSessionId.value),
+      reconcileSessionTurnsFromMain(activeSessionId.value),
+    ])
+  }
 }, { immediate: true })
 
 watch(activeSessionId, (sessionId) => {
@@ -616,26 +1108,13 @@ watch(activeSessionId, (sessionId) => {
     ...resolveAliceScope(),
     sessionId,
   })
+  void Promise.all([
+    backfillProactiveTurnsForSession(sessionId),
+    reconcileSessionTurnsFromMain(sessionId),
+  ])
 }, { immediate: true })
 
-watch([activeProvider, activeModel, providers], () => {
-  const nextCredentials = JSON.parse(JSON.stringify(providers.value || {})) as Record<string, Record<string, unknown>>
-  const payload = {
-    activeProviderId: activeProvider.value || '',
-    activeModelId: activeModel.value || '',
-    providerCredentials: nextCredentials,
-  }
-  const signature = JSON.stringify(payload)
-  if (signature === lastLlmSyncSignature)
-    return
-
-  if (llmSyncTimer)
-    clearTimeout(llmSyncTimer)
-  llmSyncTimer = setTimeout(() => {
-    lastLlmSyncSignature = signature
-    void aliceSyncLlmConfig(payload)
-  }, 120)
-}, { deep: true, immediate: true })
+watch([activeProvider, activeModel, providers], () => scheduleMainLlmConfigSync(), { deep: true, immediate: true })
 
 const { updateThemeColor } = useThemeColor(themeColorFromValue({ light: 'rgb(255 255 255)', dark: 'rgb(18 18 18)' }))
 watch(dark, () => updateThemeColor(), { immediate: true })
@@ -659,6 +1138,14 @@ onMounted(async () => {
   await aliceEpoch1Store.initialize()
 
   await chatSessionStore.initialize()
+  await hydrateMainLlmConfig()
+  scheduleMainLlmConfigSync()
+  if (activeSessionId.value?.trim()) {
+    await Promise.all([
+      backfillProactiveTurnsForSession(activeSessionId.value),
+      reconcileSessionTurnsFromMain(activeSessionId.value),
+    ])
+  }
   await displayModelsStore.loadDisplayModelsFromIndexedDB()
   await settingsStore.initializeStageModel()
 

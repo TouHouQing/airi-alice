@@ -363,6 +363,65 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     return sessionId
   }
 
+  async function ensureExternalSession(sessionIdRaw: string, options?: { setActive?: boolean, title?: string }) {
+    const sessionId = sessionIdRaw.trim()
+    if (!sessionId)
+      return ''
+
+    const currentUserId = getCurrentUserId()
+    const characterId = getCurrentCharacterId()
+    if (!index.value || index.value.userId !== currentUserId)
+      await loadIndexForUser(currentUserId)
+
+    ensureSession(sessionId)
+    ensureGeneration(sessionId)
+    await loadSession(sessionId)
+
+    const existingMeta = sessionMetas.value[sessionId]
+    if (existingMeta) {
+      if (options?.setActive)
+        setActiveSession(sessionId)
+      return sessionId
+    }
+
+    const now = Date.now()
+    const meta: ChatSessionMeta = {
+      sessionId,
+      userId: currentUserId,
+      characterId,
+      title: options?.title,
+      createdAt: now,
+      updatedAt: now,
+    }
+    sessionMetas.value[sessionId] = meta
+
+    if (!index.value)
+      index.value = { userId: currentUserId, characters: {} }
+
+    const characterIndex = index.value.characters[characterId] ?? {
+      activeSessionId: sessionId,
+      sessions: {},
+    }
+    characterIndex.sessions[sessionId] = meta
+    if (options?.setActive)
+      characterIndex.activeSessionId = sessionId
+    index.value.characters[characterId] = characterIndex
+
+    const record: ChatSessionRecord = {
+      meta,
+      messages: sessionMessages.value[sessionId] ?? [],
+    }
+
+    if (options?.setActive)
+      activeSessionId.value = sessionId
+
+    loadedSessions.add(sessionId)
+    await enqueuePersist(() => chatSessionsRepo.saveSession(sessionId, record))
+    await persistIndex()
+    scheduleSync(sessionId)
+    return sessionId
+  }
+
   async function ensureActiveSessionForCharacter() {
     const currentUserId = getCurrentUserId()
     const characterId = getCurrentCharacterId()
@@ -605,6 +664,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     setSessionMessages,
     persistSessionMessages,
     getSessionMessages,
+    ensureExternalSession,
     ensureSessionReady,
     sessionMessages,
     sessionMetas,

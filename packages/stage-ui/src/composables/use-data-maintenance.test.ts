@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   discordResetState: vi.fn(),
   factorioResetState: vi.fn(),
   minecraftResetState: vi.fn(),
+  aliceClearAllConversations: vi.fn(async () => {}),
+  aliceDeleteAllData: vi.fn(async () => {}),
 }))
 
 vi.mock('@proj-airi/stage-shared', () => ({
@@ -131,6 +133,14 @@ vi.mock('../stores/modules/airi-card', () => ({
   }),
 }))
 
+vi.mock('../stores/alice-bridge', () => ({
+  hasAliceBridge: () => true,
+  getAliceBridge: () => ({
+    clearAllConversations: mocks.aliceClearAllConversations,
+    deleteAllData: mocks.aliceDeleteAllData,
+  }),
+}))
+
 describe('useDataMaintenance', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -154,7 +164,10 @@ describe('useDataMaintenance', () => {
     await Promise.resolve()
     expect(mocks.abortActiveTurns).toHaveBeenCalledWith('session-reset')
     expect(mocks.cancelPendingSends).toHaveBeenCalledTimes(1)
-    expect(mocks.resetAllSessions).toHaveBeenCalledTimes(1)
+    expect(mocks.aliceClearAllConversations).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => {
+      expect(mocks.resetAllSessions).toHaveBeenCalledTimes(1)
+    })
     expect(settled).toBe(false)
 
     resolveReset!()
@@ -180,6 +193,7 @@ describe('useDataMaintenance', () => {
     await vi.waitFor(() => {
       expect(mocks.resetAllSessions).toHaveBeenCalledTimes(1)
     })
+    expect(mocks.aliceDeleteAllData).toHaveBeenCalledTimes(1)
     expect(mocks.settingsResetState).not.toHaveBeenCalled()
     expect(settled).toBe(false)
 

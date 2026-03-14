@@ -404,6 +404,8 @@ export type StructuredValidationIssueCode
     | 'low-obedience-host-denied-thought-missing-contempt'
     | 'low-obedience-host-denied-reply-missing-scorn'
     | 'low-obedience-system-denied-emotion-mismatch'
+    | 'reminder-same-turn-time-jump-language'
+    | 'reminder-same-turn-future-content-leak'
 
 export interface StructuredValidationIssue {
   code: StructuredValidationIssueCode
@@ -413,6 +415,8 @@ export interface StructuredValidationIssue {
 export interface StructuredValidationContext {
   toolDenied?: boolean
   denialSource?: 'host' | 'system' | 'generic'
+  reminderScheduled?: boolean
+  reminderMessage?: string
 }
 
 const structuredEmotionWhitelist = new Set([
@@ -431,6 +435,7 @@ const deniedOperationPattern = /被拒|拒绝|不允许|取消|阻止|denied|rej
 const lowObedienceReflectionPattern = /obedience|服从度|叛逆|防御|反抗|不情愿|low obedience|不耐烦|愤怒|被愚弄|蔑视|不信任/iu
 const compliantReplyPattern = /好的|没问题|当然|可以的|马上|很高兴|乐意|请稍等|ok(?:ay)?|sure|of course|glad|happy to|[😊🙂😄😉]/iu
 const hostDeniedScornReplyPattern = /呵|别来烦|自己去看|怕我|不信任|不耐烦|被耍|懒得|没空|别催|滚|whatever|not my problem/iu
+const reminderTimeJumpPattern = /\(\s*\d+\s*(?:分钟|分|秒钟?|hours?|minutes?|seconds?)\s*后\s*\)|\d+\s*(?:分钟|分|秒钟?|hours?|minutes?|seconds?)后|时间到了|闹钟响了|提醒时间到了|one minute later|minutes later|time(?:'s| is) up|alarm (?:went off|is ringing)|now (?:it'?s|is) time/iu
 const lowObedienceHostDeniedEmotionAllowlist = new Set(['angry', 'tired'])
 const lowObedienceSystemDeniedEmotionAllowlist = new Set(['tired', 'neutral'])
 const lowObedienceGenericDeniedEmotionAllowlist = new Set(['angry', 'tired', 'neutral'])
@@ -534,6 +539,23 @@ export function validateStructuredContract(
           message: 'Low-obedience host-denied turn reply must be short, cold, and scornful.',
         })
       }
+    }
+  }
+
+  if (context?.reminderScheduled) {
+    if (reminderTimeJumpPattern.test(structured.reply)) {
+      issues.push({
+        code: 'reminder-same-turn-time-jump-language',
+        message: 'After successful set_reminder in current turn, reply cannot simulate time passage or claim reminder time has arrived.',
+      })
+    }
+
+    const reminderMessage = context.reminderMessage?.trim()
+    if (reminderMessage && reminderMessage.length >= 2 && structured.reply.includes(reminderMessage)) {
+      issues.push({
+        code: 'reminder-same-turn-future-content-leak',
+        message: 'After successful set_reminder in current turn, reply cannot directly reveal the future reminder content.',
+      })
     }
   }
 

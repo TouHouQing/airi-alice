@@ -15,6 +15,7 @@ import type {
   AliceChatToolCallEvent,
   AliceChatToolResultEvent,
   AliceConversationTurnInput,
+  AliceConversationTurnRecord,
   AliceDialogueRespondedPayload,
   AliceDreamRunResult,
   AliceGender,
@@ -23,6 +24,8 @@ import type {
   AliceRealtimeCategory,
   AliceRealtimeExecutePayload,
   AliceRealtimeExecuteResult,
+  AliceReminderSchedulePayload,
+  AliceReminderScheduleResult,
   AliceSoulFrontmatter,
   AliceSoulSnapshot,
   AliceSubconsciousNeedsState,
@@ -30,7 +33,8 @@ import type {
   AliceSubconsciousTickResult,
 } from '../../../shared/eventa'
 
-import { createHash } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { appendFile, mkdir, open as openFile, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -41,7 +45,7 @@ import { createContext } from '@moeru/eventa/adapters/electron/main'
 import { createOpenAI } from '@xsai-ext/providers/create'
 import { streamText } from '@xsai/stream-text'
 import { tool } from '@xsai/tool'
-import { app, globalShortcut, ipcMain, powerMonitor } from 'electron'
+import { app, globalShortcut, ipcMain, powerMonitor, webContents } from 'electron'
 import { z } from 'zod'
 
 import {
@@ -56,11 +60,14 @@ import {
   aliceDialogueResponded,
   aliceKillSwitchStateChanged,
   aliceSoulChanged,
+  electronAliceAckDialogue,
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
   electronAliceChatAbort,
   electronAliceChatStart,
+  electronAliceClearAllConversations,
+  electronAliceDeleteAllData,
   electronAliceDeleteCardScope,
   electronAliceGetMemoryStats,
   electronAliceGetSensorySnapshot,
@@ -69,12 +76,15 @@ import {
   electronAliceKillSwitchGetState,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceListConversationTurns,
   electronAliceLlmGetConfig,
   electronAliceLlmSyncConfig,
   electronAliceMemoryImportLegacy,
   electronAliceMemoryRetrieveFacts,
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
+  electronAliceReminderSchedule,
+  electronAliceReplayDialogues,
   electronAliceRunMemoryPrune,
   electronAliceSetActiveSession,
   electronAliceSubconsciousForceDream,
@@ -130,6 +140,7 @@ const aliceCardKillSwitchMetaKey = 'kill_switch_state_v1'
 const aliceCardActiveSessionMetaKey = 'active_session_id_v1'
 const aliceSubconsciousStateMetaKey = 'subconscious_state_v1'
 const aliceDreamLastRunMetaKey = 'subconscious_last_dreamed_at_v1'
+const aliceDialogueAckStateMetaKey = 'dialogue_ack_state_v1'
 const defaultAliceCardId = 'default'
 const aliceSubconsciousTickMs = 60_000
 const aliceSubconsciousPersistMs = 30 * 60_000
@@ -137,9 +148,19 @@ const dreamMaxTurns = 100
 const dreamMaxCharsPerUserTurn = 320
 const dreamMaxCharsPerAssistantTurn = 360
 const dreamMaxTotalChars = 16_000
+const reminderMinMinutes = 1
+const reminderMaxMinutes = 10_080
+const reminderMaxMessageChars = 500
+const reminderClaimBatchSize = 12
+const reminderOverdueTierThresholdMinutes = 5
+const reminderLlmRetryDelayMs = 60_000
+const subconsciousInterruptionProbeTimeoutMs = 1_200
 const chatRunFinishedRetentionMs = 2 * 60_000
 const mainChatFirstEventTimeoutMs = 45_000
 const mainChatTimeoutRecoveryMs = 12_000
+const dialogueDeliveryRetryBaseMs = 2_000
+const dialogueDeliveryRetryMaxMs = 60_000
+const dialogueDeliveryRetryMaxAttempts = 8
 
 interface SubconsciousCardState extends AliceSubconsciousNeedsState {
   updatedAt: number
@@ -156,11 +177,20 @@ interface ChatRunState {
   state: 'running' | 'aborted' | 'finished'
 }
 
+type StreamDispatchEventType = Exclude<AliceChatStreamDispatchPayload['eventType'], 'dialogue-responded'>
+
 interface MainGatewayResolvedConfig {
   providerId: string
   model: string
   headers?: Record<string, string>
   provider: ReturnType<typeof createOpenAI>
+}
+
+interface PendingDialogueDeliveryState {
+  key: string
+  payload: AliceDialogueRespondedPayload
+  attempts: number
+  timer?: ReturnType<typeof setTimeout>
 }
 
 interface CardScopeOptions {
@@ -272,7 +302,7 @@ function syncPersonalityBaselineInBody(body: string, personality: AlicePersonali
 
   const nextSectionIndex = lines.findIndex((line, index) => index > sectionIndex && line.trim().startsWith('## '))
   const sectionEnd = nextSectionIndex >= 0 ? nextSectionIndex : lines.length
-  const sectionLines = [...lines.slice(sectionIndex, sectionEnd)]
+  const sectionLines = lines.slice(sectionIndex, sectionEnd)
 
   const upsertMetric = (label: string, value: number) => {
     const line = `- ${label}：${value.toFixed(2)}`
@@ -491,6 +521,58 @@ function sanitizeBriefText(raw: string, maxLength = 160) {
   if (text.length <= maxLength)
     return text
   return `${text.slice(0, Math.max(8, maxLength - 1))}…`
+}
+
+function normalizeReminderMessage(value: string) {
+  const text = sanitizeText(value, '').replace(/\s+/g, ' ').trim()
+  return text
+}
+
+function parseReminderToolResultForDebug(result: unknown): {
+  status?: string
+  taskId?: string
+  triggerAt?: number
+  message?: string
+  code?: string
+} {
+  const parseObject = (value: Record<string, unknown>) => {
+    const status = typeof value.status === 'string' ? value.status : undefined
+    const taskId = typeof value.taskId === 'string' ? value.taskId : undefined
+    const triggerAt = typeof value.triggerAt === 'number' && Number.isFinite(value.triggerAt)
+      ? value.triggerAt
+      : undefined
+    const message = typeof value.message === 'string' ? sanitizeBriefText(value.message, 120) : undefined
+    const code = typeof value.code === 'string' ? value.code : undefined
+    return {
+      status,
+      taskId,
+      triggerAt,
+      message,
+      code,
+    }
+  }
+
+  if (!result || typeof result !== 'object')
+    return {}
+
+  const payload = result as Record<string, unknown>
+  const direct = parseObject(payload)
+  if (direct.status || direct.code)
+    return direct
+
+  if (payload.toolResult && typeof payload.toolResult === 'object') {
+    const nested = parseObject(payload.toolResult as Record<string, unknown>)
+    if (nested.status || nested.code)
+      return nested
+  }
+
+  if (payload.structuredContent && typeof payload.structuredContent === 'object') {
+    const nested = parseObject(payload.structuredContent as Record<string, unknown>)
+    if (nested.status || nested.code)
+      return nested
+  }
+
+  return {}
 }
 
 async function fetchWithTimeout(url: string, timeoutMs = realtimeRequestTimeoutMsec) {
@@ -1041,10 +1123,13 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   let soulWatcher: import('node:fs').FSWatcher | undefined
   let pruneTimer: ReturnType<typeof setInterval> | undefined
   let subconsciousTimer: ReturnType<typeof setInterval> | undefined
+  let reminderDueTimer: ReturnType<typeof setTimeout> | undefined
   let dreamTimer: ReturnType<typeof setInterval> | undefined
   let muteWatchUntil = 0
   const turnWriteAbortControllers = new Map<string, AbortController>()
   const activeSessionIdByCard = new Map<string, string>()
+  const dialogueAckByCard = new Map<string, Map<string, number>>()
+  const pendingDialogueDeliveries = new Map<string, PendingDialogueDeliveryState>()
   const subconsciousStateByCard = new Map<string, SubconsciousCardState>()
   const chatRuns = new Map<string, ChatRunState>()
   const recentlyFinishedChatRuns = new Map<string, number>()
@@ -1085,7 +1170,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       await aliceDb.appendAuditLog({
         ...input,
         payload: {
-          ...(input.payload ?? {}),
+          ...input.payload,
           cardId,
         },
       })
@@ -1113,6 +1198,228 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     if (typeof raw !== 'string')
       return ''
     return raw.trim()
+  }
+
+  function getDialogueAckMap(cardIdRaw: unknown) {
+    const cardId = normalizeCardId(cardIdRaw)
+    let map = dialogueAckByCard.get(cardId)
+    if (!map) {
+      map = new Map<string, number>()
+      dialogueAckByCard.set(cardId, map)
+    }
+    return map
+  }
+
+  function getDialogueAckCursor(cardIdRaw: unknown, sessionIdRaw: unknown) {
+    const sessionId = normalizeSessionId(sessionIdRaw)
+    if (!sessionId)
+      return 0
+    const map = getDialogueAckMap(cardIdRaw)
+    const cursor = map.get(sessionId)
+    return typeof cursor === 'number' && Number.isFinite(cursor) ? cursor : 0
+  }
+
+  function normalizeDialogueAckObject(raw: unknown) {
+    const source = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+    const entries = Object.entries(source)
+      .map(([sessionId, cursorRaw]) => {
+        const normalizedSessionId = normalizeSessionId(sessionId)
+        const cursor = Number(cursorRaw)
+        if (!normalizedSessionId || !Number.isFinite(cursor))
+          return null
+        return [normalizedSessionId, Math.max(0, Math.floor(cursor))] as const
+      })
+      .filter((entry): entry is readonly [string, number] => Boolean(entry))
+    return new Map<string, number>(entries)
+  }
+
+  async function persistDialogueAckMap(cardIdRaw: unknown) {
+    const cardId = normalizeCardId(cardIdRaw)
+    const payload = Object.fromEntries(getDialogueAckMap(cardId).entries())
+    if (cardId === activeCardId) {
+      await aliceDb.setMetaValue(aliceDialogueAckStateMetaKey, JSON.stringify(payload)).catch(() => {})
+      return
+    }
+    await withCardScope(cardId, async () => {
+      await aliceDb.setMetaValue(aliceDialogueAckStateMetaKey, JSON.stringify(payload)).catch(() => {})
+    }, {
+      label: `dialogue-ack.persist:${cardId}`,
+    })
+  }
+
+  async function restoreDialogueAckMap(cardIdRaw: unknown) {
+    const cardId = normalizeCardId(cardIdRaw)
+    const setMap = (map: Map<string, number>) => {
+      dialogueAckByCard.set(cardId, map)
+      return map
+    }
+
+    if (cardId !== activeCardId) {
+      await withCardScope(cardId, async () => {
+        const raw = await aliceDb.getMetaValue(aliceDialogueAckStateMetaKey).catch(() => undefined)
+        if (!raw) {
+          setMap(new Map())
+          return
+        }
+        try {
+          setMap(normalizeDialogueAckObject(JSON.parse(raw)))
+        }
+        catch {
+          setMap(new Map())
+        }
+      }, {
+        label: `dialogue-ack.restore:${cardId}`,
+      })
+      return getDialogueAckMap(cardId)
+    }
+
+    const raw = await aliceDb.getMetaValue(aliceDialogueAckStateMetaKey).catch(() => undefined)
+    if (!raw)
+      return setMap(new Map())
+    try {
+      return setMap(normalizeDialogueAckObject(JSON.parse(raw)))
+    }
+    catch {
+      return setMap(new Map())
+    }
+  }
+
+  function createPendingDialogueDeliveryKey(payload: Pick<AliceDialogueRespondedPayload, 'cardId' | 'sessionId' | 'turnId'>) {
+    return `${normalizeCardId(payload.cardId)}::${normalizeSessionId(payload.sessionId)}::${sanitizeText(payload.turnId)}`
+  }
+
+  function clearPendingDialogueDelivery(entryOrKey: PendingDialogueDeliveryState | string) {
+    const key = typeof entryOrKey === 'string' ? entryOrKey : entryOrKey.key
+    const pending = typeof entryOrKey === 'string' ? pendingDialogueDeliveries.get(entryOrKey) : entryOrKey
+    if (pending?.timer) {
+      clearTimeout(pending.timer)
+      pending.timer = undefined
+    }
+    pendingDialogueDeliveries.delete(key)
+  }
+
+  function clearPendingDialogueDeliveriesByCard(cardIdRaw: unknown) {
+    const normalizedCardId = normalizeCardId(cardIdRaw)
+    for (const pending of pendingDialogueDeliveries.values()) {
+      if (normalizeCardId(pending.payload.cardId) !== normalizedCardId)
+        continue
+      clearPendingDialogueDelivery(pending)
+    }
+  }
+
+  function clearAllPendingDialogueDeliveries() {
+    for (const pending of pendingDialogueDeliveries.values()) {
+      clearPendingDialogueDelivery(pending)
+    }
+    pendingDialogueDeliveries.clear()
+  }
+
+  function shouldSkipPendingDialogueRetry(payload: AliceDialogueRespondedPayload) {
+    const currentCursor = getDialogueAckCursor(payload.cardId, payload.sessionId)
+    return payload.createdAt <= currentCursor
+  }
+
+  function schedulePendingDialogueRetry(entry: PendingDialogueDeliveryState, reason: string) {
+    clearPendingDialogueDelivery(entry)
+
+    if (shouldSkipPendingDialogueRetry(entry.payload))
+      return
+    if (entry.attempts >= dialogueDeliveryRetryMaxAttempts)
+      return
+
+    const delayMs = Math.min(
+      dialogueDeliveryRetryMaxMs,
+      dialogueDeliveryRetryBaseMs * 2 ** Math.max(0, entry.attempts),
+    )
+
+    entry.timer = setTimeout(() => {
+      const current = pendingDialogueDeliveries.get(entry.key)
+      if (!current)
+        return
+      if (shouldSkipPendingDialogueRetry(current.payload)) {
+        clearPendingDialogueDelivery(current)
+        return
+      }
+
+      emitDialogueRespondedEvent(current.payload)
+      current.attempts += 1
+      void appendRuntimeDebugLine('dialogue-responded.retry', {
+        cardId: current.payload.cardId,
+        sessionId: current.payload.sessionId,
+        turnId: current.payload.turnId,
+        attempts: current.attempts,
+        reason,
+      })
+      schedulePendingDialogueRetry(current, 'unacked-retry')
+    }, delayMs)
+
+    pendingDialogueDeliveries.set(entry.key, entry)
+  }
+
+  function emitDialogueRespondedEvent(payload: AliceDialogueRespondedPayload) {
+    context.emit(aliceDialogueResponded, payload)
+    emitDialogueRespondedDispatch(payload)
+  }
+
+  function emitDialogueRespondedDispatch(payload: AliceDialogueRespondedPayload) {
+    const dispatchPayload = toAliceChatStreamDispatchPayload('dialogue-responded', payload)
+    const dispatchedSenderIds = new Set<number>()
+    const allWebContents = webContents.getAllWebContents()
+    for (const target of allWebContents) {
+      if (target.isDestroyed())
+        continue
+      try {
+        target.send(aliceChatStreamDispatchChannel, dispatchPayload)
+        dispatchedSenderIds.add(target.id)
+      }
+      catch (error) {
+        void appendRuntimeDebugLine('dialogue-dispatch.failed', {
+          cardId: payload.cardId,
+          sessionId: payload.sessionId,
+          turnId: payload.turnId,
+          senderId: target.id,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    if (dispatchedSenderIds.size === 0) {
+      void appendRuntimeDebugLine('dialogue-dispatch.skipped', {
+        cardId: payload.cardId,
+        sessionId: payload.sessionId,
+        turnId: payload.turnId,
+        reason: 'no-renderer',
+      })
+    }
+  }
+
+  function emitDialogueRespondedWithDelivery(payload: AliceDialogueRespondedPayload) {
+    emitDialogueRespondedEvent(payload)
+
+    if (payload.origin !== 'subconscious-proactive')
+      return
+
+    const key = createPendingDialogueDeliveryKey(payload)
+    const existing = pendingDialogueDeliveries.get(key)
+    const next: PendingDialogueDeliveryState = existing
+      ? {
+          ...existing,
+          payload,
+        }
+      : {
+          key,
+          payload,
+          attempts: 0,
+        }
+    void appendRuntimeDebugLine('dialogue-delivery.pending-registered', {
+      cardId: payload.cardId,
+      sessionId: payload.sessionId,
+      turnId: payload.turnId,
+      createdAt: payload.createdAt,
+      hasExisting: Boolean(existing),
+      currentActiveSession: normalizeSessionId(activeSessionIdByCard.get(normalizeCardId(payload.cardId))),
+    })
+    schedulePendingDialogueRetry(next, 'initial-delivery')
   }
 
   async function persistActiveSessionId(cardId: string, sessionId: string) {
@@ -1381,6 +1688,143 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     return [...ids]
   }
 
+  async function clearAllConversationData(reason: string) {
+    const startedAt = Date.now()
+    const previousCardId = normalizeCardId(activeCardId)
+    const cardIds = await listKnownCardIds()
+    await appendRuntimeDebugLine('conversation-clear-all.started', {
+      reason,
+      previousCardId,
+      cardCount: cardIds.length,
+      cardIds,
+    })
+
+    await abortAllTurnWrites(`conversation-clear-all:${reason}`).catch(() => {})
+    clearReminderDueTimer()
+    clearAllPendingDialogueDeliveries()
+    recentlyFinishedChatRuns.clear()
+
+    try {
+      for (const cardId of cardIds) {
+        await switchCardScope(cardId)
+        await aliceDb.clearConversationData()
+        await aliceDb.setMetaValue(aliceCardActiveSessionMetaKey, '').catch(() => {})
+        await aliceDb.setMetaValue(aliceDialogueAckStateMetaKey, '{}').catch(() => {})
+        activeSessionIdByCard.delete(cardId)
+        dialogueAckByCard.delete(cardId)
+        clearPendingDialogueDeliveriesByCard(cardId)
+        await appendAuditLog({
+          level: 'notice',
+          category: 'conversation',
+          action: 'clear-all',
+          message: 'Cleared all conversation turns and scheduled reminder tasks for card scope.',
+          payload: {
+            reason,
+          },
+        }, cardId)
+      }
+    }
+    finally {
+      await switchCardScope(previousCardId).catch(() => {})
+      await scheduleNextReminderDueCheck(`conversation-clear-all:${reason}`).catch(() => {})
+      await appendRuntimeDebugLine('conversation-clear-all.finished', {
+        reason,
+        elapsedMs: Date.now() - startedAt,
+        restoredCardId: activeCardId,
+      })
+    }
+  }
+
+  async function deleteAllAlicizationData(reason: string) {
+    const startedAt = Date.now()
+    await appendRuntimeDebugLine('delete-all-data.started', {
+      reason,
+      activeCardId,
+    })
+
+    await abortAllTurnWrites(`delete-all-data:${reason}`).catch(() => {})
+    clearReminderDueTimer()
+    stopWatch()
+    sensoryBus.stop('manual')
+
+    if (pruneTimer) {
+      clearInterval(pruneTimer)
+      pruneTimer = undefined
+    }
+    if (subconsciousTimer) {
+      clearInterval(subconsciousTimer)
+      subconsciousTimer = undefined
+    }
+    if (dreamTimer) {
+      clearInterval(dreamTimer)
+      dreamTimer = undefined
+    }
+
+    clearAllPendingDialogueDeliveries()
+    turnWriteAbortControllers.clear()
+    chatRuns.clear()
+    recentlyFinishedChatRuns.clear()
+    activeSessionIdByCard.clear()
+    dialogueAckByCard.clear()
+    subconsciousStateByCard.clear()
+    subconsciousTickInFlight = null
+    queuedWrite = Promise.resolve()
+    soulSnapshot = null
+    watching = false
+    muteWatchUntil = 0
+    revision = 0
+
+    await aliceDb.close().catch(() => {})
+    await rm(join(userDataPath, 'alicizations'), { recursive: true, force: true })
+
+    activeProviderId = ''
+    activeModelId = ''
+    providerCredentials = {}
+    setAliceKillSwitchState('ACTIVE', 'delete-all-data')
+    setAliceCardKillSwitchState(defaultAliceCardId, 'ACTIVE', 'delete-all-data')
+
+    activeCardId = defaultAliceCardId
+    ;({ soulRoot, soulPath, legacyPromptProfilePath, legacySparkProfilePath } = resolveCardPaths(activeCardId))
+    aliceDb = await setupAliceDb(userDataPath, { cardId: activeCardId })
+    await restoreScopedKillSwitch(activeCardId)
+    await restoreActiveSessionId(activeCardId)
+    await restoreDialogueAckMap(activeCardId)
+    await restoreSubconsciousState(activeCardId)
+
+    sensoryBus = createAliceSensoryBus({
+      tickMs: 60_000,
+      staleMs: 90_000,
+      cpuWindowMs: 1_000,
+      appendAuditLog: input => appendAuditLog(input, activeCardId),
+    })
+    if (!isAliceKillSwitchSuspended() && getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED')
+      sensoryBus.start()
+
+    await persistLlmConfigToDisk().catch(() => {})
+    await bootstrap()
+    await scheduleNextReminderDueCheck(`delete-all-data:${reason}`).catch(() => {})
+    startPruneTimer()
+    startSubconsciousTimer()
+    startDreamTimer()
+    emitKillSwitchChanged(activeCardId)
+
+    await appendAuditLog({
+      level: 'notice',
+      category: 'alice.runtime',
+      action: 'delete-all-data-completed',
+      message: 'Deleted all Alicization runtime data and reinitialized default scope.',
+      payload: {
+        reason,
+        elapsedMs: Date.now() - startedAt,
+      },
+    }, activeCardId)
+    await appendRuntimeDebugLine('delete-all-data.finished', {
+      reason,
+      elapsedMs: Date.now() - startedAt,
+      activeCardId,
+    })
+  }
+
   const llmConfigPath = join(userDataPath, 'alicizations', 'llm-config.json')
   const runtimeDebugLogPath = join(userDataPath, 'alicizations', 'runtime-debug.log')
 
@@ -1393,7 +1837,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         ts: new Date().toISOString(),
         pid,
         event,
-        ...(payload ?? {}),
+        ...payload,
       })
       await appendFile(runtimeDebugLogPath, `${line}\n`, 'utf-8')
     }
@@ -1481,6 +1925,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       clearInterval(pruneTimer)
       pruneTimer = undefined
     }
+    clearReminderDueTimer()
     turnWriteAbortControllers.clear()
     queuedWrite = Promise.resolve()
     soulSnapshot = null
@@ -1495,6 +1940,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     aliceDb = await setupAliceDb(userDataPath, { cardId: activeCardId })
     await restoreScopedKillSwitch(activeCardId)
     await restoreActiveSessionId(activeCardId)
+    await restoreDialogueAckMap(activeCardId)
     await restoreSubconsciousState(activeCardId)
 
     sensoryBus = createAliceSensoryBus({
@@ -1508,6 +1954,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       sensoryBus.start()
     }
     startPruneTimer()
+    await scheduleNextReminderDueCheck('card-scope-switch')
     await appendRuntimeDebugLine('card-scope.switch-completed', {
       fromCardId: previousCardId,
       toCardId: activeCardId,
@@ -1550,6 +1997,214 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     return await next
   }
 
+  type ReminderScheduleSource = 'tool' | 'manual-fallback'
+
+  async function scheduleReminderTask(
+    cardId: string,
+    input: {
+      minutes: unknown
+      message: unknown
+      sourceTurnId?: string
+    },
+    source: ReminderScheduleSource,
+  ): Promise<AliceReminderScheduleResult> {
+    const debugPrefix = source === 'tool' ? 'reminder.tool-execute' : 'reminder.manual-schedule'
+    await appendRuntimeDebugLine(`${debugPrefix}-requested`, {
+      cardId,
+      minutes: input.minutes,
+      sourceTurnId: sanitizeText(input.sourceTurnId),
+      messagePreview: sanitizeBriefText(String(input.message ?? ''), 120),
+    })
+
+    const parsedMinutes = Number(input.minutes)
+    if (!Number.isFinite(parsedMinutes)) {
+      await appendRuntimeDebugLine(`${debugPrefix}-rejected`, {
+        cardId,
+        reason: 'invalid-minutes-not-finite',
+        minutes: input.minutes,
+      })
+      return {
+        status: 'error',
+        code: 'ALICE_REMINDER_INVALID_MINUTES',
+        message: 'Reminder minutes must be a valid number.',
+      }
+    }
+
+    const normalizedMinutes = Math.floor(parsedMinutes)
+    if (normalizedMinutes < reminderMinMinutes || normalizedMinutes > reminderMaxMinutes) {
+      await appendRuntimeDebugLine(`${debugPrefix}-rejected`, {
+        cardId,
+        reason: 'invalid-minutes-out-of-range',
+        normalizedMinutes,
+        min: reminderMinMinutes,
+        max: reminderMaxMinutes,
+      })
+      return {
+        status: 'error',
+        code: 'ALICE_REMINDER_INVALID_MINUTES',
+        message: `Reminder minutes must be between ${reminderMinMinutes} and ${reminderMaxMinutes}.`,
+      }
+    }
+
+    const normalizedMessage = normalizeReminderMessage(String(input.message ?? ''))
+    if (!normalizedMessage) {
+      await appendRuntimeDebugLine(`${debugPrefix}-rejected`, {
+        cardId,
+        reason: 'invalid-message-empty',
+      })
+      return {
+        status: 'error',
+        code: 'ALICE_REMINDER_INVALID_MESSAGE',
+        message: 'Reminder message must be a non-empty string.',
+      }
+    }
+
+    if (normalizedMessage.length > reminderMaxMessageChars) {
+      await appendRuntimeDebugLine(`${debugPrefix}-rejected`, {
+        cardId,
+        reason: 'invalid-message-too-long',
+        length: normalizedMessage.length,
+        limit: reminderMaxMessageChars,
+      })
+      return {
+        status: 'error',
+        code: 'ALICE_REMINDER_INVALID_MESSAGE',
+        message: `Reminder message must be at most ${reminderMaxMessageChars} characters.`,
+      }
+    }
+
+    const triggerAt = Date.now() + normalizedMinutes * 60_000
+    const taskId = `reminder:${cardId}:${Date.now()}:${randomUUID().slice(0, 8)}`
+    const sourceTurnId = sanitizeText(input.sourceTurnId)
+    const record = await withCardScope(cardId, async () => await aliceDb.insertScheduledTask({
+      taskId,
+      triggerAt,
+      message: normalizedMessage,
+      sourceTurnId: sourceTurnId || undefined,
+    }), {
+      label: source === 'tool'
+        ? `tool:set-reminder:${cardId}`
+        : `manual:set-reminder:${cardId}`,
+    })
+
+    await appendRuntimeDebugLine('reminder.task-inserted', {
+      cardId,
+      source,
+      taskId: record.taskId,
+      sourceTurnId: sourceTurnId || undefined,
+      createdAt: record.createdAt,
+      createdIso: new Date(record.createdAt).toISOString(),
+      triggerAt: record.triggerAt,
+      triggerIso: new Date(record.triggerAt).toISOString(),
+      delayMs: record.triggerAt - record.createdAt,
+      delayMinutes: Number(((record.triggerAt - record.createdAt) / 60_000).toFixed(2)),
+      messagePreview: sanitizeBriefText(record.message, 120),
+    })
+
+    await queueScopedAuditLog(cardId, {
+      level: 'notice',
+      category: 'alice.reminder',
+      action: 'alice.reminder.task.created',
+      message: source === 'tool'
+        ? 'Created reminder task via main gateway top-level tool.'
+        : 'Created reminder task via deterministic fallback scheduler.',
+      payload: {
+        taskId: record.taskId,
+        triggerAt: record.triggerAt,
+        minutes: normalizedMinutes,
+        source,
+        sourceTurnId: sourceTurnId || undefined,
+      },
+    })
+
+    await scheduleNextReminderDueCheck('task-created')
+
+    return {
+      status: 'scheduled',
+      taskId: record.taskId,
+      triggerTime: new Date(record.triggerAt).toISOString(),
+      triggerAt: record.triggerAt,
+      message: record.message,
+    }
+  }
+
+  function clearReminderDueTimer() {
+    if (!reminderDueTimer)
+      return
+    clearTimeout(reminderDueTimer)
+    reminderDueTimer = undefined
+  }
+
+  async function scheduleNextReminderDueCheck(reason: string) {
+    clearReminderDueTimer()
+
+    if (isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
+      await appendRuntimeDebugLine('reminder.next-due-skipped', {
+        cardId: activeCardId,
+        reason: 'kill-switch-suspended',
+        trigger: reason,
+      })
+      return
+    }
+
+    const pendingPreview = await aliceDb.listPendingScheduledTasks(1).catch(() => [])
+    const nextPending = pendingPreview.at(0)
+    if (!nextPending) {
+      await appendRuntimeDebugLine('reminder.next-due-none', {
+        cardId: activeCardId,
+        trigger: reason,
+      })
+      return
+    }
+
+    const nowMs = Date.now()
+    const dueInMs = Math.max(0, nextPending.triggerAt - nowMs)
+    const timeoutMs = Math.min(2_147_000_000, dueInMs + 120)
+    await appendRuntimeDebugLine('reminder.next-due-scheduled', {
+      cardId: activeCardId,
+      trigger: reason,
+      taskId: nextPending.taskId,
+      triggerAt: nextPending.triggerAt,
+      triggerIso: new Date(nextPending.triggerAt).toISOString(),
+      dueInMs,
+      timeoutMs,
+    })
+
+    reminderDueTimer = setTimeout(() => {
+      reminderDueTimer = undefined
+      void appendRuntimeDebugLine('reminder.next-due-fired', {
+        cardId: activeCardId,
+        taskId: nextPending.taskId,
+      })
+
+      if (subconsciousTickInFlight) {
+        void appendRuntimeDebugLine('reminder.next-due-deferred', {
+          cardId: activeCardId,
+          reason: 'tick-in-flight',
+        })
+        void scheduleNextReminderDueCheck('deferred-after-inflight').catch(() => {})
+        return
+      }
+
+      subconsciousTickInFlight = runSubconsciousTickAcrossCards('force', [activeCardId])
+      void subconsciousTickInFlight.catch(async (error) => {
+        await appendAuditLog({
+          level: 'warning',
+          category: 'alice.reminder',
+          action: 'next-due-trigger-failed',
+          message: 'Reminder next-due trigger failed.',
+          payload: {
+            reason: error instanceof Error ? error.message : String(error),
+            cardId: activeCardId,
+          },
+        })
+      }).finally(() => {
+        subconsciousTickInFlight = null
+        void scheduleNextReminderDueCheck('post-next-due-trigger').catch(() => {})
+      })
+    }, timeoutMs)
+  }
+
   function startPruneTimer() {
     if (pruneTimer) {
       clearInterval(pruneTimer)
@@ -1576,8 +2231,18 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       subconsciousTimer = undefined
     }
     subconsciousTimer = setInterval(() => {
-      if (subconsciousTickInFlight)
+      if (subconsciousTickInFlight) {
+        void appendRuntimeDebugLine('subconscious.timer.skipped', {
+          reason: 'tick-in-flight',
+          activeCardId,
+        })
         return
+      }
+
+      void appendRuntimeDebugLine('subconscious.timer.fired', {
+        activeCardId,
+        tickMs: aliceSubconsciousTickMs,
+      })
 
       subconsciousTickInFlight = runSubconsciousTickAcrossCards('timer')
       void subconsciousTickInFlight.catch(async (error) => {
@@ -2100,6 +2765,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   async function suspendKillSwitch(reason?: string) {
     const snapshot = await persistScopedKillSwitch(activeCardId, 'SUSPENDED', reason)
     sensoryBus.stop('kill-switch')
+    clearReminderDueTimer()
     await abortAllTurnWrites(reason ?? 'manual')
     emitKillSwitchChanged()
     await appendAuditLog({
@@ -2118,6 +2784,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     const snapshot = await persistScopedKillSwitch(activeCardId, 'ACTIVE', reason)
     if (!isAliceKillSwitchSuspended())
       sensoryBus.start()
+    await scheduleNextReminderDueCheck('kill-switch-resume')
     emitKillSwitchChanged()
     await appendAuditLog({
       level: 'notice',
@@ -2134,6 +2801,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   async function suspendGlobalKillSwitch(reason?: string) {
     const snapshot = setAliceKillSwitchState('SUSPENDED', reason)
     sensoryBus.stop('kill-switch')
+    clearReminderDueTimer()
     await abortAllTurnWrites(reason ?? 'manual')
     emitKillSwitchChanged(activeCardId)
     await appendAuditLog({
@@ -2152,6 +2820,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     const snapshot = setAliceKillSwitchState('ACTIVE', reason)
     if (getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED')
       sensoryBus.start()
+    await scheduleNextReminderDueCheck('global-kill-switch-resume')
     emitKillSwitchChanged(activeCardId)
     await appendAuditLog({
       level: 'notice',
@@ -2191,7 +2860,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
           turnId: normalizedPayload.turnId,
         },
       })
-      return
+      return false
     }
 
     const signal = createTurnWriteAbortSignal(normalizedPayload.turnId)
@@ -2207,7 +2876,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
           turnId: normalizedPayload.turnId,
         },
       })
-      return
+      return false
     }
 
     try {
@@ -2223,14 +2892,21 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
             turnId: normalizedPayload.turnId,
           },
         })
-        return
+        return true
       }
 
       const dialoguePayload = normalizeDialogueRespondedPayload(normalizedPayload)
       if (dialoguePayload) {
-        context.emit(aliceDialogueResponded, {
+        emitDialogueRespondedWithDelivery({
           cardId: activeCardId,
           ...dialoguePayload,
+        })
+        await appendRuntimeDebugLine('dialogue-responded.emitted', {
+          cardId: activeCardId,
+          turnId: dialoguePayload.turnId,
+          sessionId: dialoguePayload.sessionId,
+          origin: dialoguePayload.origin,
+          emotion: dialoguePayload.structured.emotion,
         })
         await appendAuditLog({
           level: 'notice',
@@ -2247,6 +2923,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
           },
         })
       }
+      return true
     }
     catch (error) {
       if (isAbortError(error) || signal?.aborted) {
@@ -2291,6 +2968,46 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     }
   }
 
+  function toReplayDialogueRespondedPayload(row: {
+    turnId: string | null
+    sessionId: string
+    userText: string | null
+    assistantText: string | null
+    structuredJson: string | null
+    createdAt: number
+  }): AliceDialogueRespondedPayload | null {
+    const structured = parseStructuredHint(row.structuredJson)
+    const normalizedTurnId = sanitizeText(row.turnId)
+    const structuredFormat = sanitizeText((structured as { format?: unknown }).format).toLowerCase()
+    const inferredProactiveByTurnId
+      = normalizedTurnId.startsWith('reminder:')
+        || normalizedTurnId.startsWith('subconscious:')
+    const inferredProactiveByFormat
+      = structuredFormat === 'subconscious-proactive-v1'
+        || structuredFormat === 'subconscious-proactive-llm-v1'
+        || structuredFormat === 'subconscious-reminder-v1'
+    const origin = inferredProactiveByTurnId || inferredProactiveByFormat
+      ? 'subconscious-proactive'
+      : 'user-turn'
+
+    const normalized = normalizeDialogueRespondedPayload({
+      turnId: row.turnId ?? undefined,
+      sessionId: row.sessionId,
+      userText: row.userText ?? undefined,
+      assistantText: row.assistantText ?? undefined,
+      structured,
+      origin,
+      createdAt: row.createdAt,
+    })
+    if (!normalized || normalized.origin !== 'subconscious-proactive')
+      return null
+
+    return {
+      cardId: activeCardId,
+      ...normalized,
+    }
+  }
+
   function clampSoulDelta(value: number, maxAbs = 0.08) {
     if (!Number.isFinite(value))
       return 0
@@ -2324,6 +3041,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       system,
       user,
       timeoutMs: 15_000,
+      source: 'proactive',
     })
     if (!raw)
       return null
@@ -2368,6 +3086,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       system,
       user,
       timeoutMs: 20_000,
+      source: 'dream',
     })
     if (!raw)
       return null
@@ -2448,24 +3167,391 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     }
   }
 
+  async function generateReminderStructuredWithGateway(
+    personality: AlicePersonalityState,
+    reminder: { minutes: number, message: string, tier: 'mild' | 'severe' },
+  ) {
+    const system = [
+      '[SYSTEM OVERRIDE: 备忘录触发]',
+      'You are A.L.I.C.E and must proactively deliver a due reminder now.',
+      `Reminder trigger delay: ${reminder.minutes.toFixed(1)} minutes.`,
+      reminder.tier === 'severe'
+        ? 'Delay tier: severe. Mention this reminder is late because the system was offline/suspended, then still deliver the reminder immediately.'
+        : 'Delay tier: mild. Mention a short delay/catch-up and deliver the reminder immediately.',
+      `Reminder content: "${reminder.message}".`,
+      `Personality parameters: obedience=${personality.obedience.toFixed(2)}, liveliness=${personality.liveliness.toFixed(2)}, sensibility=${personality.sensibility.toFixed(2)}.`,
+      'Output must be valid JSON only with keys: thought, emotion, reply.',
+      'emotion must be one of: neutral|happy|sad|angry|concerned|tired|apologetic|processing.',
+      'reply must contain the reminder content and match emotion/personality.',
+      'No markdown, no extra keys.',
+    ].join('\n')
+    const user = 'Deliver this reminder to the Host now.'
+
+    const raw = await generateMainGatewayText({
+      system,
+      user,
+      timeoutMs: 15_000,
+      source: 'reminder',
+    })
+    if (!raw)
+      return null
+
+    const parsed = parseJsonObjectFromText(raw)
+    if (!parsed)
+      return null
+
+    const thought = sanitizeText(parsed.thought)
+    const reply = sanitizeText(parsed.reply)
+    const normalizedEmotion = normalizeAliceEmotion(parsed.emotion)
+    if (!thought || !reply || normalizedEmotion.downgraded)
+      return null
+
+    return {
+      thought,
+      emotion: normalizedEmotion.emotion,
+      reply,
+      parsePath: 'json',
+      format: 'subconscious-reminder-v1',
+    }
+  }
+
+  async function processDueRemindersForCurrentCard(trigger: 'timer' | 'force' | 'startup') {
+    if (isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
+      await appendRuntimeDebugLine('reminder.scan-skipped', {
+        cardId: activeCardId,
+        trigger,
+        reason: 'kill-switch-suspended',
+      })
+      clearReminderDueTimer()
+      return { claimed: 0, completed: 0, failed: 0, requeued: 0 }
+    }
+
+    const nowMs = Date.now()
+    const pendingPreview = await aliceDb.listPendingScheduledTasks(1).catch(() => [])
+    const nextPending = pendingPreview.at(0)
+    await appendRuntimeDebugLine('reminder.scan-started', {
+      cardId: activeCardId,
+      trigger,
+      nowMs,
+      nowIso: new Date(nowMs).toISOString(),
+      nextPendingTaskId: nextPending?.taskId,
+      nextPendingTriggerAt: nextPending?.triggerAt,
+      nextPendingTriggerIso: typeof nextPending?.triggerAt === 'number' ? new Date(nextPending.triggerAt).toISOString() : undefined,
+      nextPendingDueInMs: typeof nextPending?.triggerAt === 'number' ? nextPending.triggerAt - nowMs : undefined,
+    })
+    const dueTasks = await aliceDb.claimDueScheduledTasks(nowMs, reminderClaimBatchSize)
+    if (dueTasks.length === 0) {
+      await appendRuntimeDebugLine('reminder.scan-empty', {
+        cardId: activeCardId,
+        trigger,
+        nowMs,
+        nextPendingTaskId: nextPending?.taskId,
+        nextPendingTriggerAt: nextPending?.triggerAt,
+        nextPendingDueInMs: typeof nextPending?.triggerAt === 'number' ? nextPending.triggerAt - nowMs : undefined,
+      })
+      await scheduleNextReminderDueCheck(`scan-empty:${trigger}`)
+      return { claimed: 0, completed: 0, failed: 0, requeued: 0 }
+    }
+
+    await appendRuntimeDebugLine('reminder.scan-claimed', {
+      cardId: activeCardId,
+      trigger,
+      nowMs,
+      claimedTaskIds: dueTasks.map(task => task.taskId),
+      claimedCount: dueTasks.length,
+    })
+
+    const personality = (soulSnapshot ?? await bootstrap()).frontmatter.personality
+    let completed = 0
+    let failed = 0
+    let requeued = 0
+
+    for (const task of dueTasks) {
+      const delayMinutes = Math.max(0, (nowMs - task.triggerAt) / 60_000)
+      const tier = delayMinutes >= reminderOverdueTierThresholdMinutes ? 'severe' : 'mild'
+      const reminderInput = {
+        minutes: delayMinutes,
+        message: task.message,
+        tier,
+      } as const
+      await appendRuntimeDebugLine('reminder.task-processing', {
+        cardId: activeCardId,
+        trigger,
+        taskId: task.taskId,
+        triggerAt: task.triggerAt,
+        triggerIso: new Date(task.triggerAt).toISOString(),
+        delayMinutes: Number(delayMinutes.toFixed(2)),
+        tier,
+      })
+
+      await appendAuditLog({
+        level: 'notice',
+        category: 'alice.reminder',
+        action: 'alice.reminder.task.claimed',
+        message: 'Claimed due reminder task for subconscious delivery.',
+        payload: {
+          trigger,
+          taskId: task.taskId,
+          triggerAt: task.triggerAt,
+        },
+      })
+
+      if (delayMinutes > 0) {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.reminder',
+          action: 'alice.reminder.task.overdue-triggered',
+          message: 'Triggered overdue reminder task after runtime recovery.',
+          payload: {
+            trigger,
+            taskId: task.taskId,
+            delayMinutes: Number(delayMinutes.toFixed(2)),
+            tier,
+          },
+        })
+      }
+
+      try {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.reminder',
+          action: 'alice.reminder.task.triggered',
+          message: 'Triggering reminder proactive utterance generation.',
+          payload: {
+            trigger,
+            taskId: task.taskId,
+            tier,
+          },
+        })
+        const llmStructured = await generateReminderStructuredWithGateway(personality, reminderInput)
+        if (!llmStructured) {
+          const nextTriggerAt = Date.now() + reminderLlmRetryDelayMs
+          await aliceDb.requeueScheduledTask(task.taskId, 'llm-unavailable', nextTriggerAt)
+          requeued += 1
+          await appendRuntimeDebugLine('reminder.task-requeued', {
+            cardId: activeCardId,
+            trigger,
+            taskId: task.taskId,
+            reason: 'llm-unavailable',
+            nextTriggerAt,
+            nextTriggerIso: new Date(nextTriggerAt).toISOString(),
+          })
+          await appendAuditLog({
+            level: 'warning',
+            category: 'alice.reminder',
+            action: 'alice.reminder.task.failed',
+            message: 'Reminder task generation unavailable in this tick; task requeued for retry without deterministic fallback text.',
+            payload: {
+              trigger,
+              taskId: task.taskId,
+              reason: 'llm-unavailable',
+              nextTriggerAt,
+            },
+          })
+          continue
+        }
+        const structured = llmStructured
+        await appendRuntimeDebugLine('reminder.task-generated', {
+          cardId: activeCardId,
+          trigger,
+          taskId: task.taskId,
+          source: 'llm',
+          emotion: structured.emotion,
+          replyPreview: sanitizeBriefText(structured.reply, 120),
+        })
+        const firedTurnId = `reminder:${activeCardId}:${task.taskId}:${Date.now()}`
+        const persisted = await appendConversationTurnWithGuards({
+          turnId: firedTurnId,
+          sessionId: await ensureActiveOrLatestSessionId(activeCardId),
+          assistantText: structured.reply,
+          structured,
+          origin: 'subconscious-proactive',
+          createdAt: Date.now(),
+        })
+
+        if (!persisted) {
+          await aliceDb.requeueScheduledTask(task.taskId, 'turn-write-skipped')
+          requeued += 1
+          await appendAuditLog({
+            level: 'warning',
+            category: 'alice.reminder',
+            action: 'alice.reminder.task.failed',
+            message: 'Reminder turn write skipped by runtime guard; task requeued.',
+            payload: {
+              trigger,
+              taskId: task.taskId,
+              reason: 'turn-write-skipped',
+            },
+          })
+          continue
+        }
+        await appendRuntimeDebugLine('reminder.task-persisted', {
+          cardId: activeCardId,
+          trigger,
+          taskId: task.taskId,
+          firedTurnId,
+        })
+
+        await aliceDb.completeScheduledTask(task.taskId, firedTurnId, Date.now())
+        completed += 1
+        await appendRuntimeDebugLine('reminder.task-completed', {
+          cardId: activeCardId,
+          trigger,
+          taskId: task.taskId,
+          firedTurnId,
+        })
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.reminder',
+          action: 'alice.reminder.task.completed',
+          message: 'Reminder task completed and delivered through subconscious proactive turn.',
+          payload: {
+            trigger,
+            taskId: task.taskId,
+            firedTurnId,
+            emotion: structured.emotion,
+            format: structured.format,
+            source: 'llm',
+          },
+        })
+      }
+      catch (error) {
+        failed += 1
+        const reason = sanitizeBriefText(error instanceof Error ? error.message : String(error), 300) || 'unknown reminder execution failure'
+        await aliceDb.failScheduledTask(task.taskId, reason, Date.now()).catch(() => {})
+        await appendRuntimeDebugLine('reminder.task-failed', {
+          cardId: activeCardId,
+          trigger,
+          taskId: task.taskId,
+          reason,
+        })
+        await appendAuditLog({
+          level: 'warning',
+          category: 'alice.reminder',
+          action: 'alice.reminder.task.failed',
+          message: 'Reminder task failed during subconscious trigger execution.',
+          payload: {
+            trigger,
+            taskId: task.taskId,
+            reason,
+          },
+        })
+      }
+    }
+
+    await scheduleNextReminderDueCheck(`scan-finished:${trigger}`)
+    return {
+      claimed: dueTasks.length,
+      completed,
+      failed,
+      requeued,
+    }
+  }
+
+  async function runReminderCompensationAcrossCards(trigger: 'startup') {
+    const previousCardId = activeCardId
+    const cardIds = await listKnownCardIds()
+    const processedCards: string[] = []
+    try {
+      for (const cardId of cardIds) {
+        await withCardScope(cardId, async () => {
+          const result = await processDueRemindersForCurrentCard(trigger)
+          if (result.claimed > 0)
+            processedCards.push(activeCardId)
+        }, {
+          label: `reminder-compensation:${trigger}:${cardId}`,
+        })
+      }
+    }
+    finally {
+      await withCardScope(previousCardId, async () => {}, {
+        label: `reminder-compensation:return:${trigger}:${previousCardId}`,
+      })
+    }
+    return processedCards
+  }
+
+  async function runCommandWithTimeout(command: string, args: string[], timeoutMs: number) {
+    const boundedTimeout = Math.max(300, Math.floor(timeoutMs))
+    return await new Promise<string>((resolve, reject) => {
+      const child = execFile(command, args, { timeout: boundedTimeout, windowsHide: true }, (error, stdout, stderr) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        resolve([stdout, stderr].filter(Boolean).join('\n').trim())
+      })
+      child.on('error', reject)
+    })
+  }
+
+  async function sampleSubconsciousInterruptionContext() {
+    const degraded: string[] = []
+    let idleSeconds = Number.NaN
+
+    try {
+      idleSeconds = Number(powerMonitor.getSystemIdleTime())
+    }
+    catch {
+      degraded.push('input-activity-unavailable')
+    }
+
+    let fullscreenLikely = false
+    if (platform === 'darwin') {
+      try {
+        const output = await runCommandWithTimeout(
+          '/usr/bin/osascript',
+          [
+            '-e',
+            'tell application "System Events" to tell (first process whose frontmost is true) to get value of attribute "AXFullScreen" of front window',
+          ],
+          subconsciousInterruptionProbeTimeoutMs,
+        )
+        fullscreenLikely = /\btrue\b/i.test(output)
+      }
+      catch {
+        degraded.push('fullscreen-likely-unavailable')
+      }
+    }
+    else {
+      degraded.push('fullscreen-likely-unavailable')
+    }
+
+    const inputActivity = Number.isFinite(idleSeconds)
+      ? idleSeconds <= 60 ? 'active' as const : 'idle' as const
+      : 'unknown' as const
+    if (inputActivity === 'unknown' && !degraded.includes('input-activity-unavailable'))
+      degraded.push('input-activity-unavailable')
+
+    return {
+      idleSeconds: Number.isFinite(idleSeconds) ? idleSeconds : null,
+      inputActivity,
+      fullscreenLikely,
+      degraded,
+    }
+  }
+
   async function runSubconsciousTickForCurrentCard(trigger: 'timer' | 'force'): Promise<{ proactive: boolean, suppressed: boolean }> {
     const state = await ensureSubconsciousState(activeCardId)
+    const reminderResult = await processDueRemindersForCurrentCard(trigger)
     const now = Date.now()
     const elapsedMinutes = Math.max(1 / 6, (now - state.lastTickAt) / 60_000)
     const sensorySnapshot = sensoryBus.getSnapshot()
     const cpuUsage = Number(sensorySnapshot?.sample?.cpu?.usagePercent ?? 0)
-    const busy = cpuUsage >= 70
-    const idleLikely = cpuUsage <= 10
-    const fullscreenLikely = false
-    const inputActivity = cpuUsage >= 8 ? 'active' : 'idle'
-    const degradedSignals = ['fullscreen-likely-unavailable', 'input-activity-inferred']
+    const interruptionContext = await sampleSubconsciousInterruptionContext()
+    const fullscreenLikely = interruptionContext.fullscreenLikely
+    const inputActivity = interruptionContext.inputActivity
+    const busy = cpuUsage >= 70 || fullscreenLikely || (inputActivity === 'active' && cpuUsage >= 45)
+    const idleLikely = inputActivity === 'idle' || (inputActivity !== 'active' && cpuUsage <= 10)
+    const degradedSignals = [...interruptionContext.degraded]
 
     const nextState: SubconsciousCardState = {
       ...state,
       boredom: clampNeed(state.boredom + elapsedMinutes * (busy ? 2.2 : 1.2)),
       loneliness: clampNeed(state.loneliness + elapsedMinutes * (idleLikely ? 2.4 : 0.8)),
-      fatigue: clampNeed(state.fatigue + elapsedMinutes * 0.6),
+      fatigue: clampNeed(state.fatigue + elapsedMinutes * 0.6 + reminderResult.completed * 1.2),
       lastTickAt: now,
+      lastInteractionAt: reminderResult.completed > 0 ? now : state.lastInteractionAt,
       updatedAt: now,
     }
 
@@ -2485,6 +3571,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
           fullscreenLikely,
           inputActivity,
           cpuUsage,
+          idleSeconds: interruptionContext.idleSeconds,
           degraded: degradedSignals,
           trigger,
         },
@@ -2847,7 +3934,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       ? requestProviderConfig.headers as Record<string, string>
       : undefined
     const mergedCredentials = {
-      ...(providerCredentials[providerId] ?? {}),
+      ...providerCredentials[providerId],
       ...requestProviderConfig,
     }
     const apiKey = sanitizeText(mergedCredentials.apiKey)
@@ -2897,10 +3984,18 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     system: string
     user: string
     timeoutMs?: number
+    source?: 'reminder' | 'proactive' | 'dream'
   }) {
     const config = resolveMainGatewayConfig()
-    if (!config)
+    if (!config) {
+      await appendRuntimeDebugLine('main-gateway.one-shot-missing-config', {
+        cardId: activeCardId,
+        source: options.source ?? 'unknown',
+        activeProviderId,
+        activeModelId,
+      })
       return null
+    }
 
     const controller = new AbortController()
     const timeout = setTimeout(() => {
@@ -2959,6 +4054,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
           reason: error instanceof Error ? error.message : String(error),
           model: config.model,
           providerId: config.providerId,
+          source: options.source ?? 'unknown',
         },
       })
       return null
@@ -3048,6 +4144,20 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   async function buildMainGatewayTools(cardId: string) {
     return await Promise.all([
       tool({
+        name: 'set_reminder',
+        description: '用于在系统后台设定一个真实的倒计时闹钟。注意：调用此工具后，真实的物理系统会在未来唤醒你。因此，你在本轮的 reply 中，【只允许】回复“已为你定好闹钟”等确认语句。绝对禁止在本轮回复中直接给出提醒内容！',
+        parameters: z.object({
+          minutes: z.coerce.number(),
+          message: z.string(),
+        }).strict(),
+        execute: async ({ minutes, message }) => {
+          return await scheduleReminderTask(cardId, {
+            minutes,
+            message,
+          }, 'tool')
+        },
+      }),
+      tool({
         name: 'mcp_list_tools',
         description: 'List all tools available on the connected MCP servers.',
         parameters: z.object({}).strict(),
@@ -3077,7 +4187,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   function toAliceChatStreamDispatchPayload(
     eventType: AliceChatStreamDispatchPayload['eventType'],
-    body: AliceChatStreamChunkEvent | AliceChatToolCallEvent | AliceChatToolResultEvent | AliceChatFinishEvent | AliceChatErrorEvent,
+    body: AliceChatStreamChunkEvent | AliceChatToolCallEvent | AliceChatToolResultEvent | AliceChatFinishEvent | AliceChatErrorEvent | AliceDialogueRespondedPayload,
   ): AliceChatStreamDispatchPayload {
     switch (eventType) {
       case 'chunk':
@@ -3090,12 +4200,14 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         return { eventType, body: body as AliceChatFinishEvent }
       case 'error':
         return { eventType, body: body as AliceChatErrorEvent }
+      case 'dialogue-responded':
+        return { eventType, body: body as AliceDialogueRespondedPayload }
     }
   }
 
   function emitChatStreamEventForState(
     state: ChatRunState | undefined,
-    eventType: AliceChatStreamDispatchPayload['eventType'],
+    eventType: StreamDispatchEventType,
     body: AliceChatStreamChunkEvent | AliceChatToolCallEvent | AliceChatToolResultEvent | AliceChatFinishEvent | AliceChatErrorEvent,
   ) {
     if (!state)
@@ -3264,6 +4376,26 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       }
     }
 
+    // NOTICE: Keep reminder/proactive one-shot generation aligned with the latest confirmed
+    // chat model route, even if renderer-side llm sync races or misses.
+    activeProviderId = mainGateway.providerId
+    activeModelId = mainGateway.model
+    const payloadProviderConfig = normalizeProviderConfig(payload.providerConfig)
+    if (Object.keys(payloadProviderConfig).length > 0) {
+      providerCredentials[mainGateway.providerId] = {
+        ...providerCredentials[mainGateway.providerId],
+        ...payloadProviderConfig,
+      }
+    }
+    void persistLlmConfigToDisk()
+    await appendRuntimeDebugLine('llm-config.updated-from-chat-start', {
+      cardId: payload.cardId,
+      turnId: payload.turnId,
+      providerId: activeProviderId,
+      model: activeModelId,
+      persistedConfigKeys: Object.keys(providerCredentials[mainGateway.providerId] ?? {}),
+    })
+
     let chatConfig: ReturnType<MainGatewayResolvedConfig['provider']['chat']>
     let messages: Message[]
     let waitForTools = false
@@ -3323,6 +4455,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     })
     const isRunActive = () => chatRuns.get(key)?.state === 'running'
     const nonProgressEventTypes = new Set<string>()
+    const reminderToolCallIds = new Set<string>()
 
     void (async () => {
       try {
@@ -3380,11 +4513,24 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
               if (event?.type === 'tool-call') {
                 if (!isRunActive())
                   return
+                const observedToolName = sanitizeText(event.toolName ?? event.name)
+                if (observedToolName === 'set_reminder') {
+                  const toolCallId = sanitizeText(event.toolCallId)
+                  if (toolCallId)
+                    reminderToolCallIds.add(toolCallId)
+                  await appendRuntimeDebugLine('reminder.stream-tool-call', {
+                    cardId: payload.cardId,
+                    turnId: payload.turnId,
+                    toolCallId,
+                    toolName: observedToolName,
+                    argumentsPreview: sanitizeBriefText(JSON.stringify(event.arguments ?? {}), 200),
+                  })
+                }
                 emitChatStreamEventForState(chatRuns.get(key), 'tool-call', {
                   cardId: payload.cardId,
                   turnId: payload.turnId,
                   toolCallId: sanitizeText(event.toolCallId),
-                  toolName: sanitizeText(event.toolName),
+                  toolName: observedToolName,
                   arguments: typeof event.arguments === 'object' && event.arguments
                     ? event.arguments as Record<string, unknown>
                     : undefined,
@@ -3394,10 +4540,21 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
               if (event?.type === 'tool-result') {
                 if (!isRunActive())
                   return
+                const toolCallId = sanitizeText(event.toolCallId)
+                if (reminderToolCallIds.has(toolCallId)) {
+                  const summary = parseReminderToolResultForDebug(event.result)
+                  await appendRuntimeDebugLine('reminder.stream-tool-result', {
+                    cardId: payload.cardId,
+                    turnId: payload.turnId,
+                    toolCallId,
+                    ...summary,
+                    triggerIso: typeof summary.triggerAt === 'number' ? new Date(summary.triggerAt).toISOString() : undefined,
+                  })
+                }
                 emitChatStreamEventForState(chatRuns.get(key), 'tool-result', {
                   cardId: payload.cardId,
                   turnId: payload.turnId,
-                  toolCallId: sanitizeText(event.toolCallId),
+                  toolCallId,
                   result: event.result,
                 })
                 return
@@ -3716,8 +4873,118 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit)))
   defineInvokeHandler(context, electronAliceMemoryUpsertFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.upsertMemoryFacts(payload.facts, payload.source)))
   defineInvokeHandler(context, electronAliceMemoryImportLegacy, async payload => await withCardScope(payload.cardId, async () => await aliceDb.importLegacyMemory(payload)))
+  defineInvokeHandler(context, electronAliceReminderSchedule, async (payload: AliceReminderSchedulePayload) => {
+    const cardId = cardIdFrom(payload)
+    return await scheduleReminderTask(cardId, {
+      minutes: payload.minutes,
+      message: payload.message,
+      sourceTurnId: payload.sourceTurnId,
+    }, 'manual-fallback')
+  })
   defineInvokeHandler(context, electronAliceSetActiveSession, async payload => await withCardScope(payload.cardId, async () => await persistActiveSessionId(activeCardId, payload.sessionId)))
-  defineInvokeHandler(context, electronAliceAppendConversationTurn, async payload => await withCardScope(payload.cardId, async () => await appendConversationTurnWithGuards(payload)))
+  defineInvokeHandler(context, electronAliceAppendConversationTurn, async (payload) => {
+    await withCardScope(payload.cardId, async () => {
+      await appendConversationTurnWithGuards(payload)
+    })
+  })
+  defineInvokeHandler(context, electronAliceAckDialogue, async payload => await withCardScope(payload.cardId, async () => {
+    const sessionId = normalizeSessionId(payload.sessionId)
+    const turnId = sanitizeText(payload.turnId)
+    const createdAt = Number.isFinite(payload.createdAt)
+      ? Math.max(0, Math.floor(Number(payload.createdAt)))
+      : 0
+    if (!sessionId || !turnId || createdAt <= 0)
+      return
+
+    const ackMap = getDialogueAckMap(activeCardId)
+    const previousCursor = getDialogueAckCursor(activeCardId, sessionId)
+    const nextCursor = Math.max(previousCursor, createdAt)
+    await appendRuntimeDebugLine('dialogue-ack.received', {
+      cardId: activeCardId,
+      sessionId,
+      turnId,
+      createdAt,
+      previousCursor,
+      nextCursor,
+    })
+    if (nextCursor !== previousCursor) {
+      ackMap.set(sessionId, nextCursor)
+      await persistDialogueAckMap(activeCardId)
+    }
+
+    let cleared = 0
+    for (const entry of pendingDialogueDeliveries.values()) {
+      if (normalizeCardId(entry.payload.cardId) !== activeCardId)
+        continue
+      if (normalizeSessionId(entry.payload.sessionId) !== sessionId)
+        continue
+      if (entry.payload.createdAt <= nextCursor) {
+        clearPendingDialogueDelivery(entry)
+        cleared += 1
+      }
+    }
+    await appendRuntimeDebugLine('dialogue-delivery.acked-cleared', {
+      cardId: activeCardId,
+      sessionId,
+      turnId,
+      ackCursor: nextCursor,
+      cleared,
+      remainingPending: pendingDialogueDeliveries.size,
+    })
+  }))
+  defineInvokeHandler(context, electronAliceReplayDialogues, async payload => await withCardScope(payload.cardId, async () => {
+    const sessionId = normalizeSessionId(payload.sessionId)
+    if (!sessionId)
+      return [] as AliceDialogueRespondedPayload[]
+
+    const ackCursor = getDialogueAckCursor(activeCardId, sessionId)
+    const limit = Math.max(1, Math.min(500, Math.floor(payload.limit ?? 200)))
+    await appendRuntimeDebugLine('dialogue-replay.requested', {
+      cardId: activeCardId,
+      sessionId,
+      ackCursor,
+      limit,
+    })
+    const rows = await aliceDb.listConversationTurnsBySession(sessionId, {
+      sinceCreatedAt: ackCursor + 1,
+      limit,
+    })
+    const replayRows = rows
+      .map(row => toReplayDialogueRespondedPayload(row))
+      .filter((item): item is AliceDialogueRespondedPayload => Boolean(item))
+    await appendRuntimeDebugLine('dialogue-replay.returned', {
+      cardId: activeCardId,
+      sessionId,
+      ackCursor,
+      requestedLimit: limit,
+      rawRows: rows.length,
+      replayRows: replayRows.length,
+    })
+    return replayRows
+  }))
+  defineInvokeHandler(context, electronAliceClearAllConversations, async () => await withCardScope(activeCardId, async () => {
+    await clearAllConversationData('renderer')
+  }, {
+    label: 'conversation-clear-all',
+  }))
+  defineInvokeHandler(context, electronAliceListConversationTurns, async payload => await withCardScope(payload.cardId, async () => {
+    const rows = await aliceDb.listConversationTurnsBySession(payload.sessionId, {
+      sinceCreatedAt: payload.sinceCreatedAt,
+      limit: payload.limit,
+    })
+    return rows.map((row): AliceConversationTurnRecord => {
+      const structured = parseStructuredHint(row.structuredJson)
+      const hasStructured = Object.keys(structured).length > 0
+      return {
+        turnId: row.turnId,
+        sessionId: row.sessionId,
+        userText: row.userText,
+        assistantText: row.assistantText,
+        structured: hasStructured ? structured : null,
+        createdAt: row.createdAt,
+      }
+    })
+  }))
   defineInvokeHandler(context, electronAliceAppendAuditLog, async payload => await withCardScope(payload.cardId, async () => await aliceDb.appendAuditLog(payload)))
   defineInvokeHandler(context, electronAliceRealtimeExecute, async (payload) => {
     return await withCardScope(payload.cardId, async () => {
@@ -3749,6 +5016,11 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       await switchCardScope(defaultAliceCardId)
       await bootstrap()
     }
+  }))
+  defineInvokeHandler(context, electronAliceDeleteAllData, async () => await withCardScope(defaultAliceCardId, async () => {
+    await deleteAllAlicizationData('renderer')
+  }, {
+    label: 'delete-all-data',
   }))
   defineInvokeHandler(context, electronAliceSubconsciousGetState, async scope => await withCardScope(cardIdFrom(scope), async () => {
     const state = await ensureSubconsciousState(activeCardId)
@@ -3831,6 +5103,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
 
   await restoreScopedKillSwitch(activeCardId)
   await restoreActiveSessionId(activeCardId)
+  await restoreDialogueAckMap(activeCardId)
   await restoreSubconsciousState(activeCardId)
   await restoreLlmConfigFromDisk()
   const journalMode = await aliceDb.getJournalMode().catch(() => '')
@@ -3880,6 +5153,9 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     stopWatch()
     sensoryBus.stop('shutdown')
     turnWriteAbortControllers.clear()
+    for (const pending of pendingDialogueDeliveries.values())
+      clearPendingDialogueDelivery(pending)
+    pendingDialogueDeliveries.clear()
     chatRuns.clear()
     recentlyFinishedChatRuns.clear()
     if (typeof ipcMain.removeHandler === 'function') {
@@ -3899,6 +5175,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       clearInterval(dreamTimer)
       dreamTimer = undefined
     }
+    clearReminderDueTimer()
     void aliceDb.close().catch((error) => {
       console.warn('[alice-runtime] failed to close sqlite database:', error)
     })
@@ -3923,6 +5200,18 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       },
     })
   })
+  await runReminderCompensationAcrossCards('startup').catch(async (error) => {
+    await appendAuditLog({
+      level: 'warning',
+      category: 'alice.reminder',
+      action: 'startup-compensation-failed',
+      message: 'Startup reminder compensation scan failed.',
+      payload: {
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    })
+  })
+  await scheduleNextReminderDueCheck('startup')
   startPruneTimer()
   startSubconsciousTimer()
   startDreamTimer()

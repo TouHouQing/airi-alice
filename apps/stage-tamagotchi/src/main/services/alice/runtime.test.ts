@@ -18,6 +18,8 @@ import {
   electronAliceBootstrap,
   electronAliceChatAbort,
   electronAliceChatStart,
+  electronAliceClearAllConversations,
+  electronAliceDeleteAllData,
   electronAliceDeleteCardScope,
   electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
@@ -25,6 +27,7 @@ import {
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
   electronAliceLlmSyncConfig,
+  electronAliceReminderSchedule,
   electronAliceSetActiveSession,
   electronAliceSubconsciousForceDream,
   electronAliceSubconsciousForceTick,
@@ -39,6 +42,7 @@ const contextEmitMock = vi.fn()
 const metaStore = new Map<string, string>()
 const streamTextMock = vi.fn()
 const directIpcHandlers = new Map<string, (event: any, payload?: any) => Promise<any> | any>()
+const listWebContentsMock = vi.fn<() => any[]>(() => [])
 let sensoryCpuUsage = 12
 
 const dbStub = {
@@ -72,9 +76,28 @@ const dbStub = {
     archived: 0,
     lastPrunedAt: null,
   }),
+  insertScheduledTask: vi.fn().mockImplementation(async (input: { taskId: string, triggerAt: number, message: string, sourceTurnId?: string }) => ({
+    id: `row:${input.taskId}`,
+    taskId: input.taskId,
+    triggerAt: input.triggerAt,
+    message: input.message,
+    status: 'pending',
+    createdAt: Date.now(),
+    claimedAt: null,
+    completedAt: null,
+    sourceTurnId: input.sourceTurnId ?? null,
+    firedTurnId: null,
+    lastError: null,
+  })),
+  claimDueScheduledTasks: vi.fn().mockResolvedValue([]),
+  requeueScheduledTask: vi.fn().mockResolvedValue(undefined),
+  completeScheduledTask: vi.fn().mockResolvedValue(undefined),
+  failScheduledTask: vi.fn().mockResolvedValue(undefined),
+  listPendingScheduledTasks: vi.fn().mockResolvedValue([]),
   getJournalMode: vi.fn().mockResolvedValue('wal'),
   getLatestConversationSessionId: vi.fn().mockResolvedValue(undefined),
   listConversationTurnsSince: vi.fn().mockResolvedValue([]),
+  clearConversationData: vi.fn().mockResolvedValue(undefined),
   getMetaValue: vi.fn(async (key: string) => metaStore.get(key)),
   setMetaValue: vi.fn(async (key: string, value: string) => {
     metaStore.set(key, value)
@@ -117,6 +140,9 @@ vi.mock('electron', () => ({
     removeHandler: vi.fn((channel: string) => {
       directIpcHandlers.delete(channel)
     }),
+  },
+  webContents: {
+    getAllWebContents: listWebContentsMock,
   },
 }))
 
@@ -199,6 +225,8 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     streamTextMock.mockReset()
     directIpcHandlers.clear()
     sensoryCpuUsage = 12
+    listWebContentsMock.mockReset()
+    listWebContentsMock.mockReturnValue([])
   })
 
   afterEach(async () => {
@@ -463,6 +491,97 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     expect(defaultSoul.soulPath).toContain('/alicizations/cards/default/')
   })
 
+  it('clears conversation and reminder data across all card scopes', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const clearAllConversations = invokeHandlers.get(electronAliceClearAllConversations)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(clearAllConversations).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      cardId: 'card-clear-a',
+      ownerName: 'A',
+      hostName: 'A',
+      aliceName: 'A',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.4,
+        liveliness: 0.4,
+        sensibility: 0.4,
+      },
+      personaNotes: 'A',
+      allowOverwrite: true,
+    })
+    await initializeGenesis!({
+      cardId: 'card-clear-b',
+      ownerName: 'B',
+      hostName: 'B',
+      aliceName: 'B',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.4,
+        liveliness: 0.4,
+        sensibility: 0.4,
+      },
+      personaNotes: 'B',
+      allowOverwrite: true,
+    })
+
+    await clearAllConversations!()
+    expect(dbStub.clearConversationData).toBeCalled()
+    expect(dbStub.setMetaValue).toBeCalledWith('active_session_id_v1', '')
+    expect(dbStub.setMetaValue).toBeCalledWith('dialogue_ack_state_v1', '{}')
+  })
+
+  it('deletes userData alicizations root and reboots default scope when delete-all-data is invoked', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const deleteAllData = invokeHandlers.get(electronAliceDeleteAllData)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(deleteAllData).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      cardId: 'card-delete-all',
+      ownerName: 'DeleteAll',
+      hostName: 'DeleteAll',
+      aliceName: 'DeleteAll',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.4,
+        liveliness: 0.4,
+        sensibility: 0.4,
+      },
+      personaNotes: 'DeleteAll',
+      allowOverwrite: true,
+    })
+
+    const scopedRoot = join(sandboxPath, 'alicizations', 'cards', 'card-delete-all')
+    expect(existsSync(scopedRoot)).toBe(true)
+
+    await deleteAllData!()
+
+    expect(existsSync(scopedRoot)).toBe(false)
+    const resetSoul = await getSoul!({ cardId: 'default' })
+    expect(resetSoul.soulPath).toContain('/alicizations/cards/default/')
+    expect(resetSoul.needsGenesis).toBe(true)
+  })
+
   it('emits alice.dialogue.responded only after turn persistence succeeds', async () => {
     const sandboxPath = await createSandboxPath()
     await setupAliceRuntime({
@@ -494,6 +613,49 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
       sessionId: 'session-test',
       isFallback: false,
     }))
+  })
+
+  it('dispatches dialogue-responded through direct renderer channel', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const appendConversationTurn = invokeHandlers.get(electronAliceAppendConversationTurn)
+    expect(appendConversationTurn).toBeTypeOf('function')
+
+    const sender = {
+      id: 777,
+      isDestroyed: () => false,
+      send: vi.fn(),
+    }
+    listWebContentsMock.mockReturnValue([sender])
+
+    await appendConversationTurn!({
+      cardId: 'default',
+      turnId: 'turn-dialogue-dispatch',
+      sessionId: 'session-test',
+      assistantText: '实时投递',
+      structured: {
+        thought: 'deliver now',
+        emotion: 'neutral',
+        reply: '实时投递',
+        parsePath: 'json',
+      },
+      createdAt: Date.now(),
+    })
+
+    expect(sender.send).toBeCalledWith(
+      aliceChatStreamDispatchChannel,
+      expect.objectContaining({
+        eventType: 'dialogue-responded',
+        body: expect.objectContaining({
+          cardId: 'default',
+          turnId: 'turn-dialogue-dispatch',
+          sessionId: 'session-test',
+        }),
+      }),
+    )
   })
 
   it('normalizes unsupported emotion to neutral and preserves rawEmotion in dialogue event', async () => {
@@ -1223,6 +1385,310 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
       isError: true,
       errorCode: 'MCP_CALL_UNAVAILABLE',
     }))
+  })
+
+  it('registers top-level set_reminder tool and persists scheduled task on success', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ tools, onEvent }) => {
+      const reminderTool = Array.isArray(tools)
+        ? tools.find((entry: any) => entry?.function?.name === 'set_reminder')
+        : undefined
+      expect(String(reminderTool?.function?.description ?? '')).toContain('绝对禁止在本轮回复中直接给出提醒内容')
+      await onEvent?.({
+        type: 'tool-call',
+        toolCallId: 'tool-reminder-1',
+        toolName: 'set_reminder',
+        arguments: { minutes: 3, message: '3分钟后提醒我喝水' },
+      })
+      const toolResult = reminderTool?.execute
+        ? await reminderTool.execute({ minutes: 3, message: '3分钟后提醒我喝水' })
+        : undefined
+      await onEvent?.({
+        type: 'tool-result',
+        toolCallId: 'tool-reminder-1',
+        result: toolResult,
+      })
+      await onEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"已设置提醒","emotion":"neutral","reply":"好的，我会提醒你。"}',
+      })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    expect(startChat).toBeTypeOf('function')
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId: 'turn-main-set-reminder',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      supportsTools: true,
+      waitForTools: true,
+      messages: [{ role: 'user', content: '三分钟后提醒我喝水' }],
+    })
+    expect(startResult.accepted).toBe(true)
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-main-set-reminder')
+      expect(finishEvents).toHaveLength(1)
+    })
+
+    expect(dbStub.insertScheduledTask).toBeCalledTimes(1)
+    expect(dbStub.insertScheduledTask).toBeCalledWith(expect.objectContaining({
+      message: '3分钟后提醒我喝水',
+    }))
+    const reminderToolResult = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamToolResult && payload.turnId === 'turn-main-set-reminder')
+      .map(([, payload]) => payload.result)
+      .at(0)
+    expect(reminderToolResult).toEqual(expect.objectContaining({
+      status: 'scheduled',
+      message: '3分钟后提醒我喝水',
+    }))
+  })
+
+  it('returns explainable error when set_reminder input is invalid', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ tools, onEvent }) => {
+      const reminderTool = Array.isArray(tools)
+        ? tools.find((entry: any) => entry?.function?.name === 'set_reminder')
+        : undefined
+      await onEvent?.({
+        type: 'tool-call',
+        toolCallId: 'tool-reminder-invalid',
+        toolName: 'set_reminder',
+        arguments: { minutes: 0, message: '' },
+      })
+      const toolResult = reminderTool?.execute
+        ? await reminderTool.execute({ minutes: 0, message: '' })
+        : undefined
+      await onEvent?.({
+        type: 'tool-result',
+        toolCallId: 'tool-reminder-invalid',
+        result: toolResult,
+      })
+      await onEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"参数不合法","emotion":"neutral","reply":"无法设置提醒。"}',
+      })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    expect(startChat).toBeTypeOf('function')
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId: 'turn-main-set-reminder-invalid',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      supportsTools: true,
+      waitForTools: true,
+      messages: [{ role: 'user', content: '0分钟后提醒我' }],
+    })
+    expect(startResult.accepted).toBe(true)
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-main-set-reminder-invalid')
+      expect(finishEvents).toHaveLength(1)
+    })
+
+    expect(dbStub.insertScheduledTask).toBeCalledTimes(0)
+    const invalidResult = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamToolResult && payload.turnId === 'turn-main-set-reminder-invalid')
+      .map(([, payload]) => payload.result)
+      .at(0)
+    expect(invalidResult).toEqual(expect.objectContaining({
+      status: 'error',
+      code: 'ALICE_REMINDER_INVALID_MINUTES',
+    }))
+  })
+
+  it('supports deterministic reminder scheduling via invoke handler fallback', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const scheduleReminder = invokeHandlers.get(electronAliceReminderSchedule)
+    expect(scheduleReminder).toBeTypeOf('function')
+
+    const result = await scheduleReminder!({
+      cardId: 'default',
+      minutes: 1,
+      message: '喝水',
+      sourceTurnId: 'turn-reminder-fallback',
+    })
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'scheduled',
+      message: '喝水',
+    }))
+    expect(dbStub.insertScheduledTask).toBeCalledWith(expect.objectContaining({
+      message: '喝水',
+      sourceTurnId: 'turn-reminder-fallback',
+    }))
+  })
+
+  it('processes due reminder tasks during subconscious tick with overdue tier auditing', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ messages, onEvent }: { messages?: Array<{ role?: string, content?: unknown }>, onEvent?: (event: any) => Promise<void> | void }) => {
+      const systemMessage = messages?.find(message => message.role === 'system')
+      const systemText = typeof systemMessage?.content === 'string' ? systemMessage.content : ''
+      const reminderMatch = /Reminder content: "([^"]+)"/.exec(systemText)
+      const reminderText = reminderMatch?.[1] ?? '提醒事项'
+      await onEvent?.({
+        type: 'text-delta',
+        text: JSON.stringify({
+          thought: `按要求执行提醒：${reminderText}`,
+          emotion: 'tired',
+          reply: `提醒你：${reminderText}`,
+        }),
+      })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+    const forceTick = invokeHandlers.get(electronAliceSubconsciousForceTick)
+    const syncLlmConfig = invokeHandlers.get(electronAliceLlmSyncConfig)
+    expect(forceTick).toBeTypeOf('function')
+    expect(syncLlmConfig).toBeTypeOf('function')
+
+    await syncLlmConfig!({
+      activeProviderId: 'openai',
+      activeModelId: 'gpt-4o-mini',
+      providerCredentials: {
+        openai: {
+          apiKey: 'test-key',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+      },
+    })
+
+    const nowMs = Date.now()
+    dbStub.claimDueScheduledTasks.mockResolvedValueOnce([
+      {
+        id: 'row-reminder-mild',
+        taskId: 'task-reminder-mild',
+        triggerAt: nowMs - 2 * 60_000,
+        message: '轻微延迟提醒',
+        status: 'running',
+        createdAt: nowMs - 3 * 60_000,
+        claimedAt: nowMs,
+        completedAt: null,
+        sourceTurnId: null,
+        firedTurnId: null,
+        lastError: null,
+      },
+      {
+        id: 'row-reminder-severe',
+        taskId: 'task-reminder-severe',
+        triggerAt: nowMs - 8 * 60_000,
+        message: '严重延迟提醒',
+        status: 'running',
+        createdAt: nowMs - 9 * 60_000,
+        claimedAt: nowMs,
+        completedAt: null,
+        sourceTurnId: null,
+        firedTurnId: null,
+        lastError: null,
+      },
+    ])
+
+    await forceTick!({ cardId: 'default' })
+
+    expect(dbStub.completeScheduledTask).toBeCalledTimes(2)
+    expect(dbStub.failScheduledTask).toBeCalledTimes(0)
+
+    const reminderEvents = getDialogueRespondedEvents()
+      .filter(event => event.origin === 'subconscious-proactive')
+      .map(event => event.structured.reply)
+    expect(reminderEvents.some(reply => reply.includes('轻微延迟提醒'))).toBe(true)
+    expect(reminderEvents.some(reply => reply.includes('严重延迟提醒'))).toBe(true)
+
+    const overdueAudits = dbStub.appendAuditLog.mock.calls
+      .map(call => call[0])
+      .filter((item: any) => item.action === 'alice.reminder.task.overdue-triggered')
+    const tiers = overdueAudits.map((item: any) => item.payload?.tier).sort()
+    expect(tiers).toEqual(['mild', 'severe'])
+  })
+
+  it('requeues reminder task when llm reminder generation fails', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async () => {
+      throw new Error('main gateway unavailable')
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+    const forceTick = invokeHandlers.get(electronAliceSubconsciousForceTick)
+    const syncLlmConfig = invokeHandlers.get(electronAliceLlmSyncConfig)
+    expect(forceTick).toBeTypeOf('function')
+    expect(syncLlmConfig).toBeTypeOf('function')
+
+    await syncLlmConfig!({
+      activeProviderId: 'openai',
+      activeModelId: 'gpt-4o-mini',
+      providerCredentials: {
+        openai: {
+          apiKey: 'test-key',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+      },
+    })
+
+    const nowMs = Date.now()
+    dbStub.claimDueScheduledTasks.mockResolvedValueOnce([
+      {
+        id: 'row-reminder-fallback',
+        taskId: 'task-reminder-fallback',
+        triggerAt: nowMs - 7 * 60_000,
+        message: 'fallback提醒',
+        status: 'running',
+        createdAt: nowMs - 8 * 60_000,
+        claimedAt: nowMs,
+        completedAt: null,
+        sourceTurnId: null,
+        firedTurnId: null,
+        lastError: null,
+      },
+    ])
+
+    await forceTick!({ cardId: 'default' })
+
+    expect(dbStub.completeScheduledTask).toBeCalledTimes(0)
+    expect(dbStub.failScheduledTask).toBeCalledTimes(0)
+    expect(dbStub.requeueScheduledTask).toBeCalledTimes(1)
+    expect(dbStub.requeueScheduledTask).toBeCalledWith(
+      'task-reminder-fallback',
+      'llm-unavailable',
+      expect.any(Number),
+    )
+    expect(dbStub.appendConversationTurn).toBeCalledTimes(0)
+
+    const failedAudit = dbStub.appendAuditLog.mock.calls
+      .map(call => call[0])
+      .find((item: any) => item.action === 'alice.reminder.task.failed')
+    expect(failedAudit?.payload?.reason).toBe('llm-unavailable')
   })
 
   it('keeps a single aborted finish when stream is aborted after tool events', async () => {

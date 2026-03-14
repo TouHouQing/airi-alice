@@ -182,7 +182,7 @@ function summarizeToolArguments(input: unknown) {
 }
 
 function looksLikePathString(value: string) {
-  return value.includes('/') || value.includes('\\') || /^~/.test(value) || /^[a-z]:[\\/]/i.test(value) || value.startsWith('.')
+  return value.includes('/') || value.includes('\\') || value.startsWith('~') || /^[a-z]:[\\/]/i.test(value) || value.startsWith('.')
 }
 
 function collectPathCandidates(input: unknown, keyHint = '', depth = 0): string[] {

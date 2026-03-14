@@ -59,6 +59,36 @@ interface DbConversationTurnRow {
   created_at: number
 }
 
+type AliceScheduledTaskStatus = 'pending' | 'running' | 'completed' | 'failed'
+
+export interface AliceScheduledTaskRecord {
+  id: string
+  taskId: string
+  triggerAt: number
+  message: string
+  status: AliceScheduledTaskStatus
+  createdAt: number
+  claimedAt: number | null
+  completedAt: number | null
+  sourceTurnId: string | null
+  firedTurnId: string | null
+  lastError: string | null
+}
+
+interface DbScheduledTaskRow {
+  id: string
+  task_id: string
+  trigger_at: number
+  message: string
+  status: AliceScheduledTaskStatus
+  created_at: number
+  claimed_at: number | null
+  completed_at: number | null
+  source_turn_id: string | null
+  fired_turn_id: string | null
+  last_error: string | null
+}
+
 interface DbWriteOptions {
   signal?: AbortSignal
 }
@@ -129,6 +159,22 @@ function mapFactRow(row: DbMemoryFactRow): AliceMemoryFact {
 
 function now() {
   return Date.now()
+}
+
+function mapScheduledTaskRow(row: DbScheduledTaskRow): AliceScheduledTaskRecord {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    triggerAt: row.trigger_at,
+    message: row.message,
+    status: row.status,
+    createdAt: row.created_at,
+    claimedAt: row.claimed_at,
+    completedAt: row.completed_at,
+    sourceTurnId: row.source_turn_id,
+    firedTurnId: row.fired_turn_id,
+    lastError: row.last_error,
+  }
 }
 
 function createAbortError(reason?: unknown) {
@@ -252,6 +298,15 @@ export interface AliceDbService {
     structuredJson: string | null
     createdAt: number
   }>>
+  listConversationTurnsBySession: (sessionId: string, options?: { sinceCreatedAt?: number, limit?: number }) => Promise<Array<{
+    turnId: string | null
+    sessionId: string
+    userText: string | null
+    assistantText: string | null
+    structuredJson: string | null
+    createdAt: number
+  }>>
+  clearConversationData: () => Promise<void>
   appendAuditLog: (input: AliceAuditLogInput) => Promise<void>
   appendConversationTurn: (input: AliceConversationTurnInput, options?: DbWriteOptions) => Promise<void>
   getMemoryStats: () => Promise<AliceMemoryStats>
@@ -260,6 +315,17 @@ export interface AliceDbService {
   runMemoryPrune: () => Promise<AliceMemoryStats>
   importLegacyMemory: (snapshot: AliceMemoryLegacySnapshot) => Promise<AliceMemoryMigrationResult>
   overrideMemoryStats: (next: AliceMemoryStats) => Promise<AliceMemoryStats>
+  insertScheduledTask: (input: {
+    taskId: string
+    triggerAt: number
+    message: string
+    sourceTurnId?: string
+  }) => Promise<AliceScheduledTaskRecord>
+  claimDueScheduledTasks: (nowMs: number, limit: number) => Promise<AliceScheduledTaskRecord[]>
+  requeueScheduledTask: (taskId: string, reason?: string, nextTriggerAt?: number) => Promise<void>
+  completeScheduledTask: (taskId: string, firedTurnId: string, completedAt?: number) => Promise<void>
+  failScheduledTask: (taskId: string, error: string, completedAt?: number) => Promise<void>
+  listPendingScheduledTasks: (limit?: number) => Promise<AliceScheduledTaskRecord[]>
   getJournalMode: () => Promise<string>
 }
 
@@ -372,6 +438,24 @@ export async function setupAliceDb(
         updated_at INTEGER NOT NULL
       )
     `)
+
+    await run(database, `
+      CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL UNIQUE,
+        trigger_at INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        claimed_at INTEGER,
+        completed_at INTEGER,
+        source_turn_id TEXT,
+        fired_turn_id TEXT,
+        last_error TEXT
+      )
+    `)
+    await run(database, 'CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status_trigger_at ON scheduled_tasks(status, trigger_at)')
+    await run(database, 'CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_task_id ON scheduled_tasks(task_id)')
   }
 
   async function upsertMeta(key: string, value: string) {
@@ -533,6 +617,240 @@ export async function setupAliceDb(
       structuredJson: row.structured_json,
       createdAt: row.created_at,
     }))
+  }
+
+  async function listConversationTurnsBySession(sessionIdRaw: string, options?: { sinceCreatedAt?: number, limit?: number }) {
+    const sessionId = sessionIdRaw.trim()
+    if (!sessionId)
+      return []
+
+    const sinceCreatedAt = Number.isFinite(options?.sinceCreatedAt)
+      ? Math.max(0, Math.floor(Number(options?.sinceCreatedAt)))
+      : 0
+    const limit = Math.max(1, Math.min(10_000, Math.floor(options?.limit ?? 500)))
+    const rows = await all<DbConversationTurnRow>(
+      database,
+      `
+      SELECT
+        turn_id,
+        session_id,
+        user_text,
+        assistant_text,
+        structured_json,
+        created_at
+      FROM conversation_turns
+      WHERE session_id = ?
+        AND created_at >= ?
+      ORDER BY created_at ASC
+      LIMIT ?
+      `,
+      [sessionId, sinceCreatedAt, limit],
+    )
+
+    return rows.map(row => ({
+      turnId: row.turn_id,
+      sessionId: row.session_id,
+      userText: row.user_text,
+      assistantText: row.assistant_text,
+      structuredJson: row.structured_json,
+      createdAt: row.created_at,
+    }))
+  }
+
+  async function clearConversationData() {
+    await enqueueWrite(async () => await runInTransaction(database, async () => {
+      await run(database, 'DELETE FROM conversation_turns')
+      await run(database, 'DELETE FROM scheduled_tasks')
+    }))
+  }
+
+  async function insertScheduledTask(input: {
+    taskId: string
+    triggerAt: number
+    message: string
+    sourceTurnId?: string
+  }) {
+    const taskId = input.taskId.trim()
+    const message = input.message.trim()
+    if (!taskId)
+      throw new Error('taskId is required')
+    if (!message)
+      throw new Error('message is required')
+
+    const createdAt = now()
+    const triggerAt = Number.isFinite(input.triggerAt) ? Math.floor(input.triggerAt) : createdAt
+    const id = randomUUID()
+    const sourceTurnId = input.sourceTurnId?.trim() || null
+    await enqueueWrite(async () => {
+      await run(
+        database,
+        `
+        INSERT INTO scheduled_tasks (
+          id,
+          task_id,
+          trigger_at,
+          message,
+          status,
+          created_at,
+          source_turn_id
+        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        `,
+        [id, taskId, triggerAt, message, createdAt, sourceTurnId],
+      )
+    })
+
+    return {
+      id,
+      taskId,
+      triggerAt,
+      message,
+      status: 'pending',
+      createdAt,
+      claimedAt: null,
+      completedAt: null,
+      sourceTurnId,
+      firedTurnId: null,
+      lastError: null,
+    } satisfies AliceScheduledTaskRecord
+  }
+
+  async function claimDueScheduledTasks(nowMs: number, limit: number) {
+    const safeNow = Number.isFinite(nowMs) ? Math.floor(nowMs) : now()
+    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)))
+    return await enqueueWrite(async () => await runInTransaction(database, async () => {
+      const dueRows = await all<DbScheduledTaskRow>(
+        database,
+        `
+        SELECT *
+        FROM scheduled_tasks
+        WHERE status = 'pending'
+          AND trigger_at <= ?
+        ORDER BY trigger_at ASC
+        LIMIT ?
+        `,
+        [safeNow, safeLimit],
+      )
+      const claimed: AliceScheduledTaskRecord[] = []
+      for (const row of dueRows) {
+        const claimAt = now()
+        const result = await run(
+          database,
+          `
+          UPDATE scheduled_tasks
+          SET status = 'running',
+              claimed_at = ?,
+              last_error = NULL
+          WHERE id = ?
+            AND status = 'pending'
+          `,
+          [claimAt, row.id],
+        )
+        if (result.changes < 1)
+          continue
+
+        claimed.push({
+          ...mapScheduledTaskRow(row),
+          status: 'running',
+          claimedAt: claimAt,
+          lastError: null,
+        })
+      }
+      return claimed
+    }))
+  }
+
+  async function completeScheduledTask(taskIdRaw: string, firedTurnIdRaw: string, completedAtRaw?: number) {
+    const taskId = taskIdRaw.trim()
+    const firedTurnId = firedTurnIdRaw.trim()
+    if (!taskId)
+      throw new Error('taskId is required')
+    if (!firedTurnId)
+      throw new Error('firedTurnId is required')
+    const completedAt = typeof completedAtRaw === 'number' && Number.isFinite(completedAtRaw)
+      ? Math.floor(completedAtRaw)
+      : now()
+
+    await enqueueWrite(async () => {
+      await run(
+        database,
+        `
+        UPDATE scheduled_tasks
+        SET status = 'completed',
+            fired_turn_id = ?,
+            completed_at = ?,
+            last_error = NULL
+        WHERE task_id = ?
+        `,
+        [firedTurnId, completedAt, taskId],
+      )
+    })
+  }
+
+  async function requeueScheduledTask(taskIdRaw: string, reasonRaw?: string, nextTriggerAtRaw?: number) {
+    const taskId = taskIdRaw.trim()
+    if (!taskId)
+      throw new Error('taskId is required')
+    const reason = reasonRaw?.trim() || null
+    const nextTriggerAt = Number.isFinite(nextTriggerAtRaw)
+      ? Math.max(0, Math.floor(Number(nextTriggerAtRaw)))
+      : null
+
+    await enqueueWrite(async () => {
+      await run(
+        database,
+        `
+        UPDATE scheduled_tasks
+        SET status = 'pending',
+            trigger_at = COALESCE(?, trigger_at),
+            claimed_at = NULL,
+            completed_at = NULL,
+            fired_turn_id = NULL,
+            last_error = ?
+        WHERE task_id = ?
+        `,
+        [nextTriggerAt, reason, taskId],
+      )
+    })
+  }
+
+  async function failScheduledTask(taskIdRaw: string, errorRaw: string, completedAtRaw?: number) {
+    const taskId = taskIdRaw.trim()
+    if (!taskId)
+      throw new Error('taskId is required')
+    const message = errorRaw.trim() || 'unknown reminder error'
+    const completedAt = typeof completedAtRaw === 'number' && Number.isFinite(completedAtRaw)
+      ? Math.floor(completedAtRaw)
+      : now()
+
+    await enqueueWrite(async () => {
+      await run(
+        database,
+        `
+        UPDATE scheduled_tasks
+        SET status = 'failed',
+            completed_at = ?,
+            last_error = ?
+        WHERE task_id = ?
+        `,
+        [completedAt, message, taskId],
+      )
+    })
+  }
+
+  async function listPendingScheduledTasks(limit = 200) {
+    const safeLimit = Math.max(1, Math.min(2000, Math.floor(limit)))
+    const rows = await all<DbScheduledTaskRow>(
+      database,
+      `
+      SELECT *
+      FROM scheduled_tasks
+      WHERE status = 'pending'
+      ORDER BY trigger_at ASC
+      LIMIT ?
+      `,
+      [safeLimit],
+    )
+    return rows.map(mapScheduledTaskRow)
   }
 
   async function upsertMemoryFacts(facts: AliceMemoryFactInput[], source: AliceMemorySource) {
@@ -916,6 +1234,8 @@ export async function setupAliceDb(
     },
     getLatestConversationSessionId,
     listConversationTurnsSince,
+    listConversationTurnsBySession,
+    clearConversationData,
     appendAuditLog,
     appendConversationTurn,
     getMemoryStats,
@@ -924,6 +1244,12 @@ export async function setupAliceDb(
     runMemoryPrune,
     importLegacyMemory,
     overrideMemoryStats,
+    insertScheduledTask,
+    claimDueScheduledTasks,
+    requeueScheduledTask,
+    completeScheduledTask,
+    failScheduledTask,
+    listPendingScheduledTasks,
     getJournalMode,
   }
 }

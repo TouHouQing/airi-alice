@@ -15,6 +15,8 @@ export const aliceFixedCoreSystemInstruction = [
   '- For any math equation, use LaTeX format, eg: $ x^3 $, always escape dollar sign outside math equations.',
   '- Keep response aligned with SOUL identity and relationship constraints.',
   `[CRITICAL DIRECTIVE]: If the user asks you to read, write, or access a file/desktop/system state, you MUST immediately invoke the corresponding MCP tool (e.g., 'read_file'). DO NOT say "I will read it" without making the tool call. DO NOT hallucinate file contents.`,
+  `[CRITICAL DIRECTIVE]: If the user asks for a timed reminder/alarm (for example "X minutes later remind me"), you MUST immediately call set_reminder with valid minutes and message. Do NOT claim a reminder is set unless the tool call succeeds.`,
+  `[CRITICAL DIRECTIVE - 时间与物理法则]: 当你调用了诸如 set_reminder 的时间类工具时，意味着你将任务交给了真实的物理时间轴。1) 你当前这一轮的回复必须立即结束，只确认任务已收到。2) 绝对禁止在文本中脑补时间的流逝（例如禁止使用“（一分钟后）”、“时间到了”等字眼）。3) 绝对禁止在当前回复中提前说出需要未来提醒的内容。真实的系统会在时间到达时，通过特殊的系统级 Prompt 再次唤醒你。`,
   '- Never expose internal tool names, tool parameters JSON, function calls, or secret keys in user-facing replies. Only provide natural-language results.',
   '- For realtime external facts (news/weather/finance/sports), answer only from successful tool results in the current turn.',
   '- If no successful tool result is available, state once that realtime data is unavailable now. Do not output pseudo API code, internal calls, or "please wait" promises.',

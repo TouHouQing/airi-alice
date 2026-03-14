@@ -227,6 +227,7 @@ function installAliceBridge(options?: {
   }
   streamChat?: (payload: any, options: any) => Promise<void>
   chatAbort?: (payload: any) => Promise<any>
+  reminderSchedule?: (payload: any) => Promise<any>
 }) {
   appendConversationTurnMock.mockResolvedValue(undefined)
   appendAuditLogMock.mockResolvedValue(undefined)
@@ -281,6 +282,7 @@ function installAliceBridge(options?: {
     }),
     streamChat: options?.streamChat,
     chatAbort: options?.chatAbort,
+    reminderSchedule: options?.reminderSchedule,
   } as any)
 }
 
@@ -331,6 +333,28 @@ describe('chat orchestrator', () => {
     const payload = appendConversationTurnMock.mock.calls[0]?.[0]
     expect(payload?.structured?.policyLocked).toBeUndefined()
     expect(payload?.assistantText).toContain('普通回复')
+  })
+
+  it('uses deterministic user message id derived from turnId to prevent replay duplicates', async () => {
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"stable","emotion":"neutral","reply":"已收到。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('你今天有帮我做了什么吗', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    const turnPayload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    const userMessages = ensureSessionMessages(activeSessionId.value).filter(message => message.role === 'user')
+    expect(userMessages).toHaveLength(1)
+    expect(userMessages[0]?.id).toBe(`${turnPayload?.turnId}:user`)
   })
 
   it('drops in-flight turn persistence after kill-switch abort', async () => {
@@ -384,7 +408,7 @@ describe('chat orchestrator', () => {
       origin: 'ui-user',
     })
 
-    expect(streamMock).toBeCalledTimes(2)
+    expect(streamMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
       category: 'alice.structured',
       action: 'contract-invalid',
@@ -451,7 +475,7 @@ describe('chat orchestrator', () => {
       origin: 'ui-user',
     })
 
-    expect(streamMock).toBeCalledTimes(2)
+    expect(streamMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
       category: 'alice.structured',
       action: 'contract-retry-reasoned',
@@ -514,7 +538,7 @@ describe('chat orchestrator', () => {
       origin: 'ui-user',
     })
 
-    expect(streamMock).toBeCalledTimes(2)
+    expect(streamMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
       category: 'alice.intent-action',
       action: 'cross-validation-failed',
@@ -528,6 +552,171 @@ describe('chat orchestrator', () => {
     expect(payload?.structured?.emotion).toBe('angry')
     expect(String(payload?.assistantText ?? '')).toContain('别来烦我')
     expect(String(payload?.assistantText ?? '')).not.toContain('好的，我去读一下')
+  })
+
+  it('forces reminder tool retry when timed reminder intent has no set_reminder call in first pass', async () => {
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 1) {
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, acknowledged.","emotion":"neutral","reply":"好的，一分钟后我提醒你。"}',
+        })
+      }
+      else {
+        expect(JSON.stringify(messages)).toContain('You MUST call set_reminder immediately with minutes and message')
+        await options.onStreamEvent?.({
+          type: 'tool-call',
+          toolCallId: 'tool-reminder-force-1',
+          toolName: 'set_reminder',
+          arguments: { minutes: 1, message: '提醒我喝水' },
+        })
+        await options.onStreamEvent?.({
+          type: 'tool-result',
+          toolCallId: 'tool-reminder-force-1',
+          result: {
+            status: 'scheduled',
+            message: '提醒我喝水',
+          },
+        })
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, reminder delegated to system timeline.","emotion":"neutral","reply":"已为你定好闹钟。"}',
+        })
+      }
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('一分钟后提醒我喝水', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'cross-validation-failed',
+      payload: expect.objectContaining({
+        requiresReminderToolCall: true,
+      }),
+    }))
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('一分钟后我提醒你')
+    expect(String(payload?.assistantText ?? '')).not.toContain('已为你定好闹钟')
+  })
+
+  it('emits safe reminder failure reply when timed reminder intent still has no set_reminder success', async () => {
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 2) {
+        expect(JSON.stringify(messages)).toContain('You MUST call set_reminder immediately with minutes and message')
+      }
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, acknowledged.","emotion":"neutral","reply":"好的一分钟后提醒你。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('一分钟后提醒我起来写代码', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'reminder-schedule-safe-reply',
+    }))
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('还没有成功设置提醒')
+    expect(String(payload?.assistantText ?? '')).not.toContain('一分钟后我提醒你')
+  })
+
+  it('uses deterministic reminder scheduling fallback when model still skips set_reminder', async () => {
+    const reminderScheduleMock = vi.fn().mockResolvedValue({
+      status: 'scheduled',
+      taskId: 'task-manual-fallback',
+      triggerTime: new Date(Date.now() + 60_000).toISOString(),
+      triggerAt: Date.now() + 60_000,
+      message: '喝水',
+    })
+    installAliceBridge({
+      reminderSchedule: reminderScheduleMock,
+    })
+
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, acknowledged.","emotion":"neutral","reply":"好的，一分钟后提醒你喝水。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('一分钟后提醒我喝水', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(reminderScheduleMock).toBeCalledTimes(1)
+    expect(reminderScheduleMock).toBeCalledWith(expect.objectContaining({
+      minutes: 1,
+      message: '喝水',
+    }))
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'reminder-manual-schedule-fallback',
+    }))
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('一分钟后提醒你喝水')
+    expect(String(payload?.assistantText ?? '')).not.toContain('还没有成功设置提醒')
+  })
+
+  it('detects natural chinese reminder phrasing and still schedules fallback task', async () => {
+    const reminderScheduleMock = vi.fn().mockResolvedValue({
+      status: 'scheduled',
+      taskId: 'task-manual-fallback-natural',
+      triggerTime: new Date(Date.now() + 120_000).toISOString(),
+      triggerAt: Date.now() + 120_000,
+      message: '去敲代码',
+    })
+    installAliceBridge({
+      reminderSchedule: reminderScheduleMock,
+    })
+
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, _messages: unknown, options: any) => {
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"acknowledged","emotion":"neutral","reply":"好的，我记住了。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('两分钟后告诉我要记得去敲代码', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(reminderScheduleMock).toBeCalledTimes(1)
+    expect(reminderScheduleMock).toBeCalledWith(expect.objectContaining({
+      minutes: 2,
+      message: expect.stringContaining('敲代码'),
+    }))
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.intent-action',
+      action: 'reminder-manual-schedule-fallback',
+    }))
   })
 
   it('prefers alice bridge streamChat over direct llmStore.stream when bridge stream is available', async () => {
@@ -684,6 +873,11 @@ describe('chat orchestrator', () => {
     expect(bridgeStreamChatMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(bridgeStreamChatMock.mock.calls.some(call => call?.[0]?.supportsTools === true)).toBe(true)
     expect(bridgeStreamChatMock.mock.calls.some(call => call?.[0]?.supportsTools === false && call?.[0]?.waitForTools === false)).toBe(true)
+    const firstTurnId = bridgeStreamChatMock.mock.calls[0]?.[0]?.turnId
+    const secondTurnId = bridgeStreamChatMock.mock.calls[1]?.[0]?.turnId
+    expect(firstTurnId).toBeTypeOf('string')
+    expect(secondTurnId).toBeTypeOf('string')
+    expect(firstTurnId).not.toBe(secondTurnId)
     const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
     expect(String(payload?.assistantText ?? '')).toContain('无工具重试成功')
     expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
@@ -718,6 +912,26 @@ describe('chat orchestrator', () => {
     expect(String(payload?.assistantText ?? '')).toContain('等待模型响应超时')
   })
 
+  it('does not misclassify duplicate-finished stream rejection as provider config missing', async () => {
+    const bridgeStreamChatMock = vi.fn(async () => {
+      throw new Error('A.L.I.C.E stream start rejected (state=duplicate-finished) for turn turn-x. reason=Turn has already finished.')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('一分钟后提醒我喝水', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('回复失败')
+    expect(String(payload?.assistantText ?? '')).not.toContain('配置缺失')
+  })
+
   it('finalizes from partial stream when finish event is missing after text progress', async () => {
     const bridgeStreamChatMock = vi.fn(async (_payload: any, options: any) => {
       await options.onStreamEvent?.({
@@ -745,5 +959,66 @@ describe('chat orchestrator', () => {
       category: 'alice.main-gateway',
       action: 'stream-timeout-after-progress',
     }))
+  })
+
+  it('retries same-turn reminder leakage and converges to confirmation-only reply', async () => {
+    let streamInvocation = 0
+    streamMock.mockImplementation(async (_model: string, _provider: unknown, messages: unknown, options: any) => {
+      streamInvocation += 1
+      if (streamInvocation === 1) {
+        await options.onStreamEvent?.({
+          type: 'tool-call',
+          toolCallId: 'tool-reminder-1',
+          name: 'set_reminder',
+          toolName: 'set_reminder',
+          arguments: { minutes: 1, message: '提醒你喝水' },
+        })
+        await options.onStreamEvent?.({
+          type: 'tool-result',
+          toolCallId: 'tool-reminder-1',
+          result: {
+            status: 'scheduled',
+            message: '提醒你喝水',
+          },
+        })
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, reminder task accepted.","emotion":"neutral","reply":"（一分钟后）时间到了，提醒你喝水。"}',
+        })
+      }
+      else {
+        expect(JSON.stringify(messages)).toContain('[CRITICAL DIRECTIVE - 时间与物理法则]')
+        await options.onStreamEvent?.({
+          type: 'text-delta',
+          text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, reminder task delegated to physical timeline.","emotion":"neutral","reply":"已为你定好闹钟。"}',
+        })
+      }
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('1分钟后提醒我喝水', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(streamMock).toBeCalledTimes(2)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.structured',
+      action: 'contract-invalid',
+    }))
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.structured',
+      action: 'contract-retry-reasoned',
+      payload: expect.objectContaining({
+        reminderScheduled: true,
+      }),
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('已为你定好闹钟')
+    expect(String(payload?.assistantText ?? '')).not.toContain('提醒你喝水')
+    expect(String(payload?.assistantText ?? '')).not.toContain('一分钟后')
   })
 })

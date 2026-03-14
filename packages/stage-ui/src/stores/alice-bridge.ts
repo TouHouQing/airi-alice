@@ -315,6 +315,15 @@ export interface AliceChatAbortResult {
   state: 'aborted' | 'not-found' | 'finished'
 }
 
+export interface AliceReminderScheduleResult {
+  status: 'scheduled' | 'error'
+  taskId?: string
+  triggerTime?: string
+  triggerAt?: number
+  message?: string
+  code?: string
+}
+
 export type AliceBridgeChatStreamEvent
   = | { type: 'text-delta', text: string }
     | { type: 'tool-call', toolCallId: string, toolName: string, args: string, toolCallType: 'function' }
@@ -371,6 +380,8 @@ interface AliceBridge {
   getLlmConfig?: () => Promise<AliceLlmConfigPayload>
   chatStart?: (payload: Omit<AliceChatStartPayload, 'cardId'>) => Promise<AliceChatStartResult>
   chatAbort?: (payload: { turnId: string, reason?: string }) => Promise<AliceChatAbortResult>
+  reminderSchedule?: (payload: { minutes: number, message: string, sourceTurnId?: string }) => Promise<AliceReminderScheduleResult>
+  clearAllConversations?: () => Promise<void>
   streamChat?: (
     payload: Omit<AliceChatStartPayload, 'cardId'>,
     options: {
@@ -379,6 +390,7 @@ interface AliceBridge {
     },
   ) => Promise<void>
   deleteCardScope?: (scope: AliceCardScope) => Promise<void>
+  deleteAllData?: () => Promise<void>
 }
 
 let bridge: AliceBridge | undefined

@@ -8,6 +8,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const runCalls: string[] = []
 const metaState = new Map<string, string>()
+const scheduledTasks = new Map<string, {
+  id: string
+  task_id: string
+  trigger_at: number
+  message: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  created_at: number
+  claimed_at: number | null
+  completed_at: number | null
+  source_turn_id: string | null
+  fired_turn_id: string | null
+  last_error: string | null
+}>()
 const sandboxDirs: string[] = []
 
 async function createSandboxUserDataPath() {
@@ -25,6 +38,7 @@ class FakeSqliteDatabase {
     const actualParams = Array.isArray(params) ? params : []
     const actualCallback = (typeof params === 'function' ? params : callback) as ((this: { changes: number, lastID: number }, error: Error | null) => void) | undefined
     runCalls.push(sql)
+    let changes = 1
 
     if (sql.includes('INSERT INTO alice_meta')) {
       const [key, value] = actualParams as [string, string]
@@ -33,7 +47,80 @@ class FakeSqliteDatabase {
       }
     }
 
-    actualCallback?.call({ changes: 1, lastID: 1 }, null)
+    if (sql.includes('INSERT INTO scheduled_tasks')) {
+      const [id, taskId, triggerAt, message, createdAt, sourceTurnId] = actualParams as [string, string, number, string, number, string | null]
+      scheduledTasks.set(taskId, {
+        id,
+        task_id: taskId,
+        trigger_at: triggerAt,
+        message,
+        status: 'pending',
+        created_at: createdAt,
+        claimed_at: null,
+        completed_at: null,
+        source_turn_id: sourceTurnId ?? null,
+        fired_turn_id: null,
+        last_error: null,
+      })
+    }
+    else if (sql.includes('UPDATE scheduled_tasks') && sql.includes('status = \'running\'')) {
+      const [claimedAt, id] = actualParams as [number, string]
+      const task = [...scheduledTasks.values()].find(item => item.id === id && item.status === 'pending')
+      if (!task) {
+        changes = 0
+      }
+      else {
+        task.status = 'running'
+        task.claimed_at = claimedAt
+        task.last_error = null
+      }
+    }
+    else if (sql.includes('UPDATE scheduled_tasks') && sql.includes('status = \'pending\'')) {
+      const [nextTriggerAt, reason, taskId] = actualParams as [number | null, string | null, string]
+      const task = scheduledTasks.get(taskId)
+      if (!task) {
+        changes = 0
+      }
+      else {
+        task.status = 'pending'
+        if (typeof nextTriggerAt === 'number' && Number.isFinite(nextTriggerAt))
+          task.trigger_at = nextTriggerAt
+        task.claimed_at = null
+        task.completed_at = null
+        task.fired_turn_id = null
+        task.last_error = reason ?? null
+      }
+    }
+    else if (sql.includes('UPDATE scheduled_tasks') && sql.includes('status = \'completed\'')) {
+      const [firedTurnId, completedAt, taskId] = actualParams as [string, number, string]
+      const task = scheduledTasks.get(taskId)
+      if (!task) {
+        changes = 0
+      }
+      else {
+        task.status = 'completed'
+        task.fired_turn_id = firedTurnId
+        task.completed_at = completedAt
+        task.last_error = null
+      }
+    }
+    else if (sql.includes('UPDATE scheduled_tasks') && sql.includes('status = \'failed\'')) {
+      const [completedAt, lastError, taskId] = actualParams as [number, string, string]
+      const task = scheduledTasks.get(taskId)
+      if (!task) {
+        changes = 0
+      }
+      else {
+        task.status = 'failed'
+        task.completed_at = completedAt
+        task.last_error = lastError
+      }
+    }
+    else if (sql.includes('DELETE FROM scheduled_tasks')) {
+      scheduledTasks.clear()
+    }
+
+    actualCallback?.call({ changes, lastID: 1 }, null)
     return this
   }
 
@@ -72,7 +159,26 @@ class FakeSqliteDatabase {
   }
 
   all(_sql: string, _params: unknown[] | ((error: Error | null, rows?: unknown[]) => void), callback?: (error: Error | null, rows?: unknown[]) => void) {
+    const actualParams = Array.isArray(_params) ? _params : []
     const actualCallback = (typeof _params === 'function' ? _params : callback) as ((error: Error | null, rows?: unknown[]) => void) | undefined
+    if (_sql.includes('FROM scheduled_tasks') && _sql.includes('status = \'pending\'') && _sql.includes('trigger_at <= ?')) {
+      const [nowMs, limit] = actualParams as [number, number]
+      const rows = [...scheduledTasks.values()]
+        .filter(item => item.status === 'pending' && item.trigger_at <= nowMs)
+        .sort((a, b) => a.trigger_at - b.trigger_at)
+        .slice(0, limit)
+      actualCallback?.(null, rows)
+      return this
+    }
+    if (_sql.includes('FROM scheduled_tasks') && _sql.includes('status = \'pending\'') && _sql.includes('ORDER BY trigger_at ASC')) {
+      const [limit] = actualParams as [number]
+      const rows = [...scheduledTasks.values()]
+        .filter(item => item.status === 'pending')
+        .sort((a, b) => a.trigger_at - b.trigger_at)
+        .slice(0, limit)
+      actualCallback?.(null, rows)
+      return this
+    }
     actualCallback?.(null, [])
     return this
   }
@@ -105,6 +211,7 @@ describe('alice sqlite dao', () => {
   it('initializes sqlite pragmas with WAL', async () => {
     runCalls.length = 0
     metaState.clear()
+    scheduledTasks.clear()
 
     const db = await setupAliceDb(await createSandboxUserDataPath())
     expect(runCalls.some(sql => sql.includes('PRAGMA journal_mode = WAL'))).toBe(true)
@@ -113,9 +220,23 @@ describe('alice sqlite dao', () => {
     await db.close()
   })
 
+  it('clears conversation turns and scheduled tasks with a single maintenance API', async () => {
+    runCalls.length = 0
+    metaState.clear()
+    scheduledTasks.clear()
+
+    const db = await setupAliceDb(await createSandboxUserDataPath())
+    await db.clearConversationData()
+
+    expect(runCalls.some(sql => sql.includes('DELETE FROM conversation_turns'))).toBe(true)
+    expect(runCalls.some(sql => sql.includes('DELETE FROM scheduled_tasks'))).toBe(true)
+    await db.close()
+  })
+
   it('runs legacy migration only once with marker', async () => {
     runCalls.length = 0
     metaState.clear()
+    scheduledTasks.clear()
 
     const db = await setupAliceDb(await createSandboxUserDataPath())
     const snapshot: AliceMemoryLegacySnapshot = {
@@ -137,6 +258,7 @@ describe('alice sqlite dao', () => {
   it('skips conversation turn write when signal is already aborted', async () => {
     runCalls.length = 0
     metaState.clear()
+    scheduledTasks.clear()
 
     const db = await setupAliceDb(await createSandboxUserDataPath())
     const controller = new AbortController()
@@ -152,6 +274,62 @@ describe('alice sqlite dao', () => {
     })).rejects.toMatchObject({ name: 'AbortError' })
 
     expect(runCalls.some(sql => sql.includes('INSERT INTO conversation_turns'))).toBe(false)
+    await db.close()
+  })
+
+  it('claims due scheduled tasks once and supports complete/fail transitions', async () => {
+    runCalls.length = 0
+    metaState.clear()
+    scheduledTasks.clear()
+
+    const db = await setupAliceDb(await createSandboxUserDataPath())
+    const nowMs = Date.now()
+    await db.insertScheduledTask({
+      taskId: 'task-due-1',
+      triggerAt: nowMs - 60_000,
+      message: '喝水',
+    })
+    await db.insertScheduledTask({
+      taskId: 'task-future-1',
+      triggerAt: nowMs + 60_000,
+      message: '站起来活动',
+    })
+
+    const firstClaim = await db.claimDueScheduledTasks(nowMs, 10)
+    const secondClaim = await db.claimDueScheduledTasks(nowMs, 10)
+
+    expect(firstClaim).toHaveLength(1)
+    expect(firstClaim[0]?.taskId).toBe('task-due-1')
+    expect(secondClaim).toHaveLength(0)
+
+    await db.completeScheduledTask('task-due-1', 'turn-reminder-1')
+    await db.failScheduledTask('task-future-1', 'manual-fail')
+
+    expect(scheduledTasks.get('task-due-1')?.status).toBe('completed')
+    expect(scheduledTasks.get('task-future-1')?.status).toBe('failed')
+    await db.close()
+  })
+
+  it('requeues claimed reminder task back to pending', async () => {
+    runCalls.length = 0
+    metaState.clear()
+    scheduledTasks.clear()
+
+    const db = await setupAliceDb(await createSandboxUserDataPath())
+    const nowMs = Date.now()
+    await db.insertScheduledTask({
+      taskId: 'task-requeue-1',
+      triggerAt: nowMs - 30_000,
+      message: '测试重排队',
+    })
+    const claimed = await db.claimDueScheduledTasks(nowMs, 10)
+    expect(claimed).toHaveLength(1)
+
+    await db.requeueScheduledTask('task-requeue-1', 'turn-write-skipped')
+
+    const pending = await db.listPendingScheduledTasks(10)
+    expect(pending.map(item => item.taskId)).toContain('task-requeue-1')
+    expect(scheduledTasks.get('task-requeue-1')?.status).toBe('pending')
     await db.close()
   })
 })

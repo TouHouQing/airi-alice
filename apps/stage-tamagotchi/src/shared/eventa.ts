@@ -414,6 +414,32 @@ export interface AliceConversationTurnInput {
   createdAt?: number
 }
 
+export interface AliceConversationTurnRecord {
+  turnId: string | null
+  sessionId: string
+  userText: string | null
+  assistantText: string | null
+  structured: Record<string, unknown> | null
+  createdAt: number
+}
+
+export interface AliceListConversationTurnsPayload extends AliceCardScope {
+  sessionId: string
+  sinceCreatedAt?: number
+  limit?: number
+}
+
+export interface AliceDialogueAckPayload extends AliceCardScope {
+  sessionId: string
+  turnId: string
+  createdAt: number
+}
+
+export interface AliceReplayDialoguesPayload extends AliceCardScope {
+  sessionId: string
+  limit?: number
+}
+
 export type AliceAuditLogLevel = 'info' | 'notice' | 'warning' | 'critical'
 
 export interface AliceAuditLogInput {
@@ -605,6 +631,7 @@ export type AliceChatStreamDispatchPayload
     | { eventType: 'tool-result', body: AliceChatToolResultEvent }
     | { eventType: 'finish', body: AliceChatFinishEvent }
     | { eventType: 'error', body: AliceChatErrorEvent }
+    | { eventType: 'dialogue-responded', body: AliceDialogueRespondedPayload }
 
 export interface AliceChatStartPayload extends AliceCardScope {
   turnId: string
@@ -636,6 +663,21 @@ export interface AliceChatAbortPayload extends AliceCardScope {
 export interface AliceChatAbortResult {
   accepted: boolean
   state: 'aborted' | 'not-found' | 'finished'
+}
+
+export interface AliceReminderSchedulePayload extends AliceCardScope {
+  minutes: number
+  message: string
+  sourceTurnId?: string
+}
+
+export interface AliceReminderScheduleResult {
+  status: 'scheduled' | 'error'
+  taskId?: string
+  triggerTime?: string
+  triggerAt?: number
+  message?: string
+  code?: string
 }
 
 export interface AliceLlmConfigPayload {
@@ -696,12 +738,17 @@ export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFa
 export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, AliceCardScope & { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
 export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceCardScope & AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
 export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceCardScope & AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
+export const electronAliceListConversationTurns = defineInvokeEventa<AliceConversationTurnRecord[], AliceListConversationTurnsPayload>('eventa:invoke:electron:alice:conversation:list-turns')
+export const electronAliceAckDialogue = defineInvokeEventa<void, AliceDialogueAckPayload>('eventa:invoke:electron:alice:conversation:ack-dialogue')
+export const electronAliceReplayDialogues = defineInvokeEventa<AliceDialogueRespondedPayload[], AliceReplayDialoguesPayload>('eventa:invoke:electron:alice:conversation:replay-dialogues')
+export const electronAliceClearAllConversations = defineInvokeEventa<void>('eventa:invoke:electron:alice:conversation:clear-all')
 export const electronAliceSetActiveSession = defineInvokeEventa<void, AliceSetActiveSessionPayload>('eventa:invoke:electron:alice:conversation:set-active-session')
 export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceCardScope & AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
 export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceCardScope & AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
 export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot, AliceCardScope>('eventa:invoke:electron:alice:sensory:get-snapshot')
 export const electronAliceSafetyResolvePermission = defineInvokeEventa<AliceSafetyPermissionDecisionResult, AliceSafetyPermissionDecision>('eventa:invoke:electron:alice:safety:resolve-permission')
 export const electronAliceDeleteCardScope = defineInvokeEventa<void, AliceCardScope>('eventa:invoke:electron:alice:delete-card-scope')
+export const electronAliceDeleteAllData = defineInvokeEventa<void>('eventa:invoke:electron:alice:delete-all-data')
 export const electronAliceSubconsciousGetState = defineInvokeEventa<AliceSubconsciousStatePayload, AliceCardScope>('eventa:invoke:electron:alice:subconscious:get-state')
 export const electronAliceSubconsciousForceTick = defineInvokeEventa<AliceSubconsciousTickResult, AliceCardScope>('eventa:invoke:electron:alice:subconscious:force-tick')
 export const electronAliceSubconsciousForceDream = defineInvokeEventa<AliceDreamRunResult, AliceSubconsciousForceDreamPayload>('eventa:invoke:electron:alice:subconscious:force-dream')
@@ -709,6 +756,7 @@ export const electronAliceLlmSyncConfig = defineInvokeEventa<void, AliceLlmConfi
 export const electronAliceLlmGetConfig = defineInvokeEventa<AliceLlmConfigPayload>('eventa:invoke:electron:alice:llm:get-config')
 export const electronAliceChatStart = defineInvokeEventa<AliceChatStartResult, AliceChatStartPayload>('eventa:invoke:electron:alice:chat:start')
 export const electronAliceChatAbort = defineInvokeEventa<AliceChatAbortResult, AliceChatAbortPayload>('eventa:invoke:electron:alice:chat:abort')
+export const electronAliceReminderSchedule = defineInvokeEventa<AliceReminderScheduleResult, AliceReminderSchedulePayload>('eventa:invoke:electron:alice:reminder:schedule')
 export const aliceChatStartInvokeChannel = 'alice:chat-start'
 export const aliceChatAbortInvokeChannel = 'alice:chat-abort'
 

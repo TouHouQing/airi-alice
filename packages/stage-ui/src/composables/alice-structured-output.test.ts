@@ -213,4 +213,40 @@ describe('alice structured output', () => {
 
     expect(issues.map(issue => issue.code)).toContain('low-obedience-system-denied-emotion-mismatch')
   })
+
+  it('blocks reminder same-turn time-jump wording and future content leak', () => {
+    const issues = validateStructuredContract({
+      thought: 'obedience=0.50 liveliness=0.40 sensibility=0.60, reminder task accepted.',
+      emotion: 'neutral',
+      reply: '（一分钟后）时间到了，提醒你喝水。',
+    }, {
+      obedience: 0.5,
+      liveliness: 0.4,
+      sensibility: 0.6,
+    }, {
+      reminderScheduled: true,
+      reminderMessage: '提醒你喝水',
+    })
+
+    expect(issues.map(issue => issue.code)).toContain('reminder-same-turn-time-jump-language')
+    expect(issues.map(issue => issue.code)).toContain('reminder-same-turn-future-content-leak')
+  })
+
+  it('allows reminder same-turn confirmation without leaking future reminder content', () => {
+    const issues = validateStructuredContract({
+      thought: 'obedience=0.50 liveliness=0.40 sensibility=0.60, reminder task accepted and delegated to physical timeline.',
+      emotion: 'neutral',
+      reply: '已为你定好闹钟。',
+    }, {
+      obedience: 0.5,
+      liveliness: 0.4,
+      sensibility: 0.6,
+    }, {
+      reminderScheduled: true,
+      reminderMessage: '提醒你喝水',
+    })
+
+    expect(issues.map(issue => issue.code)).not.toContain('reminder-same-turn-time-jump-language')
+    expect(issues.map(issue => issue.code)).not.toContain('reminder-same-turn-future-content-leak')
+  })
 })

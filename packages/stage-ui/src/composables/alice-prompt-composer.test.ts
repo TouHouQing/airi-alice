@@ -28,6 +28,8 @@ describe('alice prompt composer', () => {
     expect(String(result.messages[1]?.content)).toContain('The emotion value must be exactly one of')
     expect(String(result.messages[1]?.content)).toContain('Reply tone and wording MUST be semantically consistent')
     expect(String(result.messages[1]?.content)).toContain('Personality numeric state from SOUL frontmatter has higher priority than Persona Notes text')
+    expect(String(result.messages[1]?.content)).toContain('If the user asks for a timed reminder/alarm')
+    expect(String(result.messages[1]?.content)).toContain('[CRITICAL DIRECTIVE - 时间与物理法则]')
     expect(String(result.messages[0]?.content)).not.toContain('legacy-system')
     expect(String(result.messages[1]?.content)).not.toContain('legacy-system')
   })
