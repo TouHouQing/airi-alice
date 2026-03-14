@@ -88,6 +88,19 @@ const startDraggingWindow = !isLinux() ? defineInvoke(context.value, electronSta
 function refreshWindow() {
   window.location.reload()
 }
+
+function collapseExpandedMenu() {
+  expanded.value = false
+}
+
+async function runMenuAction(action: () => unknown | Promise<unknown>) {
+  try {
+    await action()
+  }
+  finally {
+    collapseExpandedMenu()
+  }
+}
 </script>
 
 <template>
@@ -103,7 +116,7 @@ function refreshWindow() {
         <div v-if="expanded" border="1 neutral-200 dark:neutral-800" mb-2 flex flex-col gap-1 rounded-2xl p-2 backdrop-blur-xl class="bg-neutral-100/80 shadow-2xl shadow-black/20 dark:bg-neutral-900/80">
           <div grid grid-cols-3 gap-2>
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" @click="openSettings({ route: '/settings' })">
+              <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(() => openSettings({ route: '/settings' }))">
                 <div i-solar:settings-minimalistic-outline :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
               <template #tooltip>
@@ -114,7 +127,7 @@ function refreshWindow() {
             <ControlButtonTooltip disable-hoverable-content>
               <ControlsIslandProfilePicker>
                 <template #default="{ toggle }">
-                  <ControlButton :button-style="adjustStyleClasses.button" @click="toggle">
+                  <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(toggle)">
                     <div i-solar:emoji-funny-square-broken :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
                   </ControlButton>
                 </template>
@@ -125,7 +138,7 @@ function refreshWindow() {
             </ControlButtonTooltip>
 
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" @click="openChat">
+              <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(openChat)">
                 <div i-solar:chat-line-line-duotone :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
               <template #tooltip>
@@ -134,7 +147,7 @@ function refreshWindow() {
             </ControlButtonTooltip>
 
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" @click="refreshWindow">
+              <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(refreshWindow)">
                 <div i-solar:refresh-linear :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
               </ControlButton>
               <template #tooltip>
@@ -143,7 +156,7 @@ function refreshWindow() {
             </ControlButtonTooltip>
 
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" @click="toggleDark()">
+              <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(toggleDark)">
                 <Transition name="fade" mode="out-in">
                   <div v-if="isDark" i-solar:moon-outline :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
                   <div v-else i-solar:sun-2-outline :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
@@ -157,7 +170,7 @@ function refreshWindow() {
             <ControlButtonTooltip disable-hoverable-content>
               <ControlsIslandHearingConfig v-model:show="hearingDialogOpen">
                 <div class="relative">
-                  <ControlButton :button-style="adjustStyleClasses.button">
+                  <ControlButton :button-style="adjustStyleClasses.button" @click="collapseExpandedMenu">
                     <Transition name="fade" mode="out-in">
                       <IndicatorMicVolume v-if="enabled" :class="adjustStyleClasses.icon" />
                       <div v-else i-ph:microphone-slash :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
@@ -171,7 +184,7 @@ function refreshWindow() {
             </ControlButtonTooltip>
 
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" @click="toggleAlwaysOnTop()">
+              <ControlButton :button-style="adjustStyleClasses.button" @click="runMenuAction(toggleAlwaysOnTop)">
                 <div v-if="alwaysOnTop" i-solar:pin-bold :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300" />
                 <div v-else i-solar:pin-linear :class="adjustStyleClasses.icon" text="neutral-800 dark:neutral-300 opacity-50" />
               </ControlButton>
@@ -180,10 +193,10 @@ function refreshWindow() {
               </template>
             </ControlButtonTooltip>
 
-            <ControlsIslandFadeOnHover :icon-class="adjustStyleClasses.icon" :button-style="adjustStyleClasses.button" />
+            <ControlsIslandFadeOnHover :icon-class="adjustStyleClasses.icon" :button-style="adjustStyleClasses.button" @clicked="collapseExpandedMenu" />
 
             <ControlButtonTooltip disable-hoverable-content>
-              <ControlButton :button-style="adjustStyleClasses.button" hover:bg-red-500 hover:text-white @click="closeWindow()">
+              <ControlButton :button-style="adjustStyleClasses.button" hover:bg-red-500 hover:text-white @click="runMenuAction(closeWindow)">
                 <div i-solar:close-circle-outline :class="adjustStyleClasses.icon" />
               </ControlButton>
               <template #tooltip>
