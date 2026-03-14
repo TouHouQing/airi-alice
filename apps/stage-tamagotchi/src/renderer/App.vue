@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import type { AliceSafetyPermissionRequest } from '../shared/eventa'
+import type { AliceBridgeChatStreamEvent } from '@proj-airi/stage-ui/stores/alice-bridge'
+
+import type { AliceChatAbortPayload, AliceChatAbortResult, AliceChatErrorEvent, AliceChatFinishEvent, AliceChatStartPayload, AliceChatStartResult, AliceChatStreamChunkEvent, AliceChatStreamDispatchPayload, AliceChatToolCallEvent, AliceChatToolResultEvent, AliceSafetyPermissionRequest } from '../shared/eventa'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import { useElectronEventaContext, useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
@@ -17,8 +19,10 @@ import { clearMcpToolBridge, setMcpToolBridge } from '@proj-airi/stage-ui/stores
 import { useModsServerChannelStore } from '@proj-airi/stage-ui/stores/mods/api/channel-server'
 import { useContextBridgeStore } from '@proj-airi/stage-ui/stores/mods/api/context-bridge'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
+import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
 import { usePerfTracerBridgeStore } from '@proj-airi/stage-ui/stores/perf-tracer-bridge'
 import { listProvidersForPluginHost, shouldPublishPluginHostCapabilities } from '@proj-airi/stage-ui/stores/plugin-host-capabilities'
+import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
 import { useSettings } from '@proj-airi/stage-ui/stores/settings'
 import { useTheme } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
@@ -30,7 +34,16 @@ import { toast, Toaster } from 'vue-sonner'
 import AliceHitlModal from './components/AliceHitlModal.vue'
 import ResizeHandler from './components/ResizeHandler.vue'
 
+import { sanitizeAliceChatStartPayloadForTransport, summarizeAliceChatStartPayloadForTransport } from '../shared/alice-chat-transport'
 import {
+  aliceChatAbortInvokeChannel,
+  aliceChatStartInvokeChannel,
+  aliceChatStreamChunk,
+  aliceChatStreamDispatchChannel,
+  aliceChatStreamError,
+  aliceChatStreamFinish,
+  aliceChatStreamToolCall,
+  aliceChatStreamToolResult,
   aliceDialogueResponded,
   aliceKillSwitchStateChanged,
 
@@ -39,6 +52,8 @@ import {
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
+  electronAliceChatAbort,
+  electronAliceChatStart,
   electronAliceDeleteCardScope,
   electronAliceGetMemoryStats,
   electronAliceGetSensorySnapshot,
@@ -47,12 +62,18 @@ import {
   electronAliceKillSwitchGetState,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceLlmGetConfig,
+  electronAliceLlmSyncConfig,
   electronAliceMemoryImportLegacy,
   electronAliceMemoryRetrieveFacts,
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
   electronAliceRunMemoryPrune,
   electronAliceSafetyResolvePermission,
+  electronAliceSetActiveSession,
+  electronAliceSubconsciousForceDream,
+  electronAliceSubconsciousForceTick,
+  electronAliceSubconsciousGetState,
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
@@ -81,13 +102,18 @@ const i18n = useI18n()
 const contextBridgeStore = useContextBridgeStore()
 const displayModelsStore = useDisplayModelsStore()
 const settingsStore = useSettings()
+const providersStore = useProvidersStore()
+const consciousnessStore = useConsciousnessStore()
 const { language, themeColorsHue, themeColorsHueDynamic } = storeToRefs(settingsStore)
+const { providers } = storeToRefs(providersStore)
+const { activeProvider, activeModel } = storeToRefs(consciousnessStore)
 const serverChannelSettingsStore = useServerChannelSettingsStore()
 const router = useRouter()
 const route = useRoute()
 const cardStore = useAiriCardStore()
 const { activeCardId } = storeToRefs(cardStore)
 const chatSessionStore = useChatSessionStore()
+const { activeSessionId } = storeToRefs(chatSessionStore)
 const serverChannelStore = useModsServerChannelStore()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
 const analyticsStore = useSharedAnalyticsStore()
@@ -126,9 +152,17 @@ const aliceRetrieveMemoryFacts = useElectronEventaInvoke(electronAliceMemoryRetr
 const aliceUpsertMemoryFacts = useElectronEventaInvoke(electronAliceMemoryUpsertFacts)
 const aliceImportLegacyMemory = useElectronEventaInvoke(electronAliceMemoryImportLegacy)
 const aliceAppendConversationTurn = useElectronEventaInvoke(electronAliceAppendConversationTurn)
+const aliceSetActiveSession = useElectronEventaInvoke(electronAliceSetActiveSession)
 const aliceAppendAuditLog = useElectronEventaInvoke(electronAliceAppendAuditLog)
 const aliceRealtimeExecute = useElectronEventaInvoke(electronAliceRealtimeExecute)
 const aliceGetSensorySnapshot = useElectronEventaInvoke(electronAliceGetSensorySnapshot)
+const aliceGetSubconsciousState = useElectronEventaInvoke(electronAliceSubconsciousGetState)
+const aliceForceSubconsciousTick = useElectronEventaInvoke(electronAliceSubconsciousForceTick)
+const aliceForceDreaming = useElectronEventaInvoke(electronAliceSubconsciousForceDream)
+const aliceSyncLlmConfig = useElectronEventaInvoke(electronAliceLlmSyncConfig)
+const aliceGetLlmConfig = useElectronEventaInvoke(electronAliceLlmGetConfig)
+const aliceChatStart = useElectronEventaInvoke(electronAliceChatStart)
+const aliceChatAbort = useElectronEventaInvoke(electronAliceChatAbort)
 const aliceDeleteCardScope = useElectronEventaInvoke(electronAliceDeleteCardScope)
 const aliceResolvePermission = useElectronEventaInvoke(electronAliceSafetyResolvePermission)
 
@@ -137,6 +171,151 @@ const isCurrentAliceCard = (cardId: string) => cardId === (activeCardId.value ||
 const currentHitlRequest = ref<AliceSafetyPermissionRequest | null>(null)
 const pendingHitlRequests = ref<AliceSafetyPermissionRequest[]>([])
 const hitlResolving = ref(false)
+let llmSyncTimer: ReturnType<typeof setTimeout> | undefined
+let lastLlmSyncSignature = ''
+const pendingAliceChatStreams = new Map<string, {
+  onStreamEvent?: (event: AliceBridgeChatStreamEvent) => Promise<void> | void
+  resolve: () => void
+  reject: (error: unknown) => void
+}>()
+
+function aliceChatStreamKey(cardId: string, turnId: string) {
+  return `${cardId}:${turnId}`
+}
+
+function resolvePendingAliceStream(cardId: string, turnId: string) {
+  return pendingAliceChatStreams.get(aliceChatStreamKey(cardId, turnId))
+}
+
+function settlePendingAliceStream(cardId: string, turnId: string) {
+  pendingAliceChatStreams.delete(aliceChatStreamKey(cardId, turnId))
+}
+
+function createAliceAbortError(reason?: string) {
+  return new DOMException(`A.L.I.C.E stream aborted: ${reason || 'manual'}`, 'AbortError')
+}
+
+function estimateJsonPayloadBytes(value: unknown) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length
+  }
+  catch {
+    return null
+  }
+}
+
+async function invokeAliceChatStartTransport(payload: AliceChatStartPayload): Promise<AliceChatStartResult> {
+  const invoke = window.electron?.ipcRenderer?.invoke
+  if (typeof invoke === 'function')
+    return await invoke(aliceChatStartInvokeChannel, payload) as AliceChatStartResult
+  return await aliceChatStart(payload)
+}
+
+async function invokeAliceChatAbortTransport(payload: AliceChatAbortPayload): Promise<AliceChatAbortResult> {
+  const invoke = window.electron?.ipcRenderer?.invoke
+  if (typeof invoke === 'function')
+    return await invoke(aliceChatAbortInvokeChannel, payload) as AliceChatAbortResult
+  return await aliceChatAbort(payload)
+}
+
+function handleAliceChatStreamChunk(payload?: AliceChatStreamChunkEvent) {
+  if (!payload)
+    return
+  const pending = resolvePendingAliceStream(payload.cardId, payload.turnId)
+  if (!pending)
+    return
+  void pending.onStreamEvent?.({
+    type: 'text-delta',
+    text: payload.text,
+  })
+}
+
+function handleAliceChatStreamToolCall(payload?: AliceChatToolCallEvent) {
+  if (!payload)
+    return
+  const pending = resolvePendingAliceStream(payload.cardId, payload.turnId)
+  if (!pending)
+    return
+  void pending.onStreamEvent?.({
+    type: 'tool-call',
+    toolCallId: payload.toolCallId,
+    toolName: payload.toolName,
+    args: JSON.stringify(payload.arguments ?? {}),
+    toolCallType: 'function',
+  })
+}
+
+function handleAliceChatStreamToolResult(payload?: AliceChatToolResultEvent) {
+  if (!payload)
+    return
+  const pending = resolvePendingAliceStream(payload.cardId, payload.turnId)
+  if (!pending)
+    return
+  void pending.onStreamEvent?.({
+    type: 'tool-result',
+    toolCallId: payload.toolCallId,
+    result: payload.result,
+  })
+}
+
+function handleAliceChatStreamError(payload?: AliceChatErrorEvent) {
+  if (!payload)
+    return
+  const pending = resolvePendingAliceStream(payload.cardId, payload.turnId)
+  if (!pending)
+    return
+  void pending.onStreamEvent?.({
+    type: 'error',
+    error: payload.error,
+  })
+  pending.reject(new Error(String(payload.error || 'A.L.I.C.E stream error')))
+}
+
+function handleAliceChatStreamFinish(payload?: AliceChatFinishEvent) {
+  if (!payload)
+    return
+  const pending = resolvePendingAliceStream(payload.cardId, payload.turnId)
+  if (!pending)
+    return
+  if (payload.status === 'completed') {
+    void pending.onStreamEvent?.({ type: 'finish' })
+    pending.resolve()
+    return
+  }
+  if (payload.status === 'aborted') {
+    pending.reject(createAliceAbortError(payload.finishReason))
+    return
+  }
+  const error = payload.error || 'A.L.I.C.E stream failed'
+  void pending.onStreamEvent?.({ type: 'error', error })
+  pending.reject(new Error(error))
+}
+
+function handleAliceChatStreamDispatch(payload?: AliceChatStreamDispatchPayload) {
+  if (!payload)
+    return
+  switch (payload.eventType) {
+    case 'chunk':
+      handleAliceChatStreamChunk(payload.body)
+      return
+    case 'tool-call':
+      handleAliceChatStreamToolCall(payload.body)
+      return
+    case 'tool-result':
+      handleAliceChatStreamToolResult(payload.body)
+      return
+    case 'finish':
+      handleAliceChatStreamFinish(payload.body)
+      return
+    case 'error':
+      handleAliceChatStreamError(payload.body)
+  }
+}
+
+const removeAliceChatStreamDispatchListener = window.electron?.ipcRenderer?.on(
+  aliceChatStreamDispatchChannel,
+  (_event, payload) => handleAliceChatStreamDispatch(payload as AliceChatStreamDispatchPayload),
+)
 
 function popNextHitlRequest() {
   if (currentHitlRequest.value || pendingHitlRequests.value.length === 0)
@@ -185,9 +364,163 @@ setAliceBridge({
   upsertMemoryFacts: async payload => await aliceUpsertMemoryFacts({ ...resolveAliceScope(), ...payload }),
   importLegacyMemory: async payload => await aliceImportLegacyMemory({ ...resolveAliceScope(), ...payload }),
   appendConversationTurn: async payload => await aliceAppendConversationTurn({ ...resolveAliceScope(), ...payload }),
+  setActiveSession: async payload => await aliceSetActiveSession({ ...resolveAliceScope(), ...payload }),
   appendAuditLog: async payload => await aliceAppendAuditLog({ ...resolveAliceScope(), ...payload }),
   realtimeExecute: async payload => await aliceRealtimeExecute({ ...resolveAliceScope(), ...payload }),
   getSensorySnapshot: async () => await aliceGetSensorySnapshot(resolveAliceScope()),
+  getSubconsciousState: async () => await aliceGetSubconsciousState(resolveAliceScope()),
+  forceSubconsciousTick: async () => await aliceForceSubconsciousTick(resolveAliceScope()),
+  forceDreaming: async payload => await aliceForceDreaming({ ...resolveAliceScope(), ...(payload ?? {}) }),
+  syncLlmConfig: async payload => await aliceSyncLlmConfig(payload),
+  getLlmConfig: async () => await aliceGetLlmConfig(),
+  chatStart: async payload => await invokeAliceChatStartTransport({ ...resolveAliceScope(), ...payload }),
+  chatAbort: async payload => await invokeAliceChatAbortTransport({ ...resolveAliceScope(), ...payload }),
+  streamChat: async (payload, options) => await new Promise<void>(async (resolve, reject) => {
+    const scope = resolveAliceScope()
+    const key = aliceChatStreamKey(scope.cardId, payload.turnId)
+    const previousPending = pendingAliceChatStreams.get(key)
+    if (previousPending) {
+      // NOTICE: Retry path may restart the same turnId after timeout.
+      // Forcefully supersede the old pending stream so retried stream can proceed.
+      await invokeAliceChatAbortTransport({
+        ...scope,
+        turnId: payload.turnId,
+        reason: 'renderer-restart',
+      }).catch(() => {})
+      previousPending.reject(new Error(`A.L.I.C.E stream superseded by restart for turn ${payload.turnId}`))
+      pendingAliceChatStreams.delete(key)
+    }
+
+    let disposed = false
+    const abortHandler = () => {
+      void invokeAliceChatAbortTransport({
+        ...scope,
+        turnId: payload.turnId,
+        reason: 'renderer-abort',
+      })
+    }
+    const dispose = () => {
+      if (disposed)
+        return
+      disposed = true
+      options.abortSignal?.removeEventListener('abort', abortHandler)
+      settlePendingAliceStream(scope.cardId, payload.turnId)
+    }
+    const rejectAndDispose = (error: unknown) => {
+      dispose()
+      reject(error)
+    }
+    const resolveAndDispose = () => {
+      dispose()
+      resolve()
+    }
+
+    pendingAliceChatStreams.set(key, {
+      onStreamEvent: options.onStreamEvent,
+      resolve: resolveAndDispose,
+      reject: rejectAndDispose,
+    })
+
+    if (options.abortSignal?.aborted) {
+      await invokeAliceChatAbortTransport({
+        ...scope,
+        turnId: payload.turnId,
+        reason: 'renderer-abort',
+      })
+      rejectAndDispose(createAliceAbortError('renderer-abort'))
+      return
+    }
+
+    options.abortSignal?.addEventListener('abort', abortHandler, { once: true })
+
+    const transportPayloadResult = sanitizeAliceChatStartPayloadForTransport({
+      ...scope,
+      ...payload,
+    })
+    const transportPayload = transportPayloadResult.value
+    const transportPayloadSummary = summarizeAliceChatStartPayloadForTransport(transportPayload)
+
+    try {
+      void aliceAppendAuditLog({
+        ...scope,
+        level: 'notice',
+        category: 'alice.main-gateway',
+        action: 'renderer-chat-start-requested',
+        message: 'Renderer requested main-process Alicization chat stream startup.',
+        payload: {
+          turnId: transportPayload.turnId,
+          providerId: transportPayload.providerId,
+          model: transportPayload.model,
+          messageCount: Array.isArray(transportPayload.messages) ? transportPayload.messages.length : 0,
+          payloadBytes: estimateJsonPayloadBytes(transportPayload),
+          transport: typeof window.electron?.ipcRenderer?.invoke === 'function' ? 'direct-ipc' : 'eventa',
+          transportPayload: transportPayloadSummary,
+          transportSanitization: transportPayloadResult.report.changed
+            ? {
+                droppedCount: transportPayloadResult.report.droppedCount,
+                coercedCount: transportPayloadResult.report.coercedCount,
+                droppedPaths: transportPayloadResult.report.droppedPaths,
+                coercedPaths: transportPayloadResult.report.coercedPaths,
+              }
+            : undefined,
+        },
+      }).catch(() => {})
+      let start = await invokeAliceChatStartTransport(transportPayload)
+      if (!start.accepted && start.state === 'duplicate-running') {
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          await new Promise(resolve => setTimeout(resolve, 120 * (attempt + 1)))
+          start = await invokeAliceChatStartTransport(transportPayload)
+          if (start.accepted || start.state !== 'duplicate-running')
+            break
+        }
+      }
+      void aliceAppendAuditLog({
+        ...scope,
+        level: start.accepted ? 'notice' : 'warning',
+        category: 'alice.main-gateway',
+        action: 'renderer-chat-start-resolved',
+        message: start.accepted
+          ? 'Renderer received accepted response for main-process Alicization chat stream startup.'
+          : 'Renderer received rejected response for main-process Alicization chat stream startup.',
+        payload: {
+          turnId: payload.turnId,
+          accepted: start.accepted,
+          state: start.state,
+          reason: start.reason,
+        },
+      }).catch(() => {})
+      if (!start.accepted) {
+        const reason = typeof start.reason === 'string' && start.reason.trim()
+          ? ` reason=${start.reason}`
+          : ''
+        const state = typeof start.state === 'string' ? start.state : 'unknown'
+        rejectAndDispose(new Error(`A.L.I.C.E stream start rejected (state=${state}) for turn ${payload.turnId}.${reason}`))
+      }
+    }
+    catch (error) {
+      void aliceAppendAuditLog({
+        ...scope,
+        level: 'warning',
+        category: 'alice.main-gateway',
+        action: 'renderer-chat-start-error',
+        message: 'Renderer chat start invoke failed before stream handshake completed.',
+        payload: {
+          turnId: payload.turnId,
+          reason: error instanceof Error ? error.message : String(error),
+          transportPayload: transportPayloadSummary,
+          transportSanitization: transportPayloadResult.report.changed
+            ? {
+                droppedCount: transportPayloadResult.report.droppedCount,
+                coercedCount: transportPayloadResult.report.coercedCount,
+                droppedPaths: transportPayloadResult.report.droppedPaths,
+                coercedPaths: transportPayloadResult.report.coercedPaths,
+              }
+            : undefined,
+        },
+      }).catch(() => {})
+      rejectAndDispose(error)
+    }
+  }),
   deleteCardScope: async scope => await aliceDeleteCardScope(scope),
 })
 
@@ -220,6 +553,26 @@ context.value.on(aliceSafetyPermissionRequested, (event) => {
     return
   pendingHitlRequests.value = [...pendingHitlRequests.value, payload]
   popNextHitlRequest()
+})
+
+context.value.on(aliceChatStreamChunk, (event) => {
+  handleAliceChatStreamChunk(event?.body)
+})
+
+context.value.on(aliceChatStreamToolCall, (event) => {
+  handleAliceChatStreamToolCall(event?.body)
+})
+
+context.value.on(aliceChatStreamToolResult, (event) => {
+  handleAliceChatStreamToolResult(event?.body)
+})
+
+context.value.on(aliceChatStreamError, (event) => {
+  handleAliceChatStreamError(event?.body)
+})
+
+context.value.on(aliceChatStreamFinish, (event) => {
+  handleAliceChatStreamFinish(event?.body)
 })
 
 // NOTICE: register plugin host bridge during setup to avoid race with pages using it in immediate watchers.
@@ -255,6 +608,34 @@ watch(activeCardId, () => {
   void aliceEpoch1Store.syncKillSwitchState()
   void aliceEpoch1Store.refreshMemoryStats()
 }, { immediate: true })
+
+watch(activeSessionId, (sessionId) => {
+  if (!sessionId?.trim())
+    return
+  void aliceSetActiveSession({
+    ...resolveAliceScope(),
+    sessionId,
+  })
+}, { immediate: true })
+
+watch([activeProvider, activeModel, providers], () => {
+  const nextCredentials = JSON.parse(JSON.stringify(providers.value || {})) as Record<string, Record<string, unknown>>
+  const payload = {
+    activeProviderId: activeProvider.value || '',
+    activeModelId: activeModel.value || '',
+    providerCredentials: nextCredentials,
+  }
+  const signature = JSON.stringify(payload)
+  if (signature === lastLlmSyncSignature)
+    return
+
+  if (llmSyncTimer)
+    clearTimeout(llmSyncTimer)
+  llmSyncTimer = setTimeout(() => {
+    lastLlmSyncSignature = signature
+    void aliceSyncLlmConfig(payload)
+  }, 120)
+}, { deep: true, immediate: true })
 
 const { updateThemeColor } = useThemeColor(themeColorFromValue({ light: 'rgb(255 255 255)', dark: 'rgb(18 18 18)' }))
 watch(dark, () => updateThemeColor(), { immediate: true })
@@ -312,6 +693,13 @@ watch(themeColorsHueDynamic, () => {
 }, { immediate: true })
 
 onUnmounted(() => {
+  if (llmSyncTimer)
+    clearTimeout(llmSyncTimer)
+  removeAliceChatStreamDispatchListener?.()
+  for (const [key, pending] of pendingAliceChatStreams.entries()) {
+    pendingAliceChatStreams.delete(key)
+    pending.reject(new Error('Renderer unmounted before A.L.I.C.E stream completed.'))
+  }
   contextBridgeStore.dispose()
   clearMcpToolBridge()
   aliceEpoch1Store.dispose()

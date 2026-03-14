@@ -68,6 +68,8 @@ const dbStub = {
     lastPrunedAt: null,
   }),
   getJournalMode: vi.fn().mockResolvedValue('wal'),
+  getLatestConversationSessionId: vi.fn().mockResolvedValue(undefined),
+  listConversationTurnsSince: vi.fn().mockResolvedValue([]),
   getMetaValue: vi.fn(async (key: string) => metaStore.get(key)),
   setMetaValue: vi.fn(async (key: string, value: string) => {
     metaStore.set(key, value)
@@ -103,6 +105,10 @@ vi.mock('electron', () => ({
     register: vi.fn(() => true),
     isRegistered: vi.fn(() => false),
     unregister: vi.fn(),
+  },
+  powerMonitor: {
+    on: vi.fn(),
+    removeListener: vi.fn(),
   },
   ipcMain: {},
   shell: {

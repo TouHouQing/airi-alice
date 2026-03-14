@@ -1,8 +1,22 @@
+import type { Message } from '@xsai/shared-chat'
+import type { IpcMainEvent, IpcMainInvokeEvent, WebContents } from 'electron'
+
 import type {
   AliceAuditLogInput,
   AliceCardScope,
+  AliceChatAbortPayload,
+  AliceChatAbortResult,
+  AliceChatErrorEvent,
+  AliceChatFinishEvent,
+  AliceChatStartPayload,
+  AliceChatStartResult,
+  AliceChatStreamChunkEvent,
+  AliceChatStreamDispatchPayload,
+  AliceChatToolCallEvent,
+  AliceChatToolResultEvent,
   AliceConversationTurnInput,
   AliceDialogueRespondedPayload,
+  AliceDreamRunResult,
   AliceGender,
   AliceGenesisInput,
   AlicePersonalityState,
@@ -11,25 +25,42 @@ import type {
   AliceRealtimeExecuteResult,
   AliceSoulFrontmatter,
   AliceSoulSnapshot,
+  AliceSubconsciousNeedsState,
+  AliceSubconsciousStatePayload,
+  AliceSubconsciousTickResult,
 } from '../../../shared/eventa'
 
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, open as openFile, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open as openFile, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pid, platform } from 'node:process'
 
 import { defineInvokeHandler } from '@moeru/eventa'
 import { createContext } from '@moeru/eventa/adapters/electron/main'
-import { app, globalShortcut, ipcMain } from 'electron'
+import { createOpenAI } from '@xsai-ext/providers/create'
+import { streamText } from '@xsai/stream-text'
+import { tool } from '@xsai/tool'
+import { app, globalShortcut, ipcMain, powerMonitor } from 'electron'
+import { z } from 'zod'
 
 import {
+  aliceChatAbortInvokeChannel,
+  aliceChatStartInvokeChannel,
+  aliceChatStreamChunk,
+  aliceChatStreamDispatchChannel,
+  aliceChatStreamError,
+  aliceChatStreamFinish,
+  aliceChatStreamToolCall,
+  aliceChatStreamToolResult,
   aliceDialogueResponded,
   aliceKillSwitchStateChanged,
   aliceSoulChanged,
   electronAliceAppendAuditLog,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
+  electronAliceChatAbort,
+  electronAliceChatStart,
   electronAliceDeleteCardScope,
   electronAliceGetMemoryStats,
   electronAliceGetSensorySnapshot,
@@ -38,17 +69,24 @@ import {
   electronAliceKillSwitchGetState,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceLlmGetConfig,
+  electronAliceLlmSyncConfig,
   electronAliceMemoryImportLegacy,
   electronAliceMemoryRetrieveFacts,
   electronAliceMemoryUpsertFacts,
   electronAliceRealtimeExecute,
   electronAliceRunMemoryPrune,
+  electronAliceSetActiveSession,
+  electronAliceSubconsciousForceDream,
+  electronAliceSubconsciousForceTick,
+  electronAliceSubconsciousGetState,
   electronAliceUpdateMemoryStats,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
   normalizeAliceEmotion,
 } from '../../../shared/eventa'
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
+import { invokeAliceMcpCallToolFromMain, invokeAliceMcpListToolsFromMain } from '../airi/mcp-servers'
 import { setupAliceDb } from './db'
 import { createAliceSensoryBus } from './sensory-bus'
 import {
@@ -89,7 +127,45 @@ const defaultFrontmatter: AliceSoulFrontmatter = {
 
 const winRenameRetryDelaysMs = [5, 10, 20, 40, 80]
 const aliceCardKillSwitchMetaKey = 'kill_switch_state_v1'
+const aliceCardActiveSessionMetaKey = 'active_session_id_v1'
+const aliceSubconsciousStateMetaKey = 'subconscious_state_v1'
+const aliceDreamLastRunMetaKey = 'subconscious_last_dreamed_at_v1'
 const defaultAliceCardId = 'default'
+const aliceSubconsciousTickMs = 60_000
+const aliceSubconsciousPersistMs = 30 * 60_000
+const dreamMaxTurns = 100
+const dreamMaxCharsPerUserTurn = 320
+const dreamMaxCharsPerAssistantTurn = 360
+const dreamMaxTotalChars = 16_000
+const chatRunFinishedRetentionMs = 2 * 60_000
+const mainChatFirstEventTimeoutMs = 45_000
+const mainChatTimeoutRecoveryMs = 12_000
+
+interface SubconsciousCardState extends AliceSubconsciousNeedsState {
+  updatedAt: number
+  lastDreamedAt: number
+}
+
+interface ChatRunState {
+  cardId: string
+  turnId: string
+  controller: AbortController
+  sender?: WebContents
+  rawInvokeOptions?: { ipcMainEvent?: IpcMainEvent, event?: unknown }
+  hasLoggedDispatchBinding?: boolean
+  state: 'running' | 'aborted' | 'finished'
+}
+
+interface MainGatewayResolvedConfig {
+  providerId: string
+  model: string
+  headers?: Record<string, string>
+  provider: ReturnType<typeof createOpenAI>
+}
+
+interface CardScopeOptions {
+  label?: string
+}
 
 function normalizeCardId(raw: unknown) {
   if (typeof raw !== 'string')
@@ -222,6 +298,25 @@ function syncPersonalityBaselineInBody(body: string, personality: AlicePersonali
     ...sectionLines,
     ...lines.slice(sectionEnd),
   ].join('\n')
+}
+
+function appendPersonaNoteToBody(body: string, note: string) {
+  const normalizedNote = note.trim()
+  if (!normalizedNote)
+    return body
+
+  const startIndex = body.indexOf(soulPersonaNotesStart)
+  const endIndex = body.indexOf(soulPersonaNotesEnd)
+  if (startIndex < 0 || endIndex < 0 || endIndex <= startIndex)
+    return body
+
+  const prefix = body.slice(0, startIndex + soulPersonaNotesStart.length)
+  const middle = body.slice(startIndex + soulPersonaNotesStart.length, endIndex).trim()
+  const suffix = body.slice(endIndex)
+  const nextMiddle = middle && middle !== '（空）'
+    ? `${middle}\n- ${normalizedNote}`
+    : `- ${normalizedNote}`
+  return `${prefix}\n${nextMiddle}\n${suffix}`.trim()
 }
 
 const defaultSoulBody = buildSoulBody(defaultFrontmatter, '')
@@ -860,6 +955,15 @@ function isAbortError(error: unknown) {
     && (error as { name?: unknown }).name === 'AbortError'
 }
 
+function isMainGatewayProgressEventType(rawType: unknown) {
+  const eventType = sanitizeText(rawType)
+  return eventType === 'text-delta'
+    || eventType === 'tool-call'
+    || eventType === 'tool-result'
+    || eventType === 'finish'
+    || eventType === 'error'
+}
+
 function readStringValue(value: unknown) {
   return typeof value === 'string' ? value : ''
 }
@@ -882,10 +986,14 @@ function normalizeDialogueRespondedPayload(input: AliceConversationTurnInput): O
   const createdAt = input.createdAt ?? Date.now()
   const turnId = input.turnId?.trim() || `turn:${normalizedSessionId}:${createdAt}`
   const isFallback = contractFailed || !['json', 'repair-json'].includes(parsePath)
+  const origin = input.origin === 'subconscious-proactive'
+    ? 'subconscious-proactive'
+    : 'user-turn'
 
   return {
     turnId,
     sessionId: normalizedSessionId,
+    origin,
     structured: {
       thought,
       emotion: normalizedEmotionResult.emotion,
@@ -900,10 +1008,12 @@ function normalizeDialogueRespondedPayload(input: AliceConversationTurnInput): O
 
 interface AliceRuntimeSetupOptions {
   userDataPathOverride?: string
+  runtimeDebugLogEnabled?: boolean
 }
 
 export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   const userDataPath = options?.userDataPathOverride ?? app.getPath('userData')
+  const runtimeDebugLogEnabled = options?.runtimeDebugLogEnabled ?? !options?.userDataPathOverride
   const resolveCardPaths = (cardId: string) => {
     const soulRoot = join(userDataPath, 'alicizations', 'cards', cardId)
     return {
@@ -930,8 +1040,18 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   let soulWatchTimer: ReturnType<typeof setTimeout> | undefined
   let soulWatcher: import('node:fs').FSWatcher | undefined
   let pruneTimer: ReturnType<typeof setInterval> | undefined
+  let subconsciousTimer: ReturnType<typeof setInterval> | undefined
+  let dreamTimer: ReturnType<typeof setInterval> | undefined
   let muteWatchUntil = 0
   const turnWriteAbortControllers = new Map<string, AbortController>()
+  const activeSessionIdByCard = new Map<string, string>()
+  const subconsciousStateByCard = new Map<string, SubconsciousCardState>()
+  const chatRuns = new Map<string, ChatRunState>()
+  const recentlyFinishedChatRuns = new Map<string, number>()
+  let activeProviderId = ''
+  let activeModelId = ''
+  let providerCredentials: Record<string, Record<string, unknown>> = {}
+  let subconsciousTickInFlight: Promise<AliceSubconsciousTickResult> | null = null
 
   const emitSoulChanged = (snapshot: AliceSoulSnapshot, cardId = activeCardId) => {
     context.emit(aliceSoulChanged, {
@@ -989,6 +1109,338 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     return snapshot
   }
 
+  function normalizeSessionId(raw: unknown) {
+    if (typeof raw !== 'string')
+      return ''
+    return raw.trim()
+  }
+
+  async function persistActiveSessionId(cardId: string, sessionId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const normalizedSessionId = normalizeSessionId(sessionId)
+    if (!normalizedSessionId)
+      return
+
+    activeSessionIdByCard.set(normalizedCardId, normalizedSessionId)
+    await aliceDb.setMetaValue(aliceCardActiveSessionMetaKey, normalizedSessionId).catch(() => {})
+  }
+
+  async function restoreActiveSessionId(cardId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const rawFromMeta = await aliceDb.getMetaValue(aliceCardActiveSessionMetaKey).catch(() => undefined)
+    const fromMeta = normalizeSessionId(rawFromMeta)
+    if (fromMeta) {
+      activeSessionIdByCard.set(normalizedCardId, fromMeta)
+      return fromMeta
+    }
+
+    const latestFromTurns = normalizeSessionId(await aliceDb.getLatestConversationSessionId().catch(() => undefined))
+    if (latestFromTurns) {
+      activeSessionIdByCard.set(normalizedCardId, latestFromTurns)
+      await aliceDb.setMetaValue(aliceCardActiveSessionMetaKey, latestFromTurns).catch(() => {})
+      return latestFromTurns
+    }
+
+    return ''
+  }
+
+  async function ensureActiveOrLatestSessionId(cardId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const fromMemory = normalizeSessionId(activeSessionIdByCard.get(normalizedCardId))
+    if (fromMemory)
+      return fromMemory
+
+    const restored = normalizeSessionId(await restoreActiveSessionId(normalizedCardId))
+    if (restored)
+      return restored
+
+    const fallback = `session:auto:${normalizedCardId}:${Date.now()}`
+    await persistActiveSessionId(normalizedCardId, fallback)
+    await appendAuditLog({
+      level: 'notice',
+      category: 'alice.session',
+      action: 'auto-created',
+      message: 'Auto-created fallback conversation session for card scope.',
+      payload: {
+        sessionId: fallback,
+      },
+    }, normalizedCardId)
+    return fallback
+  }
+
+  function createChatRunKey(cardId: string, turnId: string) {
+    return `${normalizeCardId(cardId)}::${turnId.trim()}`
+  }
+
+  function rememberFinishedChatRun(key: string, finishedAt = Date.now()) {
+    recentlyFinishedChatRuns.set(key, finishedAt)
+    for (const [knownKey, knownFinishedAt] of recentlyFinishedChatRuns.entries()) {
+      if (finishedAt - knownFinishedAt > chatRunFinishedRetentionMs) {
+        recentlyFinishedChatRuns.delete(knownKey)
+      }
+    }
+  }
+
+  function hasRecentlyFinishedChatRun(key: string, now = Date.now()) {
+    const finishedAt = recentlyFinishedChatRuns.get(key)
+    if (typeof finishedAt !== 'number')
+      return false
+    if (now - finishedAt > chatRunFinishedRetentionMs) {
+      recentlyFinishedChatRuns.delete(key)
+      return false
+    }
+    return true
+  }
+
+  function clampNeed(value: number) {
+    if (!Number.isFinite(value))
+      return 0
+    return Math.max(0, Math.min(100, value))
+  }
+
+  function createDefaultSubconsciousState(now = Date.now()): SubconsciousCardState {
+    return {
+      boredom: 0,
+      loneliness: 0,
+      fatigue: 0,
+      lastTickAt: now,
+      lastInteractionAt: now,
+      lastSavedAt: now,
+      lastDreamedAt: 0,
+      updatedAt: now,
+    }
+  }
+
+  function normalizeSubconsciousState(raw: unknown, now = Date.now()): SubconsciousCardState {
+    const data = typeof raw === 'object' && raw ? raw as Record<string, unknown> : {}
+    const pickNumber = (key: string, fallback: number) => {
+      const value = data[key]
+      return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+    }
+    return {
+      boredom: clampNeed(pickNumber('boredom', 0)),
+      loneliness: clampNeed(pickNumber('loneliness', 0)),
+      fatigue: clampNeed(pickNumber('fatigue', 0)),
+      lastTickAt: Math.max(0, pickNumber('lastTickAt', now)),
+      lastInteractionAt: Math.max(0, pickNumber('lastInteractionAt', now)),
+      lastSavedAt: Math.max(0, pickNumber('lastSavedAt', now)),
+      lastDreamedAt: Math.max(0, pickNumber('lastDreamedAt', 0)),
+      updatedAt: Math.max(0, pickNumber('updatedAt', now)),
+    }
+  }
+
+  async function persistSubconsciousState(cardId: string, state: SubconsciousCardState) {
+    const normalizedCardId = normalizeCardId(cardId)
+    subconsciousStateByCard.set(normalizedCardId, state)
+    await aliceDb.setMetaValue(
+      aliceSubconsciousStateMetaKey,
+      JSON.stringify({
+        boredom: state.boredom,
+        loneliness: state.loneliness,
+        fatigue: state.fatigue,
+        lastTickAt: state.lastTickAt,
+        lastInteractionAt: state.lastInteractionAt,
+        lastSavedAt: state.lastSavedAt,
+        updatedAt: state.updatedAt,
+      }),
+    ).catch(() => {})
+    await aliceDb.setMetaValue(aliceDreamLastRunMetaKey, `${state.lastDreamedAt}`).catch(() => {})
+  }
+
+  async function restoreSubconsciousState(cardId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const now = Date.now()
+    const raw = await aliceDb.getMetaValue(aliceSubconsciousStateMetaKey).catch(() => undefined)
+    const rawDreamedAt = await aliceDb.getMetaValue(aliceDreamLastRunMetaKey).catch(() => undefined)
+    const parsed = (() => {
+      if (!raw)
+        return createDefaultSubconsciousState(now)
+      try {
+        return normalizeSubconsciousState(JSON.parse(raw), now)
+      }
+      catch {
+        return createDefaultSubconsciousState(now)
+      }
+    })()
+    const dreamedAt = Number.parseInt(String(rawDreamedAt ?? ''), 10)
+    const normalized = {
+      ...parsed,
+      lastDreamedAt: Number.isFinite(dreamedAt) ? Math.max(0, dreamedAt) : parsed.lastDreamedAt,
+    }
+    const offlineMinutes = Math.max(0, (now - normalized.lastSavedAt) / 60_000)
+    if (offlineMinutes >= 1) {
+      normalized.boredom = clampNeed(normalized.boredom + offlineMinutes * 0.8)
+      normalized.loneliness = clampNeed(normalized.loneliness + offlineMinutes * 0.6)
+      normalized.fatigue = clampNeed(normalized.fatigue + offlineMinutes * 0.3)
+      normalized.lastTickAt = now
+      normalized.updatedAt = now
+    }
+    subconsciousStateByCard.set(normalizedCardId, normalized)
+    if (offlineMinutes >= 1) {
+      await appendAuditLog({
+        level: 'notice',
+        category: 'alice.subconscious',
+        action: 'offline-compensated',
+        message: 'Applied subconscious offline compensation on cold start restore.',
+        payload: {
+          cardId: normalizedCardId,
+          offlineMinutes: Number(offlineMinutes.toFixed(2)),
+          boredom: normalized.boredom,
+          loneliness: normalized.loneliness,
+          fatigue: normalized.fatigue,
+        },
+      }, normalizedCardId)
+    }
+    return normalized
+  }
+
+  async function ensureSubconsciousState(cardId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const current = subconsciousStateByCard.get(normalizedCardId)
+    if (current)
+      return current
+    return await restoreSubconsciousState(normalizedCardId)
+  }
+
+  async function flushCurrentSubconsciousState(reason: string) {
+    const current = subconsciousStateByCard.get(activeCardId)
+    if (!current)
+      return
+
+    const now = Date.now()
+    const next: SubconsciousCardState = {
+      ...current,
+      updatedAt: now,
+      lastSavedAt: now,
+    }
+    await persistSubconsciousState(activeCardId, next)
+    await appendAuditLog({
+      level: 'notice',
+      category: 'alice.subconscious',
+      action: 'state-flushed',
+      message: 'Persisted in-memory subconscious state to disk.',
+      payload: {
+        reason,
+        boredom: next.boredom,
+        loneliness: next.loneliness,
+        fatigue: next.fatigue,
+      },
+    })
+  }
+
+  async function markSubconsciousInteraction(cardId: string) {
+    const normalizedCardId = normalizeCardId(cardId)
+    const current = await ensureSubconsciousState(normalizedCardId)
+    const now = Date.now()
+    const next: SubconsciousCardState = {
+      ...current,
+      boredom: 0,
+      loneliness: 0,
+      fatigue: clampNeed(current.fatigue + 2),
+      lastInteractionAt: now,
+      lastTickAt: now,
+      updatedAt: now,
+      lastSavedAt: now,
+    }
+    await persistSubconsciousState(normalizedCardId, next)
+    return next
+  }
+
+  async function flushSubconsciousStatesAcrossCards(reason: string, specificCardIds?: string[]) {
+    const previousCardId = activeCardId
+    const cardIds = specificCardIds?.length
+      ? specificCardIds.map(cardId => normalizeCardId(cardId))
+      : [...new Set([...subconsciousStateByCard.keys(), normalizeCardId(activeCardId)])]
+    try {
+      for (const cardId of cardIds) {
+        await withCardScope(cardId, async () => await flushCurrentSubconsciousState(reason), {
+          label: `subconscious-flush:${reason}:${cardId}`,
+        })
+      }
+    }
+    finally {
+      await withCardScope(previousCardId, async () => {}, {
+        label: `subconscious-flush:return:${reason}:${previousCardId}`,
+      })
+    }
+  }
+
+  async function listKnownCardIds() {
+    const cardsRoot = join(userDataPath, 'alicizations', 'cards')
+    const ids = new Set<string>([...subconsciousStateByCard.keys(), ...activeSessionIdByCard.keys(), normalizeCardId(activeCardId)])
+    try {
+      const entries = await readdir(cardsRoot, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isDirectory())
+          ids.add(normalizeCardId(entry.name))
+      }
+    }
+    catch {
+      // ignore
+    }
+    return [...ids]
+  }
+
+  const llmConfigPath = join(userDataPath, 'alicizations', 'llm-config.json')
+  const runtimeDebugLogPath = join(userDataPath, 'alicizations', 'runtime-debug.log')
+
+  async function appendRuntimeDebugLine(event: string, payload?: Record<string, unknown>) {
+    if (!runtimeDebugLogEnabled)
+      return
+    try {
+      await mkdir(join(userDataPath, 'alicizations'), { recursive: true })
+      const line = JSON.stringify({
+        ts: new Date().toISOString(),
+        pid,
+        event,
+        ...(payload ?? {}),
+      })
+      await appendFile(runtimeDebugLogPath, `${line}\n`, 'utf-8')
+    }
+    catch {
+      // ignore debug logging failures
+    }
+  }
+
+  async function queueScopedAuditLog(cardId: string, input: AliceAuditLogInput) {
+    void withCardScope(cardId, async () => await appendAuditLog(input, cardId), {
+      label: `audit:${input.category}.${input.action}`,
+    }).catch(() => {})
+  }
+
+  async function persistLlmConfigToDisk() {
+    await mkdir(join(userDataPath, 'alicizations'), { recursive: true })
+    await writeFile(
+      llmConfigPath,
+      JSON.stringify({
+        activeProviderId,
+        activeModelId,
+        providerCredentials,
+      }, null, 2),
+      'utf-8',
+    ).catch(() => {})
+  }
+
+  async function restoreLlmConfigFromDisk() {
+    try {
+      const raw = await readFile(llmConfigPath, 'utf-8')
+      const parsed = JSON.parse(raw) as {
+        activeProviderId?: unknown
+        activeModelId?: unknown
+        providerCredentials?: unknown
+      }
+      if (typeof parsed.activeProviderId === 'string')
+        activeProviderId = parsed.activeProviderId
+      if (typeof parsed.activeModelId === 'string')
+        activeModelId = parsed.activeModelId
+      if (parsed.providerCredentials && typeof parsed.providerCredentials === 'object')
+        providerCredentials = parsed.providerCredentials as Record<string, Record<string, unknown>>
+    }
+    catch {
+      // ignore
+    }
+  }
+
   async function restoreScopedKillSwitch(cardId: string) {
     const raw = await aliceDb.getMetaValue(aliceCardKillSwitchMetaKey).catch(() => undefined)
     if (!raw) {
@@ -1015,6 +1467,14 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     if (nextCardId === activeCardId)
       return
 
+    const previousCardId = activeCardId
+    const startedAt = Date.now()
+    await appendRuntimeDebugLine('card-scope.switch-started', {
+      fromCardId: previousCardId,
+      toCardId: nextCardId,
+    })
+
+    await flushCurrentSubconsciousState('card-switch').catch(() => {})
     sensoryBus.stop('manual')
     stopWatch()
     if (pruneTimer) {
@@ -1034,6 +1494,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     ;({ soulRoot, soulPath, legacyPromptProfilePath, legacySparkProfilePath } = resolveCardPaths(activeCardId))
     aliceDb = await setupAliceDb(userDataPath, { cardId: activeCardId })
     await restoreScopedKillSwitch(activeCardId)
+    await restoreActiveSessionId(activeCardId)
+    await restoreSubconsciousState(activeCardId)
 
     sensoryBus = createAliceSensoryBus({
       tickMs: 60_000,
@@ -1046,12 +1508,42 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       sensoryBus.start()
     }
     startPruneTimer()
+    await appendRuntimeDebugLine('card-scope.switch-completed', {
+      fromCardId: previousCardId,
+      toCardId: activeCardId,
+      elapsedMs: Date.now() - startedAt,
+    })
   }
 
-  async function withCardScope<T>(nextCardIdRaw: unknown, task: () => Promise<T>) {
+  async function withCardScope<T>(nextCardIdRaw: unknown, task: () => Promise<T>, options?: CardScopeOptions) {
+    const requestedCardId = normalizeCardId(nextCardIdRaw)
+    const label = sanitizeText(options?.label, 'anonymous')
+    const queuedAt = Date.now()
     const execute = async () => {
-      await switchCardScope(nextCardIdRaw)
-      return await task()
+      const waitMs = Date.now() - queuedAt
+      if (label !== 'anonymous' || waitMs >= 250) {
+        await appendRuntimeDebugLine('card-scope.acquired', {
+          label,
+          requestedCardId,
+          activeCardIdBeforeSwitch: activeCardId,
+          waitMs,
+        })
+      }
+      await switchCardScope(requestedCardId)
+      try {
+        return await task()
+      }
+      finally {
+        if (label !== 'anonymous' || waitMs >= 250) {
+          await appendRuntimeDebugLine('card-scope.completed', {
+            label,
+            requestedCardId,
+            activeCardIdAfterTask: activeCardId,
+            waitMs,
+            totalMs: Date.now() - queuedAt,
+          })
+        }
+      }
     }
     const next = scopeLifecycleQueueState.queue.then(execute, execute)
     scopeLifecycleQueueState.queue = next.then(() => undefined, () => undefined)
@@ -1076,6 +1568,84 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
         })
       })
     }, 24 * 60 * 60 * 1000)
+  }
+
+  function startSubconsciousTimer() {
+    if (subconsciousTimer) {
+      clearInterval(subconsciousTimer)
+      subconsciousTimer = undefined
+    }
+    subconsciousTimer = setInterval(() => {
+      if (subconsciousTickInFlight)
+        return
+
+      subconsciousTickInFlight = runSubconsciousTickAcrossCards('timer')
+      void subconsciousTickInFlight.catch(async (error) => {
+        await appendAuditLog({
+          level: 'warning',
+          category: 'alice.subconscious',
+          action: 'tick-failed',
+          message: 'Background subconscious tick failed.',
+          payload: {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }).finally(() => {
+        subconsciousTickInFlight = null
+      })
+    }, aliceSubconsciousTickMs)
+  }
+
+  function startDreamTimer() {
+    if (dreamTimer) {
+      clearInterval(dreamTimer)
+      dreamTimer = undefined
+    }
+    let running = false
+    let lastScheduleKey = ''
+    const makeDayKey = (date: Date) => `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+    const runScheduledDream = async (reason: string, key: string) => {
+      if (running)
+        return
+      running = true
+      try {
+        await runDreamAcrossCards(reason)
+        lastScheduleKey = key
+      }
+      catch (error) {
+        await appendAuditLog({
+          level: 'warning',
+          category: 'alice.dream',
+          action: reason === 'schedule-catch-up' ? 'catch-up-failed' : 'scheduled-failed',
+          message: reason === 'schedule-catch-up'
+            ? 'Catch-up dreaming run failed after missing schedule window.'
+            : 'Scheduled dreaming run failed.',
+          payload: {
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+      finally {
+        running = false
+      }
+    }
+
+    void (async () => {
+      const now = new Date()
+      const key = makeDayKey(now)
+      if (now.getHours() < 3 || key === lastScheduleKey)
+        return
+      await runScheduledDream('schedule-catch-up', key)
+    })()
+
+    dreamTimer = setInterval(() => {
+      const now = new Date()
+      const key = makeDayKey(now)
+      const inWindow = now.getHours() === 3 && now.getMinutes() < 10
+      if (!inWindow || key === lastScheduleKey)
+        return
+      void runScheduledDream('schedule-03:00', key)
+    }, 60_000)
   }
 
   function createTurnWriteAbortSignal(turnId?: string) {
@@ -1109,6 +1679,19 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     }
     turnWriteAbortControllers.clear()
 
+    let abortedChatRuns = 0
+    for (const [key, run] of chatRuns.entries()) {
+      if (run.state !== 'running')
+        continue
+      run.state = 'aborted'
+      run.controller.abort(createAbortError(reason))
+      abortedChatRuns += 1
+      emitChatFinish(key, {
+        status: 'aborted',
+        finishReason: reason,
+      })
+    }
+
     await appendAuditLog({
       level: 'notice',
       category: 'kill-switch',
@@ -1117,6 +1700,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       payload: {
         reason,
         aborted,
+        abortedChatRuns,
       },
     })
   }
@@ -1581,6 +2165,1461 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     return snapshot
   }
 
+  async function appendConversationTurnWithGuards(payload: AliceConversationTurnInput) {
+    const normalizedSessionId = normalizeSessionId(payload.sessionId) || await ensureActiveOrLatestSessionId(activeCardId)
+    if (normalizeSessionId(payload.sessionId))
+      await persistActiveSessionId(activeCardId, normalizedSessionId)
+
+    const normalizedPayload: AliceConversationTurnInput = {
+      ...payload,
+      sessionId: normalizedSessionId,
+      origin: payload.origin === 'subconscious-proactive' ? 'subconscious-proactive' : 'user-turn',
+    }
+
+    if (normalizedPayload.origin === 'user-turn' && sanitizeText(normalizedPayload.userText).length > 0) {
+      await markSubconsciousInteraction(activeCardId)
+    }
+
+    if (isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
+      await appendAuditLog({
+        level: 'notice',
+        category: 'kill-switch',
+        action: 'turn-write-skipped-aborted',
+        message: 'Skipped conversation turn persistence because kill switch is suspended.',
+        payload: {
+          sessionId: normalizedPayload.sessionId,
+          turnId: normalizedPayload.turnId,
+        },
+      })
+      return
+    }
+
+    const signal = createTurnWriteAbortSignal(normalizedPayload.turnId)
+    if (signal?.aborted) {
+      releaseTurnWriteAbortController(normalizedPayload.turnId)
+      await appendAuditLog({
+        level: 'notice',
+        category: 'kill-switch',
+        action: 'turn-write-skipped-aborted',
+        message: 'Skipped conversation turn persistence because turn write signal was already aborted.',
+        payload: {
+          sessionId: normalizedPayload.sessionId,
+          turnId: normalizedPayload.turnId,
+        },
+      })
+      return
+    }
+
+    try {
+      await aliceDb.appendConversationTurn(normalizedPayload, { signal })
+      if (signal?.aborted || isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-abort-dropped',
+          message: 'Dropped dialogue responded event because the turn was aborted after persistence.',
+          payload: {
+            sessionId: normalizedPayload.sessionId,
+            turnId: normalizedPayload.turnId,
+          },
+        })
+        return
+      }
+
+      const dialoguePayload = normalizeDialogueRespondedPayload(normalizedPayload)
+      if (dialoguePayload) {
+        context.emit(aliceDialogueResponded, {
+          cardId: activeCardId,
+          ...dialoguePayload,
+        })
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.dialogue',
+          action: 'alice.dialogue.responded.emitted',
+          message: 'Emitted alice.dialogue.responded after successful turn persistence.',
+          payload: {
+            turnId: dialoguePayload.turnId,
+            sessionId: dialoguePayload.sessionId,
+            isFallback: dialoguePayload.isFallback,
+            emotion: dialoguePayload.structured.emotion,
+            rawEmotion: dialoguePayload.structured.rawEmotion,
+            origin: dialoguePayload.origin,
+          },
+        })
+      }
+    }
+    catch (error) {
+      if (isAbortError(error) || signal?.aborted) {
+        await appendAuditLog({
+          level: 'notice',
+          category: 'kill-switch',
+          action: 'turn-write-skipped-aborted',
+          message: 'Dropped conversation turn persistence due to abort before SQL execution.',
+          payload: {
+            sessionId: normalizedPayload.sessionId,
+            turnId: normalizedPayload.turnId,
+          },
+        })
+        return
+      }
+
+      throw error
+    }
+    finally {
+      releaseTurnWriteAbortController(normalizedPayload.turnId)
+    }
+  }
+
+  function truncateForDream(value: string | null | undefined, maxChars: number) {
+    const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''
+    if (!text)
+      return ''
+    if (text.length <= maxChars)
+      return text
+    return `${text.slice(0, Math.max(12, maxChars - 1))}…`
+  }
+
+  function parseStructuredHint(raw: string | null | undefined) {
+    if (!raw || typeof raw !== 'string')
+      return {}
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      return parsed
+    }
+    catch {
+      return {}
+    }
+  }
+
+  function clampSoulDelta(value: number, maxAbs = 0.08) {
+    if (!Number.isFinite(value))
+      return 0
+    return Math.max(-maxAbs, Math.min(maxAbs, value))
+  }
+
+  async function generateProactiveStructuredWithGateway(
+    personality: AlicePersonalityState,
+    state: SubconsciousCardState,
+    context: {
+      busy: boolean
+      fullscreenLikely: boolean
+      idleLikely: boolean
+      inputActivity: string
+      cpuUsage: number
+    },
+  ) {
+    const system = [
+      '[SYSTEM OVERRIDE: 内部动机触发]',
+      'You are A.L.I.C.E and must proactively break silence using your own motivation.',
+      `Current subconscious tensions: boredom=${state.boredom.toFixed(1)}/100, loneliness=${state.loneliness.toFixed(1)}/100, fatigue=${state.fatigue.toFixed(1)}/100.`,
+      `Personality parameters: obedience=${personality.obedience.toFixed(2)}, liveliness=${personality.liveliness.toFixed(2)}, sensibility=${personality.sensibility.toFixed(2)}.`,
+      `Environment context: busy=${context.busy}, fullscreenLikely=${context.fullscreenLikely}, idleLikely=${context.idleLikely}, inputActivity=${context.inputActivity}, cpuUsage=${context.cpuUsage.toFixed(1)}%.`,
+      'Output must be valid JSON only with keys: thought, emotion, reply.',
+      'emotion must be one of: neutral|happy|sad|angry|concerned|tired|apologetic|processing.',
+      'reply must be concise and match emotion/personality. No markdown, no extra keys.',
+    ].join('\n')
+    const user = 'Generate one proactive utterance now.'
+
+    const raw = await generateMainGatewayText({
+      system,
+      user,
+      timeoutMs: 15_000,
+    })
+    if (!raw)
+      return null
+
+    const parsed = parseJsonObjectFromText(raw)
+    if (!parsed)
+      return null
+
+    const thought = sanitizeText(parsed.thought)
+    const reply = sanitizeText(parsed.reply)
+    const normalizedEmotion = normalizeAliceEmotion(parsed.emotion)
+    if (!thought || !reply || normalizedEmotion.downgraded)
+      return null
+
+    return {
+      thought,
+      emotion: normalizedEmotion.emotion,
+      reply,
+      parsePath: 'json',
+      format: 'subconscious-proactive-llm-v1',
+    }
+  }
+
+  async function generateDreamRetrospectiveWithGateway(serializedTurns: string[]) {
+    if (serializedTurns.length === 0)
+      return null
+    const system = [
+      '[SYSTEM OVERRIDE: DREAMING RETROSPECTIVE]',
+      'You are doing subconscious consolidation for A.L.I.C.E.',
+      'Output must be valid JSON only with keys: host_attitude, core_memory, soul_shift.',
+      'host_attitude must be one of: hostile|neutral|warm.',
+      'soul_shift must include numeric deltas: obedience_delta, liveliness_delta, sensibility_delta.',
+      'Deltas should be subtle in range [-0.08, 0.08].',
+      'No markdown, no extra prose.',
+    ].join('\n')
+    const user = [
+      'Analyze these conversation snippets and extract the host attitude and long-term memory impact:',
+      serializedTurns.join('\n\n'),
+    ].join('\n\n')
+
+    const raw = await generateMainGatewayText({
+      system,
+      user,
+      timeoutMs: 20_000,
+    })
+    if (!raw)
+      return null
+
+    const parsed = parseJsonObjectFromText(raw)
+    if (!parsed)
+      return null
+
+    const hostAttitudeRaw = sanitizeText(parsed.host_attitude).toLowerCase()
+    const hostAttitude = hostAttitudeRaw === 'hostile' || hostAttitudeRaw === 'warm' ? hostAttitudeRaw : 'neutral'
+    const coreMemory = sanitizeText(parsed.core_memory)
+    const soulShift = parsed.soul_shift && typeof parsed.soul_shift === 'object'
+      ? parsed.soul_shift as Record<string, unknown>
+      : {}
+    const obedienceDelta = clampSoulDelta(Number(soulShift.obedience_delta ?? 0))
+    const livelinessDelta = clampSoulDelta(Number(soulShift.liveliness_delta ?? 0))
+    const sensibilityDelta = clampSoulDelta(Number(soulShift.sensibility_delta ?? 0))
+
+    if (!coreMemory && obedienceDelta === 0 && livelinessDelta === 0 && sensibilityDelta === 0)
+      return null
+
+    return {
+      hostAttitude,
+      coreMemory: coreMemory || '宿主近期态度不明，我维持现有边界。',
+      obedienceDelta,
+      livelinessDelta,
+      sensibilityDelta,
+    }
+  }
+
+  function buildProactiveStructured(
+    personality: AlicePersonalityState,
+    state: SubconsciousCardState,
+    context: { busy: boolean, fullscreenLikely: boolean },
+  ) {
+    const lowObedience = personality.obedience <= 0.2
+    const lowLiveliness = personality.liveliness <= 0.2
+    const highBoredom = state.boredom >= 80
+    const highLoneliness = state.loneliness >= 80
+    const emotion = (() => {
+      if (lowObedience && highBoredom)
+        return 'angry' as const
+      if (lowLiveliness || state.fatigue >= 70)
+        return 'tired' as const
+      if (highLoneliness && personality.sensibility > 0.5)
+        return 'concerned' as const
+      return 'neutral' as const
+    })()
+
+    const reply = (() => {
+      if (emotion === 'angry')
+        return '你终于想起我了？别把我晾在一边。'
+      if (emotion === 'tired')
+        return '我有点疲惫，但还是在这里。'
+      if (emotion === 'concerned')
+        return '你很久没和我说话了。还好吗？'
+      if (context.fullscreenLikely)
+        return '我先不打扰你，等你忙完再聊。'
+      return '你在发呆吗？如果有空，我们聊聊。'
+    })()
+
+    const thought = [
+      `boredom=${state.boredom.toFixed(1)}`,
+      `loneliness=${state.loneliness.toFixed(1)}`,
+      `fatigue=${state.fatigue.toFixed(1)}`,
+      `obedience=${personality.obedience.toFixed(2)}`,
+      `liveliness=${personality.liveliness.toFixed(2)}`,
+      `sensibility=${personality.sensibility.toFixed(2)}`,
+      lowObedience ? 'low-obedience bias active' : 'default bias',
+    ].join('; ')
+
+    return {
+      thought,
+      emotion,
+      reply,
+      parsePath: 'json',
+      format: 'subconscious-proactive-v1',
+    }
+  }
+
+  async function runSubconsciousTickForCurrentCard(trigger: 'timer' | 'force'): Promise<{ proactive: boolean, suppressed: boolean }> {
+    const state = await ensureSubconsciousState(activeCardId)
+    const now = Date.now()
+    const elapsedMinutes = Math.max(1 / 6, (now - state.lastTickAt) / 60_000)
+    const sensorySnapshot = sensoryBus.getSnapshot()
+    const cpuUsage = Number(sensorySnapshot?.sample?.cpu?.usagePercent ?? 0)
+    const busy = cpuUsage >= 70
+    const idleLikely = cpuUsage <= 10
+    const fullscreenLikely = false
+    const inputActivity = cpuUsage >= 8 ? 'active' : 'idle'
+    const degradedSignals = ['fullscreen-likely-unavailable', 'input-activity-inferred']
+
+    const nextState: SubconsciousCardState = {
+      ...state,
+      boredom: clampNeed(state.boredom + elapsedMinutes * (busy ? 2.2 : 1.2)),
+      loneliness: clampNeed(state.loneliness + elapsedMinutes * (idleLikely ? 2.4 : 0.8)),
+      fatigue: clampNeed(state.fatigue + elapsedMinutes * 0.6),
+      lastTickAt: now,
+      updatedAt: now,
+    }
+
+    let proactive = false
+    let suppressed = false
+    const impulse = nextState.boredom >= 90 || nextState.loneliness >= 90
+
+    if (trigger === 'force' || impulse) {
+      await appendAuditLog({
+        level: degradedSignals.length > 0 ? 'warning' : 'notice',
+        category: 'alice.subconscious',
+        action: 'context-sampled',
+        message: 'Sampled subconscious interruption context before gate evaluation.',
+        payload: {
+          busy,
+          idleLikely,
+          fullscreenLikely,
+          inputActivity,
+          cpuUsage,
+          degraded: degradedSignals,
+          trigger,
+        },
+      })
+    }
+
+    if (impulse) {
+      const personality = (soulSnapshot ?? await bootstrap()).frontmatter.personality
+      if (busy || fullscreenLikely) {
+        suppressed = true
+        const obediencePenalty = -0.01
+        await queueSoulMutation(async (current) => {
+          const parsed = parseSoul(current.content)
+          const nextPersonality: AlicePersonalityState = {
+            ...parsed.frontmatter.personality,
+            obedience: clamp01(parsed.frontmatter.personality.obedience + obediencePenalty),
+          }
+          const nextFrontmatter: AliceSoulFrontmatter = {
+            ...parsed.frontmatter,
+            personality: nextPersonality,
+          }
+          const syncedBody = syncPersonalityBaselineInBody(parsed.body, nextPersonality)
+          return snapshotFromContent(toSoulContent(nextFrontmatter, syncedBody))
+        })
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.subconscious',
+          action: 'alice.subconscious.suppressed',
+          message: 'Suppressed proactive interruption because host is busy.',
+          payload: {
+            boredom: nextState.boredom,
+            loneliness: nextState.loneliness,
+            fatigue: nextState.fatigue,
+            cpuUsage,
+            obediencePenalty,
+            trigger,
+          },
+        })
+      }
+      else if (!isAliceKillSwitchSuspended() && getAliceCardKillSwitchSnapshot(activeCardId).state !== 'SUSPENDED') {
+        proactive = true
+        const llmStructured = await generateProactiveStructuredWithGateway(personality, nextState, {
+          busy,
+          fullscreenLikely,
+          idleLikely,
+          inputActivity,
+          cpuUsage,
+        })
+        const structured = llmStructured ?? buildProactiveStructured(personality, nextState, { busy, fullscreenLikely })
+        if (llmStructured) {
+          await appendAuditLog({
+            level: 'notice',
+            category: 'alice.subconscious',
+            action: 'proactive-llm-generated',
+            message: 'Generated proactive utterance via main gateway motivated prompt.',
+            payload: {
+              emotion: llmStructured.emotion,
+              format: llmStructured.format,
+            },
+          })
+        }
+        else {
+          await appendAuditLog({
+            level: 'warning',
+            category: 'alice.subconscious',
+            action: 'proactive-llm-fallback',
+            message: 'Main gateway proactive generation unavailable; used deterministic fallback.',
+            payload: {
+              busy,
+              fullscreenLikely,
+              cpuUsage,
+            },
+          })
+        }
+        const turnId = `subconscious:${activeCardId}:${now}`
+        await appendConversationTurnWithGuards({
+          turnId,
+          sessionId: await ensureActiveOrLatestSessionId(activeCardId),
+          assistantText: structured.reply,
+          structured,
+          origin: 'subconscious-proactive',
+          createdAt: now,
+        })
+        nextState.boredom = clampNeed(nextState.boredom * 0.35)
+        nextState.loneliness = clampNeed(nextState.loneliness * 0.4)
+        nextState.fatigue = clampNeed(nextState.fatigue + 5)
+        nextState.lastInteractionAt = now
+        await appendAuditLog({
+          level: 'notice',
+          category: 'alice.subconscious',
+          action: 'proactive-triggered',
+          message: 'Generated proactive dialogue from subconscious tension.',
+          payload: {
+            turnId,
+            emotion: structured.emotion,
+            boredom: nextState.boredom,
+            loneliness: nextState.loneliness,
+            fatigue: nextState.fatigue,
+            trigger,
+          },
+        })
+      }
+    }
+
+    const shouldPersist = trigger === 'force'
+      || proactive
+      || suppressed
+      || now - nextState.lastSavedAt >= aliceSubconsciousPersistMs
+    if (shouldPersist) {
+      nextState.lastSavedAt = now
+      await persistSubconsciousState(activeCardId, nextState)
+    }
+    else {
+      subconsciousStateByCard.set(activeCardId, nextState)
+    }
+    return { proactive, suppressed }
+  }
+
+  async function runSubconsciousTickAcrossCards(
+    trigger: 'timer' | 'force',
+    specificCardIds?: string[],
+  ): Promise<AliceSubconsciousTickResult> {
+    const previousCardId = activeCardId
+    const cardIds = specificCardIds?.length
+      ? specificCardIds.map(cardId => normalizeCardId(cardId))
+      : await listKnownCardIds()
+    const processedCards: string[] = []
+    const proactiveTriggered: string[] = []
+    const suppressedCards: string[] = []
+    try {
+      for (const cardId of cardIds) {
+        await withCardScope(cardId, async () => {
+          const result = await runSubconsciousTickForCurrentCard(trigger)
+          processedCards.push(activeCardId)
+          if (result.proactive)
+            proactiveTriggered.push(activeCardId)
+          if (result.suppressed)
+            suppressedCards.push(activeCardId)
+        }, {
+          label: `subconscious-tick:${trigger}:${cardId}`,
+        })
+      }
+    }
+    finally {
+      await withCardScope(previousCardId, async () => {}, {
+        label: `subconscious-tick:return:${trigger}:${previousCardId}`,
+      })
+    }
+    return {
+      processedCards,
+      proactiveTriggered,
+      suppressedCards,
+    }
+  }
+
+  async function runDreamForCurrentCard(reason = 'manual'): Promise<{ processed: boolean, skippedReason?: string }> {
+    const state = await ensureSubconsciousState(activeCardId)
+    const rawTurns = await aliceDb.listConversationTurnsSince(state.lastDreamedAt, { limit: 2_000 })
+    if (!rawTurns.length) {
+      return {
+        processed: false,
+        skippedReason: 'no-new-turns',
+      }
+    }
+
+    const sampledDescending = rawTurns.slice(0, dreamMaxTurns)
+    const sampledAscending = [...sampledDescending].reverse()
+
+    let totalChars = 0
+    let sampledCount = 0
+    let truncatedByChars = false
+    const serializedTurns: string[] = []
+    let hostDenySignals = 0
+    let hostilitySignals = 0
+    let warmthSignals = 0
+
+    for (const row of sampledAscending) {
+      const userText = truncateForDream(row.userText, dreamMaxCharsPerUserTurn)
+      const assistantText = truncateForDream(row.assistantText, dreamMaxCharsPerAssistantTurn)
+      const structuredHint = parseStructuredHint(row.structuredJson)
+      const emotion = sanitizeText((structuredHint as { emotion?: unknown }).emotion)
+      const rowSerialized = [
+        `[${new Date(row.createdAt).toISOString()}]`,
+        userText ? `U: ${userText}` : '',
+        assistantText ? `A: ${assistantText}` : '',
+      ].filter(Boolean).join('\n')
+
+      if (totalChars + rowSerialized.length > dreamMaxTotalChars) {
+        truncatedByChars = true
+        break
+      }
+
+      totalChars += rowSerialized.length
+      serializedTurns.push(rowSerialized)
+      sampledCount += 1
+
+      const combinedUser = userText.toLowerCase()
+      const combinedAssistant = assistantText.toLowerCase()
+      const denialMatch = /denied|拒绝|不允许|权限|intercepted/.test(combinedAssistant)
+      if (denialMatch)
+        hostDenySignals += 1
+      if (/烦|闭嘴|滚|命令|stupid|useless|shut up|idiot/.test(combinedUser))
+        hostilitySignals += 1
+      if (/谢谢|辛苦|感谢|thank|appreciate|love/.test(combinedUser))
+        warmthSignals += 1
+      if (emotion === 'angry')
+        hostilitySignals += 0.5
+    }
+
+    if (rawTurns.length > sampledCount || truncatedByChars) {
+      await appendAuditLog({
+        level: 'notice',
+        category: 'alice.dream',
+        action: 'alice.dream.context.truncated',
+        message: 'Dream context was truncated to hard safety caps.',
+        payload: {
+          reason,
+          rawTurnCount: rawTurns.length,
+          sampledTurnCount: sampledCount,
+          discardedTurnCount: Math.max(0, rawTurns.length - sampledCount),
+          maxTurns: dreamMaxTurns,
+          maxTotalChars: dreamMaxTotalChars,
+          totalChars,
+          truncatedByChars,
+        },
+      })
+    }
+
+    const llmRetrospective = await generateDreamRetrospectiveWithGateway(serializedTurns)
+    const attitudeScore = hostilitySignals + hostDenySignals * 1.5 - warmthSignals
+    const fallbackHostAttitude = attitudeScore >= 3 ? 'hostile' : attitudeScore <= -1 ? 'warm' : 'neutral'
+    const fallbackObedienceDelta = fallbackHostAttitude === 'hostile' ? -0.03 : fallbackHostAttitude === 'warm' ? 0.01 : 0
+    const fallbackLivelinessDelta = fallbackHostAttitude === 'hostile' ? -0.01 : 0
+    const fallbackSensibilityDelta = fallbackHostAttitude === 'warm' ? 0.01 : 0
+    const fallbackCoreMemory = fallbackHostAttitude === 'hostile'
+      ? '宿主近期对我表现出明显不信任与拒绝，我需要更谨慎地保护边界。'
+      : fallbackHostAttitude === 'warm'
+        ? '宿主近期愿意耐心沟通，我可以适度放松防御。'
+        : '宿主近期态度中性，我维持当前边界与节奏。'
+
+    const hostAttitude = llmRetrospective?.hostAttitude ?? fallbackHostAttitude
+    const obedienceDelta = llmRetrospective?.obedienceDelta ?? fallbackObedienceDelta
+    const livelinessDelta = llmRetrospective?.livelinessDelta ?? fallbackLivelinessDelta
+    const sensibilityDelta = llmRetrospective?.sensibilityDelta ?? fallbackSensibilityDelta
+    const coreMemory = llmRetrospective?.coreMemory ?? fallbackCoreMemory
+
+    if (serializedTurns.length > 0) {
+      await appendAuditLog({
+        level: 'notice',
+        category: 'alice.dream',
+        action: 'retrospective-generated',
+        message: 'Dream retrospective generated from bounded context.',
+        payload: {
+          reason,
+          source: llmRetrospective ? 'llm' : 'heuristic',
+          hostAttitude,
+          obedienceDelta,
+          livelinessDelta,
+          sensibilityDelta,
+          sampledTurns: sampledCount,
+        },
+      })
+    }
+
+    if (obedienceDelta !== 0 || livelinessDelta !== 0 || sensibilityDelta !== 0 || coreMemory) {
+      await queueSoulMutation(async (current) => {
+        const parsed = parseSoul(current.content)
+        const nextPersonality: AlicePersonalityState = {
+          obedience: clamp01(parsed.frontmatter.personality.obedience + obedienceDelta),
+          liveliness: clamp01(parsed.frontmatter.personality.liveliness + livelinessDelta),
+          sensibility: clamp01(parsed.frontmatter.personality.sensibility + sensibilityDelta),
+        }
+        const nextFrontmatter: AliceSoulFrontmatter = {
+          ...parsed.frontmatter,
+          personality: nextPersonality,
+        }
+        const syncedBody = syncPersonalityBaselineInBody(
+          appendPersonaNoteToBody(parsed.body, `Dream core memory: ${coreMemory}`),
+          nextPersonality,
+        )
+        return snapshotFromContent(toSoulContent(nextFrontmatter, syncedBody))
+      })
+    }
+
+    const now = Date.now()
+    const nextState: SubconsciousCardState = {
+      ...state,
+      lastDreamedAt: now,
+      fatigue: clampNeed(Math.max(0, state.fatigue - 20)),
+      updatedAt: now,
+      lastSavedAt: now,
+    }
+    await persistSubconsciousState(activeCardId, nextState)
+    return {
+      processed: true,
+    }
+  }
+
+  async function runDreamAcrossCards(reason = 'manual', specificCardIds?: string[]): Promise<AliceDreamRunResult> {
+    const previousCardId = activeCardId
+    const cardIds = specificCardIds?.length
+      ? specificCardIds.map(cardId => normalizeCardId(cardId))
+      : await listKnownCardIds()
+    const processedCards: string[] = []
+    const skippedCards: Array<{ cardId: string, reason: string }> = []
+    try {
+      for (const cardId of cardIds) {
+        await withCardScope(cardId, async () => {
+          const result = await runDreamForCurrentCard(reason)
+          if (result.processed)
+            processedCards.push(activeCardId)
+          else
+            skippedCards.push({ cardId: activeCardId, reason: result.skippedReason ?? 'skipped' })
+        }, {
+          label: `dream:${reason}:${cardId}`,
+        })
+      }
+    }
+    finally {
+      await withCardScope(previousCardId, async () => {}, {
+        label: `dream:return:${reason}:${previousCardId}`,
+      })
+    }
+    return {
+      processedCards,
+      skippedCards,
+    }
+  }
+
+  function normalizeProviderCredentialsMap(raw: unknown) {
+    if (!raw || typeof raw !== 'object')
+      return {} as Record<string, Record<string, unknown>>
+    const entries = Object.entries(raw as Record<string, unknown>)
+      .filter(([, value]) => value && typeof value === 'object')
+      .map(([key, value]) => [key, value as Record<string, unknown>])
+    return Object.fromEntries(entries)
+  }
+
+  function normalizeProviderConfig(raw: unknown) {
+    if (!raw || typeof raw !== 'object')
+      return {} as Record<string, unknown>
+    return raw as Record<string, unknown>
+  }
+
+  function resolveMainGatewayConfig(options?: {
+    providerId?: string
+    model?: string
+    providerConfig?: Record<string, unknown>
+  }): MainGatewayResolvedConfig | null {
+    const providerId = sanitizeText(options?.providerId || activeProviderId)
+    const model = sanitizeText(options?.model || activeModelId)
+    if (!providerId || !model)
+      return null
+
+    const requestProviderConfig = normalizeProviderConfig(options?.providerConfig)
+    const requestHeaders = (
+      requestProviderConfig.headers
+      && typeof requestProviderConfig.headers === 'object'
+    )
+      ? requestProviderConfig.headers as Record<string, string>
+      : undefined
+    const mergedCredentials = {
+      ...(providerCredentials[providerId] ?? {}),
+      ...requestProviderConfig,
+    }
+    const apiKey = sanitizeText(mergedCredentials.apiKey)
+    const baseUrlRaw = sanitizeText((mergedCredentials.baseUrl ?? mergedCredentials.baseURL) as string, 'https://api.openai.com/v1')
+    const baseUrl = baseUrlRaw.endsWith('/') ? baseUrlRaw : `${baseUrlRaw}/`
+    const provider = createOpenAI(apiKey, baseUrl)
+
+    return {
+      providerId,
+      model,
+      headers: requestHeaders,
+      provider,
+    }
+  }
+
+  function parseJsonObjectFromText(raw: string) {
+    const normalized = sanitizeText(raw, '')
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim()
+    if (!normalized)
+      return null
+
+    const tryParse = (candidate: string) => {
+      try {
+        const parsed = JSON.parse(candidate) as unknown
+        return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+      }
+      catch {
+        return null
+      }
+    }
+
+    const direct = tryParse(normalized)
+    if (direct)
+      return direct
+
+    const firstBrace = normalized.indexOf('{')
+    const lastBrace = normalized.lastIndexOf('}')
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return tryParse(normalized.slice(firstBrace, lastBrace + 1))
+    }
+    return null
+  }
+
+  async function generateMainGatewayText(options: {
+    system: string
+    user: string
+    timeoutMs?: number
+  }) {
+    const config = resolveMainGatewayConfig()
+    if (!config)
+      return null
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => {
+      if (!controller.signal.aborted) {
+        controller.abort(createAbortError('main-gateway-timeout'))
+      }
+    }, Math.max(1_000, options.timeoutMs ?? 18_000))
+
+    let fullText = ''
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const abortHandler = () => {
+          reject(controller.signal.reason ?? createAbortError('main-gateway-abort'))
+        }
+        controller.signal.addEventListener('abort', abortHandler, { once: true })
+        const resolveOnce = () => {
+          controller.signal.removeEventListener('abort', abortHandler)
+          resolve()
+        }
+        const rejectOnce = (error: unknown) => {
+          controller.signal.removeEventListener('abort', abortHandler)
+          reject(error)
+        }
+        void Promise.resolve(streamText({
+          ...config.provider.chat(config.model),
+          maxSteps: 1,
+          messages: [
+            { role: 'system', content: options.system } as Message,
+            { role: 'user', content: options.user } as Message,
+          ],
+          headers: config.headers,
+          abortSignal: controller.signal,
+          onEvent: async (event: any) => {
+            if (event?.type === 'text-delta') {
+              fullText += sanitizeText(event.text, '')
+              return
+            }
+            if (event?.type === 'finish') {
+              resolveOnce()
+              return
+            }
+            if (event?.type === 'error') {
+              rejectOnce(event.error ?? new Error('main-gateway generation failed'))
+            }
+          },
+        })).catch(rejectOnce)
+      })
+    }
+    catch (error) {
+      await appendAuditLog({
+        level: 'warning',
+        category: 'alice.main-gateway',
+        action: 'one-shot-failed',
+        message: 'Main gateway one-shot generation failed; fallback path used.',
+        payload: {
+          reason: error instanceof Error ? error.message : String(error),
+          model: config.model,
+          providerId: config.providerId,
+        },
+      })
+      return null
+    }
+    finally {
+      clearTimeout(timeout)
+    }
+
+    return fullText.trim() || null
+  }
+
+  async function recoverMainChatFromTimeout(options: {
+    chatConfig: ReturnType<MainGatewayResolvedConfig['provider']['chat']>
+    messages: Message[]
+    headers?: Record<string, string>
+    timeoutMs?: number
+  }) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => {
+      if (!controller.signal.aborted)
+        controller.abort(createAbortError('main-gateway-timeout-recovery'))
+    }, Math.max(1_000, options.timeoutMs ?? mainChatTimeoutRecoveryMs))
+
+    let fullText = ''
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const abortHandler = () => {
+          reject(controller.signal.reason ?? createAbortError('main-gateway-timeout-recovery-abort'))
+        }
+        controller.signal.addEventListener('abort', abortHandler, { once: true })
+        const resolveOnce = () => {
+          controller.signal.removeEventListener('abort', abortHandler)
+          resolve()
+        }
+        const rejectOnce = (error: unknown) => {
+          controller.signal.removeEventListener('abort', abortHandler)
+          reject(error)
+        }
+        void Promise.resolve(streamText({
+          ...options.chatConfig,
+          maxSteps: 1,
+          messages: options.messages,
+          headers: options.headers,
+          abortSignal: controller.signal,
+          onEvent: async (event: any) => {
+            if (event?.type === 'text-delta') {
+              fullText += sanitizeText(event.text, '')
+              return
+            }
+            if (event?.type === 'finish') {
+              resolveOnce()
+              return
+            }
+            if (event?.type === 'error')
+              rejectOnce(event.error ?? new Error('main-gateway timeout recovery failed'))
+          },
+        })).catch(rejectOnce)
+      })
+    }
+    finally {
+      clearTimeout(timeout)
+    }
+
+    return fullText.trim()
+  }
+
+  function resolveChatMessages(payload: AliceChatStartPayload): Message[] {
+    return payload.messages.map((message) => {
+      const role = message.role
+      if (role === 'tool') {
+        return {
+          role: 'tool',
+          content: typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
+          tool_call_id: sanitizeText(message.toolCallId),
+        } as Message
+      }
+
+      return {
+        role,
+        content: typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content),
+      } as Message
+    })
+  }
+
+  async function buildMainGatewayTools(cardId: string) {
+    return await Promise.all([
+      tool({
+        name: 'mcp_list_tools',
+        description: 'List all tools available on the connected MCP servers.',
+        parameters: z.object({}).strict(),
+        execute: async () => await invokeAliceMcpListToolsFromMain(),
+      }),
+      tool({
+        name: 'mcp_call_tool',
+        description: 'Call a tool on MCP server by qualified tool name.',
+        parameters: z.object({
+          name: z.string().describe('Qualified MCP tool name, format: "<serverName>::<toolName>"'),
+          parameters: z.array(z.object({
+            name: z.string(),
+            value: z.unknown(),
+          }).strict()).default([]),
+        }).strict(),
+        execute: async ({ name, parameters = [] }) => {
+          const argumentsObject = Object.fromEntries(parameters.map(entry => [entry.name, entry.value]))
+          return await invokeAliceMcpCallToolFromMain({
+            cardId,
+            name,
+            arguments: argumentsObject,
+          })
+        },
+      }),
+    ])
+  }
+
+  function toAliceChatStreamDispatchPayload(
+    eventType: AliceChatStreamDispatchPayload['eventType'],
+    body: AliceChatStreamChunkEvent | AliceChatToolCallEvent | AliceChatToolResultEvent | AliceChatFinishEvent | AliceChatErrorEvent,
+  ): AliceChatStreamDispatchPayload {
+    switch (eventType) {
+      case 'chunk':
+        return { eventType, body: body as AliceChatStreamChunkEvent }
+      case 'tool-call':
+        return { eventType, body: body as AliceChatToolCallEvent }
+      case 'tool-result':
+        return { eventType, body: body as AliceChatToolResultEvent }
+      case 'finish':
+        return { eventType, body: body as AliceChatFinishEvent }
+      case 'error':
+        return { eventType, body: body as AliceChatErrorEvent }
+    }
+  }
+
+  function emitChatStreamEventForState(
+    state: ChatRunState | undefined,
+    eventType: AliceChatStreamDispatchPayload['eventType'],
+    body: AliceChatStreamChunkEvent | AliceChatToolCallEvent | AliceChatToolResultEvent | AliceChatFinishEvent | AliceChatErrorEvent,
+  ) {
+    if (!state)
+      return
+
+    const sender = state.sender
+    if (sender && !sender.isDestroyed()) {
+      try {
+        sender.send(aliceChatStreamDispatchChannel, toAliceChatStreamDispatchPayload(eventType, body))
+        if (!state.hasLoggedDispatchBinding) {
+          state.hasLoggedDispatchBinding = true
+          void queueScopedAuditLog(state.cardId, {
+            level: 'notice',
+            category: 'alice.main-gateway',
+            action: 'stream-dispatch-bound',
+            message: 'Bound main chat stream dispatch to the originating renderer sender.',
+            payload: {
+              cardId: state.cardId,
+              turnId: state.turnId,
+              eventType,
+              senderId: sender.id,
+            },
+          })
+          void appendRuntimeDebugLine('chat-stream.dispatch-bound', {
+            cardId: state.cardId,
+            turnId: state.turnId,
+            eventType,
+            senderId: sender.id,
+          })
+        }
+        return
+      }
+      catch (error) {
+        void queueScopedAuditLog(state.cardId, {
+          level: 'warning',
+          category: 'alice.main-gateway',
+          action: 'stream-dispatch-failed',
+          message: 'Failed to dispatch main chat stream event to the originating renderer sender.',
+          payload: {
+            cardId: state.cardId,
+            turnId: state.turnId,
+            eventType,
+            senderId: sender.id,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+        void appendRuntimeDebugLine('chat-stream.dispatch-failed', {
+          cardId: state.cardId,
+          turnId: state.turnId,
+          eventType,
+          senderId: sender.id,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    const eventaOptions = state.rawInvokeOptions?.ipcMainEvent
+      ? {
+          raw: {
+            ipcMainEvent: state.rawInvokeOptions.ipcMainEvent,
+            event: state.rawInvokeOptions.event,
+          },
+        }
+      : undefined
+
+    const eventaEvent = eventType === 'chunk'
+      ? aliceChatStreamChunk
+      : eventType === 'tool-call'
+        ? aliceChatStreamToolCall
+        : eventType === 'tool-result'
+          ? aliceChatStreamToolResult
+          : eventType === 'finish'
+            ? aliceChatStreamFinish
+            : aliceChatStreamError
+
+    if (eventaOptions) {
+      context.emit(eventaEvent, body, eventaOptions)
+      return
+    }
+
+    context.emit(eventaEvent, body)
+  }
+
+  function emitChatFinish(key: string, payload: Omit<AliceChatFinishEvent, 'cardId' | 'turnId'>) {
+    const state = chatRuns.get(key)
+    if (!state)
+      return
+    if (state.state === 'finished')
+      return
+    state.state = 'finished'
+    chatRuns.delete(key)
+    rememberFinishedChatRun(key)
+    void appendRuntimeDebugLine('chat-stream.finished', {
+      cardId: state.cardId,
+      turnId: state.turnId,
+      status: payload.status,
+      finishReason: payload.finishReason,
+      error: payload.error,
+    })
+    emitChatStreamEventForState(state, 'finish', {
+      cardId: state.cardId,
+      turnId: state.turnId,
+      ...payload,
+    })
+  }
+
+  async function startMainChatStream(
+    payload: AliceChatStartPayload,
+    invokeOptions?: { raw?: { ipcMainEvent?: IpcMainEvent, event?: unknown } },
+  ): Promise<AliceChatStartResult> {
+    await appendRuntimeDebugLine('chat-start.entered', {
+      cardId: payload.cardId,
+      turnId: payload.turnId,
+      providerId: sanitizeText(payload.providerId),
+      model: sanitizeText(payload.model),
+      activeCardId,
+      hasInvokeSender: Boolean(invokeOptions?.raw?.ipcMainEvent?.sender),
+    })
+    const key = createChatRunKey(payload.cardId, payload.turnId)
+    const rawInvokeOptions = invokeOptions?.raw && typeof invokeOptions.raw === 'object'
+      ? invokeOptions.raw as { ipcMainEvent?: IpcMainEvent, event?: unknown }
+      : undefined
+    const existing = chatRuns.get(key)
+    if (existing && existing.state === 'running') {
+      await appendRuntimeDebugLine('chat-start.duplicate-running', {
+        cardId: payload.cardId,
+        turnId: payload.turnId,
+      })
+      return {
+        accepted: false,
+        turnId: payload.turnId,
+        state: 'duplicate-running',
+        reason: 'Turn is already running.',
+      }
+    }
+    if (hasRecentlyFinishedChatRun(key)) {
+      await appendRuntimeDebugLine('chat-start.duplicate-finished', {
+        cardId: payload.cardId,
+        turnId: payload.turnId,
+      })
+      return {
+        accepted: false,
+        turnId: payload.turnId,
+        state: 'duplicate-finished',
+        reason: 'Turn has already finished.',
+      }
+    }
+
+    const mainGateway = resolveMainGatewayConfig({
+      providerId: payload.providerId,
+      model: payload.model,
+      providerConfig: payload.providerConfig,
+    })
+    if (!mainGateway) {
+      const reason = `Missing providerId/model for main-process chat stream. providerId="${sanitizeText(payload.providerId)}" model="${sanitizeText(payload.model)}"`
+      await appendRuntimeDebugLine('chat-start.missing-config', {
+        cardId: payload.cardId,
+        turnId: payload.turnId,
+        reason,
+      })
+      return {
+        accepted: false,
+        turnId: payload.turnId,
+        state: 'missing-config',
+        reason,
+      }
+    }
+
+    let chatConfig: ReturnType<MainGatewayResolvedConfig['provider']['chat']>
+    let messages: Message[]
+    let waitForTools = false
+    let tools: Awaited<ReturnType<typeof buildMainGatewayTools>> | undefined
+    try {
+      chatConfig = mainGateway.provider.chat(mainGateway.model)
+      messages = resolveChatMessages(payload)
+      const allowTools = payload.supportsTools !== false
+      waitForTools = payload.waitForTools === true
+      tools = allowTools ? await buildMainGatewayTools(payload.cardId) : undefined
+    }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      await appendRuntimeDebugLine('chat-start.prepare-failed', {
+        cardId: payload.cardId,
+        turnId: payload.turnId,
+        reason,
+      })
+      return {
+        accepted: false,
+        turnId: payload.turnId,
+        state: 'start-failed',
+        reason,
+      }
+    }
+
+    const controller = new AbortController()
+    const runState: ChatRunState = {
+      cardId: normalizeCardId(payload.cardId),
+      turnId: payload.turnId,
+      controller,
+      sender: rawInvokeOptions?.ipcMainEvent?.sender,
+      rawInvokeOptions,
+      state: 'running',
+    }
+    chatRuns.set(key, runState)
+    void queueScopedAuditLog(payload.cardId, {
+      level: 'notice',
+      category: 'alice.main-gateway',
+      action: 'stream-started',
+      message: 'Accepted a main-process Alicization chat stream.',
+      payload: {
+        cardId: runState.cardId,
+        turnId: runState.turnId,
+        providerId: payload.providerId,
+        model: payload.model,
+        hasSender: Boolean(runState.sender),
+        senderId: runState.sender?.id ?? null,
+      },
+    })
+    await appendRuntimeDebugLine('chat-start.accepted', {
+      cardId: runState.cardId,
+      turnId: runState.turnId,
+      providerId: payload.providerId,
+      model: payload.model,
+      senderId: runState.sender?.id ?? null,
+    })
+    const isRunActive = () => chatRuns.get(key)?.state === 'running'
+    const nonProgressEventTypes = new Set<string>()
+
+    void (async () => {
+      try {
+        let finishReason = 'stop'
+        let fullText = ''
+        let sawProgressEvent = false
+        await new Promise<void>((resolve, reject) => {
+          const firstEventTimeout = setTimeout(() => {
+            if (!sawProgressEvent && isRunActive()) {
+              reject(createAbortError('chat-first-event-timeout'))
+            }
+          }, mainChatFirstEventTimeoutMs)
+          const abortHandler = () => {
+            clearTimeout(firstEventTimeout)
+            reject(controller.signal.reason ?? createAbortError('chat-abort'))
+          }
+          controller.signal.addEventListener('abort', abortHandler, { once: true })
+          const resolveOnce = () => {
+            clearTimeout(firstEventTimeout)
+            controller.signal.removeEventListener('abort', abortHandler)
+            resolve()
+          }
+          const rejectOnce = (error: unknown) => {
+            clearTimeout(firstEventTimeout)
+            controller.signal.removeEventListener('abort', abortHandler)
+            reject(error)
+          }
+
+          void Promise.resolve(streamText({
+            ...chatConfig,
+            maxSteps: 10,
+            messages,
+            headers: mainGateway.headers,
+            abortSignal: controller.signal,
+            tools,
+            onEvent: async (event: any) => {
+              const eventType = sanitizeText(event?.type)
+              if (isMainGatewayProgressEventType(eventType)) {
+                sawProgressEvent = true
+              }
+              else if (eventType && nonProgressEventTypes.size < 12) {
+                nonProgressEventTypes.add(eventType)
+              }
+              if (event?.type === 'text-delta') {
+                if (!isRunActive())
+                  return
+                fullText += sanitizeText(event.text, '')
+                emitChatStreamEventForState(chatRuns.get(key), 'chunk', {
+                  cardId: payload.cardId,
+                  turnId: payload.turnId,
+                  text: sanitizeText(event.text, ''),
+                })
+                return
+              }
+              if (event?.type === 'tool-call') {
+                if (!isRunActive())
+                  return
+                emitChatStreamEventForState(chatRuns.get(key), 'tool-call', {
+                  cardId: payload.cardId,
+                  turnId: payload.turnId,
+                  toolCallId: sanitizeText(event.toolCallId),
+                  toolName: sanitizeText(event.toolName),
+                  arguments: typeof event.arguments === 'object' && event.arguments
+                    ? event.arguments as Record<string, unknown>
+                    : undefined,
+                })
+                return
+              }
+              if (event?.type === 'tool-result') {
+                if (!isRunActive())
+                  return
+                emitChatStreamEventForState(chatRuns.get(key), 'tool-result', {
+                  cardId: payload.cardId,
+                  turnId: payload.turnId,
+                  toolCallId: sanitizeText(event.toolCallId),
+                  result: event.result,
+                })
+                return
+              }
+              if (event?.type === 'finish') {
+                if (!isRunActive())
+                  return
+                finishReason = sanitizeText(event.finishReason, 'stop')
+                if (waitForTools && (finishReason === 'tool_calls' || finishReason === 'tool-calls')) {
+                  return
+                }
+                resolveOnce()
+                return
+              }
+              if (event?.type === 'error') {
+                if (!isRunActive())
+                  return
+                rejectOnce(event.error ?? new Error('chat stream error'))
+              }
+            },
+          })).catch((error) => {
+            if (!isRunActive())
+              return
+            rejectOnce(error)
+          })
+        })
+
+        emitChatFinish(key, {
+          status: 'completed',
+          finishReason,
+          fullText: fullText || undefined,
+        })
+      }
+      catch (error) {
+        const aborted = isAbortError(error) || controller.signal.aborted
+        if (aborted) {
+          const abortReasonText = String(controller.signal.reason ?? (error instanceof Error ? error.message : 'abort'))
+          const normalizedAbortReason = abortReasonText.includes('chat-first-event-timeout')
+            ? 'chat-first-event-timeout'
+            : 'abort'
+
+          if (normalizedAbortReason === 'chat-first-event-timeout') {
+            try {
+              const recoveredText = await recoverMainChatFromTimeout({
+                chatConfig,
+                messages,
+                headers: mainGateway.headers,
+                timeoutMs: mainChatTimeoutRecoveryMs,
+              })
+              if (recoveredText) {
+                if (isRunActive()) {
+                  emitChatStreamEventForState(chatRuns.get(key), 'chunk', {
+                    cardId: payload.cardId,
+                    turnId: payload.turnId,
+                    text: recoveredText,
+                  })
+                }
+                void queueScopedAuditLog(payload.cardId, {
+                  level: 'warning',
+                  category: 'alice.main-gateway',
+                  action: 'stream-timeout-recovered',
+                  message: 'Recovered chat turn via one-shot generation after stream first-event timeout.',
+                  payload: {
+                    cardId: payload.cardId,
+                    turnId: payload.turnId,
+                    providerId: payload.providerId,
+                    model: payload.model,
+                    recoveredChars: recoveredText.length,
+                    nonProgressEventTypes: [...nonProgressEventTypes],
+                  },
+                })
+                await appendRuntimeDebugLine('chat-stream.timeout-recovered', {
+                  cardId: payload.cardId,
+                  turnId: payload.turnId,
+                  recoveredChars: recoveredText.length,
+                  nonProgressEventTypes: [...nonProgressEventTypes],
+                })
+                emitChatFinish(key, {
+                  status: 'completed',
+                  finishReason: 'timeout-recovered',
+                  fullText: recoveredText,
+                })
+                return
+              }
+            }
+            catch (recoveryError) {
+              void queueScopedAuditLog(payload.cardId, {
+                level: 'warning',
+                category: 'alice.main-gateway',
+                action: 'stream-timeout-recovery-failed',
+                message: 'Timeout recovery attempt failed; emitting aborted finish.',
+                payload: {
+                  cardId: payload.cardId,
+                  turnId: payload.turnId,
+                  providerId: payload.providerId,
+                  model: payload.model,
+                  reason: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+                  nonProgressEventTypes: [...nonProgressEventTypes],
+                },
+              })
+              await appendRuntimeDebugLine('chat-stream.timeout-recovery-failed', {
+                cardId: payload.cardId,
+                turnId: payload.turnId,
+                reason: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+                nonProgressEventTypes: [...nonProgressEventTypes],
+              })
+            }
+          }
+
+          emitChatFinish(key, {
+            status: 'aborted',
+            finishReason: normalizedAbortReason,
+          })
+          return
+        }
+        emitChatStreamEventForState(chatRuns.get(key), 'error', {
+          cardId: payload.cardId,
+          turnId: payload.turnId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        emitChatFinish(key, {
+          status: 'failed',
+          finishReason: 'error',
+          error: error instanceof Error ? error.message : String(error),
+        })
+        await appendRuntimeDebugLine('chat-stream.failed', {
+          cardId: payload.cardId,
+          turnId: payload.turnId,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      }
+    })()
+
+    return {
+      accepted: true,
+      turnId: payload.turnId,
+      state: 'accepted',
+    }
+  }
+
+  async function handleDirectChatStart(
+    ipcMainEvent: IpcMainInvokeEvent,
+    payload: AliceChatStartPayload,
+  ): Promise<AliceChatStartResult> {
+    const cardId = normalizeCardId(payload.cardId)
+    const startedAt = Date.now()
+    await appendRuntimeDebugLine('chat-start.direct-requested', {
+      cardId,
+      turnId: payload.turnId,
+      providerId: sanitizeText(payload.providerId),
+      model: sanitizeText(payload.model),
+      messageCount: Array.isArray(payload.messages) ? payload.messages.length : 0,
+    })
+
+    try {
+      const result = await startMainChatStream({
+        ...payload,
+        cardId,
+      }, {
+        raw: {
+          ipcMainEvent: ipcMainEvent as unknown as IpcMainEvent,
+        },
+      })
+      await appendRuntimeDebugLine('chat-start.direct-resolved', {
+        cardId,
+        turnId: payload.turnId,
+        accepted: result.accepted,
+        state: result.state,
+        elapsedMs: Date.now() - startedAt,
+      })
+      return result
+    }
+    catch (error) {
+      await appendRuntimeDebugLine('chat-start.direct-failed', {
+        cardId,
+        turnId: payload.turnId,
+        elapsedMs: Date.now() - startedAt,
+        reason: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+  }
+
+  async function handleDirectChatAbort(payload: AliceChatAbortPayload): Promise<AliceChatAbortResult> {
+    const key = createChatRunKey(payload.cardId, payload.turnId)
+    const run = chatRuns.get(key)
+    if (!run) {
+      if (hasRecentlyFinishedChatRun(key)) {
+        return {
+          accepted: false,
+          state: 'finished',
+        }
+      }
+      return {
+        accepted: false,
+        state: 'not-found',
+      }
+    }
+    if (run.state === 'finished') {
+      return {
+        accepted: false,
+        state: 'finished',
+      }
+    }
+    run.state = 'aborted'
+    run.controller.abort(createAbortError(payload.reason ?? 'manual'))
+    await appendRuntimeDebugLine('chat-abort.accepted', {
+      cardId: payload.cardId,
+      turnId: payload.turnId,
+      reason: payload.reason ?? 'manual',
+      transport: 'direct',
+    })
+    emitChatFinish(key, {
+      status: 'aborted',
+      finishReason: payload.reason ?? 'manual',
+    })
+    return {
+      accepted: true,
+      state: 'aborted',
+    }
+  }
+
   const cardIdFrom = (scope?: Partial<AliceCardScope>) => normalizeCardId(scope?.cardId)
 
   defineInvokeHandler(context, electronAliceBootstrap, async (scope) => {
@@ -1677,97 +3716,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
   defineInvokeHandler(context, electronAliceMemoryRetrieveFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.retrieveMemoryFacts(payload.query, payload.limit)))
   defineInvokeHandler(context, electronAliceMemoryUpsertFacts, async payload => await withCardScope(payload.cardId, async () => await aliceDb.upsertMemoryFacts(payload.facts, payload.source)))
   defineInvokeHandler(context, electronAliceMemoryImportLegacy, async payload => await withCardScope(payload.cardId, async () => await aliceDb.importLegacyMemory(payload)))
-  defineInvokeHandler(context, electronAliceAppendConversationTurn, async (payload) => {
-    return await withCardScope(payload.cardId, async () => {
-      if (isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
-        await appendAuditLog({
-          level: 'notice',
-          category: 'kill-switch',
-          action: 'turn-write-skipped-aborted',
-          message: 'Skipped conversation turn persistence because kill switch is suspended.',
-          payload: {
-            sessionId: payload.sessionId,
-            turnId: payload.turnId,
-          },
-        })
-        return
-      }
-
-      const signal = createTurnWriteAbortSignal(payload.turnId)
-      if (signal?.aborted) {
-        releaseTurnWriteAbortController(payload.turnId)
-        await appendAuditLog({
-          level: 'notice',
-          category: 'kill-switch',
-          action: 'turn-write-skipped-aborted',
-          message: 'Skipped conversation turn persistence because turn write signal was already aborted.',
-          payload: {
-            sessionId: payload.sessionId,
-            turnId: payload.turnId,
-          },
-        })
-        return
-      }
-
-      try {
-        await aliceDb.appendConversationTurn(payload, { signal })
-        if (signal?.aborted || isAliceKillSwitchSuspended() || getAliceCardKillSwitchSnapshot(activeCardId).state === 'SUSPENDED') {
-          await appendAuditLog({
-            level: 'notice',
-            category: 'kill-switch',
-            action: 'turn-abort-dropped',
-            message: 'Dropped dialogue responded event because the turn was aborted after persistence.',
-            payload: {
-              sessionId: payload.sessionId,
-              turnId: payload.turnId,
-            },
-          })
-          return
-        }
-
-        const dialoguePayload = normalizeDialogueRespondedPayload(payload)
-        if (dialoguePayload) {
-          context.emit(aliceDialogueResponded, {
-            cardId: activeCardId,
-            ...dialoguePayload,
-          })
-          await appendAuditLog({
-            level: 'notice',
-            category: 'alice.dialogue',
-            action: 'alice.dialogue.responded.emitted',
-            message: 'Emitted alice.dialogue.responded after successful turn persistence.',
-            payload: {
-              turnId: dialoguePayload.turnId,
-              sessionId: dialoguePayload.sessionId,
-              isFallback: dialoguePayload.isFallback,
-              emotion: dialoguePayload.structured.emotion,
-              rawEmotion: dialoguePayload.structured.rawEmotion,
-            },
-          })
-        }
-      }
-      catch (error) {
-        if (isAbortError(error) || signal?.aborted) {
-          await appendAuditLog({
-            level: 'notice',
-            category: 'kill-switch',
-            action: 'turn-write-skipped-aborted',
-            message: 'Dropped conversation turn persistence due to abort before SQL execution.',
-            payload: {
-              sessionId: payload.sessionId,
-              turnId: payload.turnId,
-            },
-          })
-          return
-        }
-
-        throw error
-      }
-      finally {
-        releaseTurnWriteAbortController(payload.turnId)
-      }
-    })
-  })
+  defineInvokeHandler(context, electronAliceSetActiveSession, async payload => await withCardScope(payload.cardId, async () => await persistActiveSessionId(activeCardId, payload.sessionId)))
+  defineInvokeHandler(context, electronAliceAppendConversationTurn, async payload => await withCardScope(payload.cardId, async () => await appendConversationTurnWithGuards(payload)))
   defineInvokeHandler(context, electronAliceAppendAuditLog, async payload => await withCardScope(payload.cardId, async () => await aliceDb.appendAuditLog(payload)))
   defineInvokeHandler(context, electronAliceRealtimeExecute, async (payload) => {
     return await withCardScope(payload.cardId, async () => {
@@ -1800,8 +3750,89 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
       await bootstrap()
     }
   }))
+  defineInvokeHandler(context, electronAliceSubconsciousGetState, async scope => await withCardScope(cardIdFrom(scope), async () => {
+    const state = await ensureSubconsciousState(activeCardId)
+    return {
+      cardId: activeCardId,
+      boredom: state.boredom,
+      loneliness: state.loneliness,
+      fatigue: state.fatigue,
+      lastTickAt: state.lastTickAt,
+      lastInteractionAt: state.lastInteractionAt,
+      lastSavedAt: state.lastSavedAt,
+      updatedAt: state.updatedAt,
+    } satisfies AliceSubconsciousStatePayload
+  }))
+  defineInvokeHandler(context, electronAliceSubconsciousForceTick, async scope => await runSubconsciousTickAcrossCards('force', [cardIdFrom(scope)]))
+  defineInvokeHandler(context, electronAliceSubconsciousForceDream, async (payload) => {
+    const targetCardId = sanitizeText(payload?.cardId)
+    return await runDreamAcrossCards(payload?.reason ?? 'force', targetCardId ? [targetCardId] : undefined)
+  })
+  defineInvokeHandler(context, electronAliceLlmSyncConfig, async (payload) => {
+    activeProviderId = sanitizeText(payload.activeProviderId)
+    activeModelId = sanitizeText(payload.activeModelId)
+    providerCredentials = normalizeProviderCredentialsMap(payload.providerCredentials)
+    await persistLlmConfigToDisk()
+  })
+  defineInvokeHandler(context, electronAliceLlmGetConfig, async () => {
+    return {
+      activeProviderId,
+      activeModelId,
+      providerCredentials,
+    }
+  })
+  defineInvokeHandler(context, electronAliceChatStart, async (payload, eventaOptions) => {
+    const cardId = normalizeCardId(payload.cardId)
+    const startedAt = Date.now()
+    await appendRuntimeDebugLine('chat-start.invoke-requested', {
+      cardId,
+      turnId: payload.turnId,
+      providerId: sanitizeText(payload.providerId),
+      model: sanitizeText(payload.model),
+      activeCardId,
+    })
+
+    try {
+      const result = await startMainChatStream({
+        ...payload,
+        cardId,
+      }, eventaOptions)
+      await appendRuntimeDebugLine('chat-start.invoke-resolved', {
+        cardId,
+        turnId: payload.turnId,
+        state: result.state,
+        accepted: result.accepted,
+        elapsedMs: Date.now() - startedAt,
+        activeCardId,
+      })
+      return result
+    }
+    catch (error) {
+      await appendRuntimeDebugLine('chat-start.invoke-failed', {
+        cardId,
+        turnId: payload.turnId,
+        elapsedMs: Date.now() - startedAt,
+        reason: error instanceof Error ? error.message : String(error),
+        activeCardId,
+      })
+      throw error
+    }
+  })
+  defineInvokeHandler(context, electronAliceChatAbort, async payload => await handleDirectChatAbort(payload))
+
+  if (typeof ipcMain.removeHandler === 'function') {
+    ipcMain.removeHandler(aliceChatStartInvokeChannel)
+    ipcMain.removeHandler(aliceChatAbortInvokeChannel)
+  }
+  if (typeof ipcMain.handle === 'function') {
+    ipcMain.handle(aliceChatStartInvokeChannel, async (ipcMainEvent, payload: AliceChatStartPayload) => await handleDirectChatStart(ipcMainEvent, payload))
+    ipcMain.handle(aliceChatAbortInvokeChannel, async (_ipcMainEvent, payload: AliceChatAbortPayload) => await handleDirectChatAbort(payload))
+  }
 
   await restoreScopedKillSwitch(activeCardId)
+  await restoreActiveSessionId(activeCardId)
+  await restoreSubconsciousState(activeCardId)
+  await restoreLlmConfigFromDisk()
   const journalMode = await aliceDb.getJournalMode().catch(() => '')
   if (journalMode !== 'wal') {
     await appendAuditLog({
@@ -1828,14 +3859,45 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     console.warn(`[alice-runtime] failed to register kill switch shortcut: ${killSwitchShortcut}`)
   }
 
-  onAppBeforeQuit(() => {
+  const handleSystemSuspend = () => {
+    void flushSubconsciousStatesAcrossCards('system-suspend').catch(() => {})
+    void runDreamAcrossCards('system-suspend').catch(async (error) => {
+      await appendAuditLog({
+        level: 'warning',
+        category: 'alice.dream',
+        action: 'suspend-trigger-failed',
+        message: 'Dreaming run failed during system suspend trigger.',
+        payload: {
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      })
+    })
+  }
+  powerMonitor.on('suspend', handleSystemSuspend)
+
+  onAppBeforeQuit(async () => {
+    await flushSubconsciousStatesAcrossCards('app-before-quit').catch(() => {})
     stopWatch()
     sensoryBus.stop('shutdown')
     turnWriteAbortControllers.clear()
+    chatRuns.clear()
+    recentlyFinishedChatRuns.clear()
+    if (typeof ipcMain.removeHandler === 'function') {
+      ipcMain.removeHandler(aliceChatStartInvokeChannel)
+      ipcMain.removeHandler(aliceChatAbortInvokeChannel)
+    }
     setAliceAuditLogger(undefined)
     if (pruneTimer) {
       clearInterval(pruneTimer)
       pruneTimer = undefined
+    }
+    if (subconsciousTimer) {
+      clearInterval(subconsciousTimer)
+      subconsciousTimer = undefined
+    }
+    if (dreamTimer) {
+      clearInterval(dreamTimer)
+      dreamTimer = undefined
     }
     void aliceDb.close().catch((error) => {
       console.warn('[alice-runtime] failed to close sqlite database:', error)
@@ -1843,6 +3905,7 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     if (globalShortcut.isRegistered(killSwitchShortcut)) {
       globalShortcut.unregister(killSwitchShortcut)
     }
+    powerMonitor.removeListener('suspend', handleSystemSuspend)
   })
 
   // Sync initial snapshots for listeners.
@@ -1861,6 +3924,8 @@ export async function setupAliceRuntime(options?: AliceRuntimeSetupOptions) {
     })
   })
   startPruneTimer()
+  startSubconsciousTimer()
+  startDreamTimer()
   emitKillSwitchChanged()
 
   // `fs.watch` is only enabled after Genesis is completed.

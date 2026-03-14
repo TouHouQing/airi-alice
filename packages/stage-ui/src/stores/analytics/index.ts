@@ -14,6 +14,10 @@ export const useSharedAnalyticsStore = defineStore('analytics-shared', () => {
   const appStartTime = ref<number | null>(null)
   const firstMessageTracked = ref(false)
 
+  function canUsePosthog() {
+    return Boolean((posthog as unknown as { __loaded?: unknown }).__loaded)
+  }
+
   function initialize() {
     if (isInitialized.value)
       return
@@ -21,12 +25,14 @@ export const useSharedAnalyticsStore = defineStore('analytics-shared', () => {
     appStartTime.value = Date.now()
 
     // Register metadata with PostHog after buildInfo is set
-    posthog.register({
-      app_version: (buildInfo.value.version && buildInfo.value.version !== '0.0.0') ? buildInfo.value.version : 'dev',
-      app_commit: buildInfo.value.commit,
-      app_branch: buildInfo.value.branch,
-      app_build_time: buildInfo.value.builtOn,
-    })
+    if (canUsePosthog()) {
+      posthog.register({
+        app_version: (buildInfo.value.version && buildInfo.value.version !== '0.0.0') ? buildInfo.value.version : 'dev',
+        app_commit: buildInfo.value.commit,
+        app_branch: buildInfo.value.branch,
+        app_build_time: buildInfo.value.builtOn,
+      })
+    }
 
     isInitialized.value = true
   }

@@ -126,7 +126,8 @@ export interface AliceMemoryMigrationResult {
 
 export interface AliceConversationTurnInput {
   turnId?: string
-  sessionId: string
+  sessionId?: string
+  origin?: 'user-turn' | 'subconscious-proactive'
   userText?: string
   assistantText?: string
   structured?: Record<string, unknown>
@@ -242,10 +243,84 @@ export interface AliceDialogueRespondedPayload {
   cardId: string
   turnId: string
   sessionId: string
+  origin?: 'user-turn' | 'subconscious-proactive'
   structured: AliceDialogueStructuredPayload
   isFallback: boolean
   createdAt: number
 }
+
+export interface AliceSubconsciousNeedsState {
+  boredom: number
+  loneliness: number
+  fatigue: number
+  lastTickAt: number
+  lastInteractionAt: number
+  lastSavedAt: number
+}
+
+export interface AliceSubconsciousStatePayload extends AliceCardScope, AliceSubconsciousNeedsState {
+  updatedAt: number
+}
+
+export interface AliceSubconsciousTickResult {
+  processedCards: string[]
+  proactiveTriggered: string[]
+  suppressedCards: string[]
+}
+
+export interface AliceDreamRunResult {
+  processedCards: string[]
+  skippedCards: Array<{ cardId: string, reason: string }>
+}
+
+export interface AliceSubconsciousForceDreamPayload extends Partial<AliceCardScope> {
+  reason?: string
+}
+
+export interface AliceLlmConfigPayload {
+  activeProviderId: string
+  activeModelId: string
+  providerCredentials: Record<string, Record<string, unknown>>
+}
+
+export interface AliceChatStartPayload extends AliceCardScope {
+  turnId: string
+  providerId: string
+  model: string
+  providerConfig: Record<string, unknown>
+  messages: Array<{
+    role: 'system' | 'user' | 'assistant' | 'tool'
+    content: unknown
+    toolCallId?: string
+    toolName?: string
+  }>
+  supportsTools?: boolean
+  waitForTools?: boolean
+}
+
+export interface AliceChatStartResult {
+  accepted: boolean
+  turnId: string
+  state?: 'accepted' | 'duplicate-running' | 'duplicate-finished' | 'missing-config' | 'start-failed'
+  reason?: string
+}
+
+export interface AliceChatAbortPayload extends AliceCardScope {
+  turnId: string
+  reason?: string
+}
+
+export interface AliceChatAbortResult {
+  accepted: boolean
+  state: 'aborted' | 'not-found' | 'finished'
+}
+
+export type AliceBridgeChatStreamEvent
+  = | { type: 'text-delta', text: string }
+    | { type: 'tool-call', toolCallId: string, toolName: string, args: string, toolCallType: 'function' }
+    | { type: 'tool-result', toolCallId: string, result?: unknown }
+    | { type: 'finish' }
+    | { type: 'error', error: unknown }
 
 export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
 
@@ -285,9 +360,24 @@ interface AliceBridge {
   upsertMemoryFacts: (payload: { facts: AliceMemoryFactInput[], source: AliceMemorySource }) => Promise<void>
   importLegacyMemory: (payload: AliceMemoryLegacySnapshot) => Promise<AliceMemoryMigrationResult>
   appendConversationTurn: (payload: AliceConversationTurnInput) => Promise<void>
+  setActiveSession?: (payload: { sessionId: string }) => Promise<void>
   appendAuditLog: (payload: AliceAuditLogInput) => Promise<void>
   realtimeExecute: (payload: AliceRealtimeExecutePayload) => Promise<AliceRealtimeExecuteResult>
   getSensorySnapshot: () => Promise<AliceSensoryCacheSnapshot>
+  getSubconsciousState?: () => Promise<AliceSubconsciousStatePayload>
+  forceSubconsciousTick?: () => Promise<AliceSubconsciousTickResult>
+  forceDreaming?: (payload?: AliceSubconsciousForceDreamPayload) => Promise<AliceDreamRunResult>
+  syncLlmConfig?: (payload: AliceLlmConfigPayload) => Promise<void>
+  getLlmConfig?: () => Promise<AliceLlmConfigPayload>
+  chatStart?: (payload: Omit<AliceChatStartPayload, 'cardId'>) => Promise<AliceChatStartResult>
+  chatAbort?: (payload: { turnId: string, reason?: string }) => Promise<AliceChatAbortResult>
+  streamChat?: (
+    payload: Omit<AliceChatStartPayload, 'cardId'>,
+    options: {
+      abortSignal?: AbortSignal
+      onStreamEvent?: (event: AliceBridgeChatStreamEvent) => Promise<void> | void
+    },
+  ) => Promise<void>
   deleteCardScope?: (scope: AliceCardScope) => Promise<void>
 }
 

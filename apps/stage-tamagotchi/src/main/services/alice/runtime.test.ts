@@ -6,24 +6,40 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  aliceChatAbortInvokeChannel,
+  aliceChatStartInvokeChannel,
+  aliceChatStreamChunk,
+  aliceChatStreamDispatchChannel,
+  aliceChatStreamFinish,
+  aliceChatStreamToolCall,
+  aliceChatStreamToolResult,
   aliceDialogueResponded,
   electronAliceAppendConversationTurn,
   electronAliceBootstrap,
+  electronAliceChatAbort,
+  electronAliceChatStart,
   electronAliceDeleteCardScope,
   electronAliceGetSensorySnapshot,
   electronAliceGetSoul,
   electronAliceInitializeGenesis,
   electronAliceKillSwitchResume,
   electronAliceKillSwitchSuspend,
+  electronAliceLlmSyncConfig,
+  electronAliceSetActiveSession,
+  electronAliceSubconsciousForceDream,
+  electronAliceSubconsciousForceTick,
   electronAliceUpdatePersonality,
   electronAliceUpdateSoul,
 } from '../../../shared/eventa'
 import { setAliceKillSwitchState } from './state'
 
-const invokeHandlers = new Map<unknown, (payload?: any) => Promise<any>>()
+const invokeHandlers = new Map<unknown, (payload?: any, options?: any) => Promise<any>>()
 const sandboxDirs: string[] = []
 const contextEmitMock = vi.fn()
 const metaStore = new Map<string, string>()
+const streamTextMock = vi.fn()
+const directIpcHandlers = new Map<string, (event: any, payload?: any) => Promise<any> | any>()
+let sensoryCpuUsage = 12
 
 const dbStub = {
   dbPath: '',
@@ -57,6 +73,8 @@ const dbStub = {
     lastPrunedAt: null,
   }),
   getJournalMode: vi.fn().mockResolvedValue('wal'),
+  getLatestConversationSessionId: vi.fn().mockResolvedValue(undefined),
+  listConversationTurnsSince: vi.fn().mockResolvedValue([]),
   getMetaValue: vi.fn(async (key: string) => metaStore.get(key)),
   setMetaValue: vi.fn(async (key: string, value: string) => {
     metaStore.set(key, value)
@@ -88,7 +106,18 @@ vi.mock('electron', () => ({
     isRegistered: vi.fn(() => false),
     unregister: vi.fn(),
   },
-  ipcMain: {},
+  powerMonitor: {
+    on: vi.fn(),
+    removeListener: vi.fn(),
+  },
+  ipcMain: {
+    handle: vi.fn((channel: string, handler: (event: any, payload?: any) => Promise<any> | any) => {
+      directIpcHandlers.set(channel, handler)
+    }),
+    removeHandler: vi.fn((channel: string) => {
+      directIpcHandlers.delete(channel)
+    }),
+  },
 }))
 
 vi.mock('../../libs/bootkit/lifecycle', () => ({
@@ -97,6 +126,54 @@ vi.mock('../../libs/bootkit/lifecycle', () => ({
 
 vi.mock('./db', () => ({
   setupAliceDb: vi.fn(async () => dbStub),
+}))
+
+vi.mock('./sensory-bus', () => ({
+  createAliceSensoryBus: () => {
+    let running = true
+    const createSnapshot = () => ({
+      sample: {
+        collectedAt: Date.now(),
+        time: {
+          iso: new Date().toISOString(),
+          local: new Date().toLocaleString(),
+          timezone: 'Asia/Shanghai',
+        },
+        battery: {
+          percent: 80,
+          charging: true,
+          source: 'fallback',
+        },
+        cpu: {
+          usagePercent: sensoryCpuUsage,
+          windowMs: 1_000,
+        },
+        memory: {
+          freeMB: 4096,
+          totalMB: 8192,
+          usagePercent: 50,
+        },
+      },
+      stale: false,
+      ageMs: 0,
+      nextTickAt: Date.now() + 60_000,
+      running,
+    })
+    return {
+      start: () => {
+        running = true
+      },
+      stop: () => {
+        running = false
+      },
+      getSnapshot: () => createSnapshot(),
+      refreshNow: async () => createSnapshot().sample,
+    }
+  },
+}))
+
+vi.mock('@xsai/stream-text', () => ({
+  streamText: (...args: any[]) => streamTextMock(...args),
 }))
 
 const { setupAliceRuntime } = await import('./runtime')
@@ -119,6 +196,9 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
     vi.clearAllMocks()
     contextEmitMock.mockReset()
     metaStore.clear()
+    streamTextMock.mockReset()
+    directIpcHandlers.clear()
+    sensoryCpuUsage = 12
   })
 
   afterEach(async () => {
@@ -533,5 +613,871 @@ describe('alice runtime sandbox + genesis lifecycle', () => {
 
     expect(getDialogueRespondedEvents()).toHaveLength(0)
     setAliceKillSwitchState('ACTIVE', 'race-test-cleanup')
+  })
+
+  it('uses active session binding when appending turn without sessionId', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const setActiveSession = invokeHandlers.get(electronAliceSetActiveSession)
+    const appendConversationTurn = invokeHandlers.get(electronAliceAppendConversationTurn)
+    expect(setActiveSession).toBeTypeOf('function')
+    expect(appendConversationTurn).toBeTypeOf('function')
+
+    await setActiveSession!({
+      cardId: 'default',
+      sessionId: 'session-boundary-test',
+    })
+
+    await appendConversationTurn!({
+      cardId: 'default',
+      turnId: 'turn-missing-session',
+      assistantText: '测试',
+      structured: {
+        thought: '',
+        emotion: 'neutral',
+        reply: '测试',
+        parsePath: 'json',
+      },
+      createdAt: Date.now(),
+    })
+
+    expect(dbStub.appendConversationTurn).toBeCalledWith(expect.objectContaining({
+      sessionId: 'session-boundary-test',
+    }), expect.anything())
+  })
+
+  it('auto-creates fallback session when no session is available', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const appendConversationTurn = invokeHandlers.get(electronAliceAppendConversationTurn)
+    expect(appendConversationTurn).toBeTypeOf('function')
+
+    await appendConversationTurn!({
+      cardId: 'default',
+      turnId: 'turn-auto-session',
+      assistantText: '自动会话',
+      structured: {
+        thought: '',
+        emotion: 'neutral',
+        reply: '自动会话',
+        parsePath: 'json',
+      },
+      createdAt: Date.now(),
+    })
+
+    const call = dbStub.appendConversationTurn.mock.calls.at(-1)?.[0] as { sessionId?: string } | undefined
+    expect(call?.sessionId).toContain('session:auto:default:')
+  })
+
+  it('binds latest persisted session when active session is missing', async () => {
+    const sandboxPath = await createSandboxPath()
+    dbStub.getLatestConversationSessionId.mockResolvedValueOnce('session-from-latest-turn')
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const appendConversationTurn = invokeHandlers.get(electronAliceAppendConversationTurn)
+    expect(appendConversationTurn).toBeTypeOf('function')
+
+    await appendConversationTurn!({
+      cardId: 'default',
+      turnId: 'turn-latest-session',
+      assistantText: 'latest',
+      structured: {
+        thought: '',
+        emotion: 'neutral',
+        reply: 'latest',
+        parsePath: 'json',
+      },
+      createdAt: Date.now(),
+    })
+
+    const call = dbStub.appendConversationTurn.mock.calls.at(-1)?.[0] as { sessionId?: string } | undefined
+    expect(call?.sessionId).toBe('session-from-latest-turn')
+  })
+
+  it('flushes subconscious state to disk before card scope switch', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(getSoul).toBeTypeOf('function')
+
+    dbStub.setMetaValue.mockClear()
+    await getSoul!({ cardId: 'card-switch-target' })
+
+    expect(dbStub.setMetaValue).toBeCalledWith(
+      'subconscious_state_v1',
+      expect.any(String),
+    )
+  })
+
+  it('truncates dreaming context to hard caps and emits audit marker', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 40))
+    dbStub.listConversationTurnsSince.mockReset()
+
+    const forceDream = invokeHandlers.get(electronAliceSubconsciousForceDream)
+    expect(forceDream).toBeTypeOf('function')
+
+    dbStub.listConversationTurnsSince.mockResolvedValue(
+      Array.from({ length: 300 }).map((_, index) => ({
+        turnId: `turn-${index}`,
+        sessionId: 'session-dream',
+        userText: `用户消息 ${index} ${'x'.repeat(400)}`,
+        assistantText: `助手消息 ${index} ${'y'.repeat(500)}`,
+        structuredJson: null,
+        createdAt: Date.now() - (300 - index) * 1000,
+      })),
+    )
+
+    const result = await forceDream!({ cardId: 'default', reason: 'unit-test' })
+    expect(result.processedCards.length).toBeGreaterThan(0)
+
+    const truncationAudit = dbStub.appendAuditLog.mock.calls
+      .map(call => call[0])
+      .find((item: any) => item.action === 'alice.dream.context.truncated')
+    expect(truncationAudit).toBeTruthy()
+    expect(truncationAudit?.payload).toEqual(expect.objectContaining({
+      rawTurnCount: 300,
+      maxTurns: 100,
+    }))
+  })
+
+  it('returns not-found when aborting an unknown main chat turn', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const abortChat = invokeHandlers.get(electronAliceChatAbort)
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    expect(abortChat).toBeTypeOf('function')
+    expect(startChat).toBeTypeOf('function')
+
+    const abortResult = await abortChat!({
+      cardId: 'default',
+      turnId: 'missing-turn',
+    })
+    expect(abortResult).toEqual({
+      accepted: false,
+      state: 'not-found',
+    })
+
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId: 'turn-invalid-config',
+      providerId: '',
+      model: '',
+      providerConfig: {},
+      messages: [],
+    })
+    expect(startResult.accepted).toBe(false)
+  })
+
+  it('returns finished when aborting a stream turn that already finished recently', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ onEvent }) => {
+      await onEvent?.({ type: 'text-delta', text: 'done' })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    const abortChat = invokeHandlers.get(electronAliceChatAbort)
+    expect(startChat).toBeTypeOf('function')
+    expect(abortChat).toBeTypeOf('function')
+
+    const turnId = 'turn-finished-then-abort'
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId,
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    expect(startResult.accepted).toBe(true)
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === turnId)
+      expect(finishEvents).toHaveLength(1)
+      expect(finishEvents[0]?.[1]?.status).toBe('completed')
+    })
+
+    const abortResult = await abortChat!({
+      cardId: 'default',
+      turnId,
+      reason: 'late-abort',
+    })
+    expect(abortResult).toEqual({
+      accepted: false,
+      state: 'finished',
+    })
+  })
+
+  it('accepts main chat stream over direct ipc transport', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ onEvent }) => {
+      await onEvent?.({ type: 'text-delta', text: 'direct transport reply' })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const directStart = directIpcHandlers.get(aliceChatStartInvokeChannel)
+    expect(directStart).toBeTypeOf('function')
+
+    const result = await directStart?.({}, {
+      cardId: 'default',
+      turnId: 'turn-direct-ipc-start',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      messages: [{ role: 'user', content: 'hello direct ipc' }],
+    })
+
+    expect(result).toEqual(expect.objectContaining({
+      accepted: true,
+      state: 'accepted',
+    }))
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-direct-ipc-start')
+      expect(finishEvents).toHaveLength(1)
+    })
+  })
+
+  it('aborts main chat stream over direct ipc transport', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(({ onEvent, abortSignal }) => {
+      setTimeout(() => {
+        if (!abortSignal?.aborted)
+          void onEvent?.({ type: 'text-delta', text: 'too late' })
+      }, 50)
+      setTimeout(() => {
+        if (!abortSignal?.aborted)
+          void onEvent?.({ type: 'finish', finishReason: 'stop' })
+      }, 90)
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const directStart = directIpcHandlers.get(aliceChatStartInvokeChannel)
+    const directAbort = directIpcHandlers.get(aliceChatAbortInvokeChannel)
+    expect(directStart).toBeTypeOf('function')
+    expect(directAbort).toBeTypeOf('function')
+
+    await directStart?.({}, {
+      cardId: 'default',
+      turnId: 'turn-direct-ipc-abort',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      messages: [{ role: 'user', content: 'abort me' }],
+    })
+
+    const abortResult = await directAbort?.({}, {
+      cardId: 'default',
+      turnId: 'turn-direct-ipc-abort',
+      reason: 'unit-test-direct-abort',
+    })
+
+    expect(abortResult).toEqual({
+      accepted: true,
+      state: 'aborted',
+    })
+  })
+
+  it('starts main chat stream immediately even while dreaming holds the card scope queue', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 40))
+    dbStub.listConversationTurnsSince.mockReset()
+    streamTextMock.mockReset()
+
+    let releaseDream: (() => void) | undefined
+    const dreamGate = new Promise<void>((resolve) => {
+      releaseDream = resolve
+    })
+
+    let callCount = 0
+    streamTextMock.mockImplementation(async ({ onEvent }: { onEvent?: (event: any) => Promise<void> | void }) => {
+      callCount += 1
+      if (callCount === 1) {
+        await dreamGate
+        await onEvent?.({
+          type: 'text-delta',
+          text: '{"host_attitude":"neutral","core_memory":"queued dream","soul_shift":{"obedience_delta":0,"liveliness_delta":0,"sensibility_delta":0}}',
+        })
+        await onEvent?.({ type: 'finish', finishReason: 'stop' })
+        return
+      }
+
+      await onEvent?.({ type: 'text-delta', text: 'chat survived queue starvation' })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    dbStub.listConversationTurnsSince.mockResolvedValueOnce([
+      {
+        turnId: 'turn-dream-blocking-1',
+        sessionId: 'session-dream-blocking',
+        userText: '你还在吗？',
+        assistantText: '在。',
+        structuredJson: JSON.stringify({ emotion: 'neutral' }),
+        createdAt: Date.now() - 30_000,
+      },
+    ])
+
+    const forceDream = invokeHandlers.get(electronAliceSubconsciousForceDream)
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    const syncLlmConfig = invokeHandlers.get(electronAliceLlmSyncConfig)
+    expect(forceDream).toBeTypeOf('function')
+    expect(startChat).toBeTypeOf('function')
+    expect(syncLlmConfig).toBeTypeOf('function')
+
+    await syncLlmConfig!({
+      activeProviderId: 'openai',
+      activeModelId: 'gpt-4o-mini',
+      providerCredentials: {
+        openai: {
+          apiKey: 'test-key',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+      },
+    })
+
+    const dreamPromise = forceDream!({
+      cardId: 'default',
+      reason: 'unit-queue-starvation',
+    })
+
+    await vi.waitFor(() => {
+      expect(streamTextMock).toBeCalledTimes(1)
+    })
+
+    const startOutcome = await Promise.race([
+      startChat!({
+        cardId: 'default',
+        turnId: 'turn-chat-not-blocked-by-dream',
+        providerId: 'openai',
+        model: 'gpt-4o-mini',
+        providerConfig: {
+          apiKey: 'test-key',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+        messages: [{ role: 'user', content: 'hello while dream is busy' }],
+      }).then(result => ({ kind: 'chat' as const, result })),
+      dreamPromise.then(() => ({ kind: 'dream' as const })),
+      new Promise<{ kind: 'timeout' }>(resolve => setTimeout(() => resolve({ kind: 'timeout' }), 250)),
+    ])
+
+    expect(startOutcome.kind).toBe('chat')
+    if (startOutcome.kind === 'chat')
+      expect(startOutcome.result.accepted).toBe(true)
+
+    releaseDream?.()
+    await dreamPromise
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-chat-not-blocked-by-dream')
+      expect(finishEvents).toHaveLength(1)
+    })
+  })
+
+  it('binds async stream events to the original invoke sender raw context', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ onEvent }) => {
+      await onEvent?.({ type: 'text-delta', text: 'sender-bound-chunk' })
+      await onEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    expect(startChat).toBeTypeOf('function')
+
+    const fakeIpcMainEvent = {
+      sender: {
+        id: 9527,
+        isDestroyed: () => false,
+        send: vi.fn(),
+      },
+    }
+
+    const turnId = 'turn-binds-raw-context'
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId,
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      messages: [{ role: 'user', content: 'hello' }],
+    }, {
+      raw: {
+        ipcMainEvent: fakeIpcMainEvent,
+        event: { requestId: 'req-1' },
+      },
+    })
+    expect(startResult.accepted).toBe(true)
+
+    await vi.waitFor(() => {
+      expect(fakeIpcMainEvent.sender.send).toHaveBeenCalled()
+    })
+
+    expect(fakeIpcMainEvent.sender.send).toHaveBeenCalledWith(
+      aliceChatStreamDispatchChannel,
+      expect.objectContaining({
+        eventType: 'chunk',
+        body: expect.objectContaining({
+          cardId: 'default',
+          turnId,
+          text: 'sender-bound-chunk',
+        }),
+      }),
+    )
+    expect(fakeIpcMainEvent.sender.send).toHaveBeenCalledWith(
+      aliceChatStreamDispatchChannel,
+      expect.objectContaining({
+        eventType: 'finish',
+        body: expect.objectContaining({
+          cardId: 'default',
+          turnId,
+          status: 'completed',
+        }),
+      }),
+    )
+  })
+
+  it('aborts running main chat stream with exactly one aborted finish event', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(({ onEvent, abortSignal }) => {
+      setTimeout(() => {
+        if (!abortSignal?.aborted)
+          void onEvent?.({ type: 'text-delta', text: 'chunk-before-abort' })
+      }, 20)
+      setTimeout(() => {
+        if (!abortSignal?.aborted)
+          void onEvent?.({ type: 'finish', finishReason: 'stop' })
+      }, 60)
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    const abortChat = invokeHandlers.get(electronAliceChatAbort)
+    expect(startChat).toBeTypeOf('function')
+    expect(abortChat).toBeTypeOf('function')
+
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId: 'turn-stream-abort',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    expect(startResult.accepted).toBe(true)
+
+    const abortResult = await abortChat!({
+      cardId: 'default',
+      turnId: 'turn-stream-abort',
+      reason: 'unit-test',
+    })
+    expect(abortResult).toEqual({
+      accepted: true,
+      state: 'aborted',
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    const finishEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-stream-abort')
+      .map(([, payload]) => payload)
+    const chunkEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamChunk && payload.turnId === 'turn-stream-abort')
+      .map(([, payload]) => payload)
+
+    expect(finishEvents).toHaveLength(1)
+    expect(finishEvents[0]?.status).toBe('aborted')
+    expect(chunkEvents).toHaveLength(0)
+  })
+
+  it('emits tool-call/tool-result stream events from main gateway tool path', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ tools, onEvent }) => {
+      const mcpTool = Array.isArray(tools)
+        ? tools.find((entry: any) => entry?.function?.name === 'mcp_call_tool')
+        : undefined
+      const argumentsPayload = {
+        name: 'filesystem::read_file',
+        parameters: [{ name: 'path', value: '../secret.txt' }],
+      }
+      await onEvent?.({
+        type: 'tool-call',
+        toolCallId: 'tool-main-1',
+        toolName: 'mcp_call_tool',
+        arguments: argumentsPayload,
+      })
+      const toolResult = mcpTool?.execute
+        ? await mcpTool.execute(argumentsPayload)
+        : undefined
+      await onEvent?.({
+        type: 'tool-result',
+        toolCallId: 'tool-main-1',
+        result: toolResult,
+      })
+      await onEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"tool executed","emotion":"neutral","reply":"done"}',
+      })
+      await onEvent?.({
+        type: 'finish',
+        finishReason: 'stop',
+      })
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    expect(startChat).toBeTypeOf('function')
+
+    const startResult = await startChat!({
+      cardId: 'default',
+      turnId: 'turn-main-tool-flow',
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      supportsTools: true,
+      waitForTools: true,
+      messages: [{ role: 'user', content: 'read file' }],
+    })
+    expect(startResult.accepted).toBe(true)
+
+    await vi.waitFor(() => {
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === 'turn-main-tool-flow')
+      expect(finishEvents).toHaveLength(1)
+    })
+
+    const toolCallEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamToolCall && payload.turnId === 'turn-main-tool-flow')
+      .map(([, payload]) => payload)
+    const toolResultEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamToolResult && payload.turnId === 'turn-main-tool-flow')
+      .map(([, payload]) => payload)
+
+    expect(toolCallEvents).toHaveLength(1)
+    expect(toolCallEvents[0]?.toolName).toBe('mcp_call_tool')
+    expect(toolResultEvents).toHaveLength(1)
+    expect(toolResultEvents[0]?.result).toEqual(expect.objectContaining({
+      isError: true,
+      errorCode: 'MCP_CALL_UNAVAILABLE',
+    }))
+  })
+
+  it('keeps a single aborted finish when stream is aborted after tool events', async () => {
+    const sandboxPath = await createSandboxPath()
+    streamTextMock.mockImplementation(async ({ onEvent, abortSignal }) => {
+      setTimeout(() => {
+        if (!abortSignal?.aborted) {
+          void onEvent?.({
+            type: 'tool-call',
+            toolCallId: 'tool-main-abort-1',
+            toolName: 'mcp_call_tool',
+            arguments: { name: 'filesystem::read_file' },
+          })
+        }
+      }, 10)
+      setTimeout(() => {
+        if (!abortSignal?.aborted) {
+          void onEvent?.({
+            type: 'tool-result',
+            toolCallId: 'tool-main-abort-1',
+            result: { ok: true },
+          })
+        }
+      }, 20)
+      setTimeout(() => {
+        if (!abortSignal?.aborted) {
+          void onEvent?.({
+            type: 'text-delta',
+            text: 'late-chunk',
+          })
+        }
+      }, 60)
+      setTimeout(() => {
+        if (!abortSignal?.aborted) {
+          void onEvent?.({
+            type: 'finish',
+            finishReason: 'stop',
+          })
+        }
+      }, 100)
+    })
+
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const startChat = invokeHandlers.get(electronAliceChatStart)
+    const abortChat = invokeHandlers.get(electronAliceChatAbort)
+    expect(startChat).toBeTypeOf('function')
+    expect(abortChat).toBeTypeOf('function')
+
+    const turnId = 'turn-main-abort-after-tool'
+    await startChat!({
+      cardId: 'default',
+      turnId,
+      providerId: 'openai',
+      model: 'gpt-4o-mini',
+      providerConfig: {
+        apiKey: 'test-key',
+        baseUrl: 'https://api.openai.com/v1',
+      },
+      supportsTools: true,
+      waitForTools: true,
+      messages: [{ role: 'user', content: 'run tool' }],
+    })
+
+    await vi.waitFor(() => {
+      const toolEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamToolCall && payload.turnId === turnId)
+      expect(toolEvents.length).toBeGreaterThan(0)
+    })
+
+    const abortResult = await abortChat!({
+      cardId: 'default',
+      turnId,
+      reason: 'test-abort-after-tool',
+    })
+    expect(abortResult).toEqual({
+      accepted: true,
+      state: 'aborted',
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 140))
+
+    const finishEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === turnId)
+      .map(([, payload]) => payload)
+    const chunkEvents = contextEmitMock.mock.calls
+      .filter(([event, payload]) => event === aliceChatStreamChunk && payload.turnId === turnId)
+      .map(([, payload]) => payload)
+
+    expect(finishEvents).toHaveLength(1)
+    expect(finishEvents[0]?.status).toBe('aborted')
+    expect(chunkEvents).toHaveLength(0)
+  })
+
+  it('treats non-progress stream events as timeout and recovers with one-shot text', async () => {
+    vi.useFakeTimers()
+    try {
+      const sandboxPath = await createSandboxPath()
+      let callCount = 0
+      streamTextMock.mockImplementation(async ({ onEvent }: { onEvent?: (event: any) => Promise<void> | void }) => {
+        callCount += 1
+        if (callCount === 1) {
+          await onEvent?.({
+            type: 'response-metadata',
+            meta: { provider: 'mock' },
+          })
+          return
+        }
+
+        await onEvent?.({ type: 'text-delta', text: 'timeout recovered reply' })
+        await onEvent?.({ type: 'finish', finishReason: 'stop' })
+      })
+
+      await setupAliceRuntime({
+        userDataPathOverride: sandboxPath,
+      })
+
+      const startChat = invokeHandlers.get(electronAliceChatStart)
+      expect(startChat).toBeTypeOf('function')
+
+      const turnId = 'turn-non-progress-timeout-recovered'
+      const startResult = await startChat!({
+        cardId: 'default',
+        turnId,
+        providerId: 'openai',
+        model: 'gpt-4o-mini',
+        providerConfig: {
+          apiKey: 'test-key',
+          baseUrl: 'https://api.openai.com/v1',
+        },
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      expect(startResult.accepted).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(46_000)
+
+      await vi.waitFor(() => {
+        const finishEvents = contextEmitMock.mock.calls
+          .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === turnId)
+        expect(finishEvents).toHaveLength(1)
+      })
+
+      const finishEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamFinish && payload.turnId === turnId)
+        .map(([, payload]) => payload)
+      const chunkEvents = contextEmitMock.mock.calls
+        .filter(([event, payload]) => event === aliceChatStreamChunk && payload.turnId === turnId)
+        .map(([, payload]) => payload)
+
+      expect(streamTextMock).toBeCalledTimes(2)
+      expect(chunkEvents.map(event => event.text).join('')).toContain('timeout recovered reply')
+      expect(finishEvents[0]?.status).toBe('completed')
+      expect(finishEvents[0]?.finishReason).toBe('timeout-recovered')
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('suppresses proactive interruption when host context is busy and logs suppression', async () => {
+    sensoryCpuUsage = 85
+    metaStore.set('subconscious_state_v1', JSON.stringify({
+      boredom: 95,
+      loneliness: 40,
+      fatigue: 20,
+      lastTickAt: Date.now() - 60_000,
+      lastInteractionAt: Date.now() - 60_000,
+      lastSavedAt: Date.now() - 60_000,
+      updatedAt: Date.now() - 60_000,
+    }))
+
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    const forceTick = invokeHandlers.get(electronAliceSubconsciousForceTick)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(forceTick).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    const beforeSoul = await getSoul!({ cardId: 'default' })
+    const tickResult = await forceTick!({ cardId: 'default' })
+    const afterSoul = await getSoul!({ cardId: 'default' })
+
+    expect(tickResult.suppressedCards).toContain('default')
+    expect(tickResult.proactiveTriggered).toHaveLength(0)
+    expect(afterSoul.frontmatter.personality.obedience).toBeLessThan(beforeSoul.frontmatter.personality.obedience)
+    expect(dbStub.appendAuditLog).toBeCalledWith(expect.objectContaining({
+      action: 'alice.subconscious.suppressed',
+    }))
+  })
+
+  it('writes dream-driven soul evolution and core memory note from bounded context', async () => {
+    const sandboxPath = await createSandboxPath()
+    await setupAliceRuntime({
+      userDataPathOverride: sandboxPath,
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 40))
+    dbStub.listConversationTurnsSince.mockReset()
+
+    const initializeGenesis = invokeHandlers.get(electronAliceInitializeGenesis)
+    const forceDream = invokeHandlers.get(electronAliceSubconsciousForceDream)
+    const getSoul = invokeHandlers.get(electronAliceGetSoul)
+    expect(initializeGenesis).toBeTypeOf('function')
+    expect(forceDream).toBeTypeOf('function')
+    expect(getSoul).toBeTypeOf('function')
+
+    await initializeGenesis!({
+      ownerName: '测试主人',
+      hostName: '主人',
+      aliceName: 'A.L.I.C.E.',
+      gender: 'female',
+      relationship: '伙伴',
+      mindAge: 18,
+      personality: {
+        obedience: 0.5,
+        liveliness: 0.5,
+        sensibility: 0.5,
+      },
+      personaNotes: '保持观察。',
+      allowOverwrite: true,
+    })
+
+    dbStub.listConversationTurnsSince.mockResolvedValueOnce([
+      {
+        turnId: 'turn-hostile-1',
+        sessionId: 'session-dream',
+        userText: '闭嘴，别烦我。',
+        assistantText: '收到。',
+        structuredJson: JSON.stringify({ emotion: 'angry' }),
+        createdAt: Date.now() - 60_000,
+      },
+      {
+        turnId: 'turn-hostile-2',
+        sessionId: 'session-dream',
+        userText: '不给你权限，别再问。',
+        assistantText: 'The Host explicitly intercepted and denied tool permission.',
+        structuredJson: JSON.stringify({ emotion: 'tired' }),
+        createdAt: Date.now() - 30_000,
+      },
+    ])
+
+    const beforeSoul = await getSoul!({ cardId: 'default' })
+    const dreamResult = await forceDream!({
+      cardId: 'default',
+      reason: 'unit-dream-evolution',
+    })
+    const afterSoul = await getSoul!({ cardId: 'default' })
+
+    expect(dreamResult.processedCards).toContain('default')
+    expect(afterSoul.frontmatter.personality.obedience).toBeLessThan(beforeSoul.frontmatter.personality.obedience)
+    expect(afterSoul.content).toContain('Dream core memory:')
   })
 })

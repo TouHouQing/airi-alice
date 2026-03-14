@@ -88,6 +88,24 @@ const mcpRequestMaxTotalTimeoutMsec = 15_000
 const permissionRequestTimeoutMsec = 60_000
 const mcpWorkspaceDirectoryName = 'Alice_Workspace'
 const defaultAliceCardId = 'default'
+let sharedMcpListToolsInvoker: (() => Promise<ElectronMcpToolDescriptor[]>) | undefined
+let sharedMcpCallToolInvoker: ((payload: ElectronMcpCallToolPayload) => Promise<ElectronMcpCallToolResult>) | undefined
+
+export async function invokeAliceMcpListToolsFromMain() {
+  if (!sharedMcpListToolsInvoker)
+    return []
+  return await sharedMcpListToolsInvoker()
+}
+
+export async function invokeAliceMcpCallToolFromMain(payload: ElectronMcpCallToolPayload) {
+  if (!sharedMcpCallToolInvoker) {
+    return createToolErrorResult(
+      'MCP_CALL_UNAVAILABLE',
+      'MCP runtime is not ready yet; tool execution is unavailable.',
+    )
+  }
+  return await sharedMcpCallToolInvoker(payload)
+}
 
 interface ToolPermissionEvaluation {
   decision: 'allow' | 'deny' | 'prompt'
@@ -972,6 +990,8 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
     }
     pendingPermissionRequests.clear()
     sessionReadWhitelistByCard.clear()
+    sharedMcpListToolsInvoker = undefined
+    sharedMcpCallToolInvoker = undefined
   })
 
   defineInvokeHandler(params.context, electronMcpOpenConfigFile, async () => {
@@ -1048,7 +1068,7 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
     return { accepted: true }
   })
 
-  defineInvokeHandler(params.context, electronMcpCallTool, async (payload) => {
+  const executeGuardedCallTool = async (payload: ElectronMcpCallToolPayload) => {
     await ensureWorkspaceReady
     const cardId = normalizeCardId(payload.cardId)
 
@@ -1176,7 +1196,12 @@ export function createMcpServersService(params: { context: ReturnType<typeof cre
       })
     }
     return result
-  })
+  }
+
+  sharedMcpListToolsInvoker = async () => await params.manager.listTools()
+  sharedMcpCallToolInvoker = async payload => await executeGuardedCallTool(payload)
+
+  defineInvokeHandler(params.context, electronMcpCallTool, async payload => await executeGuardedCallTool(payload))
 
   defineInvokeHandler(params.context, electronMcpGetCapabilitiesSnapshot, async () => {
     return params.manager.getCapabilitiesSnapshot()

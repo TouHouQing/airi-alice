@@ -50,6 +50,15 @@ interface DbMemoryFactRow {
   access_count: number
 }
 
+interface DbConversationTurnRow {
+  turn_id: string | null
+  session_id: string
+  user_text: string | null
+  assistant_text: string | null
+  structured_json: string | null
+  created_at: number
+}
+
 interface DbWriteOptions {
   signal?: AbortSignal
 }
@@ -234,6 +243,15 @@ export interface AliceDbService {
   close: () => Promise<void>
   getMetaValue: (key: string) => Promise<string | undefined>
   setMetaValue: (key: string, value: string) => Promise<void>
+  getLatestConversationSessionId: () => Promise<string | undefined>
+  listConversationTurnsSince: (sinceExclusive: number, options?: { limit?: number }) => Promise<Array<{
+    turnId: string | null
+    sessionId: string
+    userText: string | null
+    assistantText: string | null
+    structuredJson: string | null
+    createdAt: number
+  }>>
   appendAuditLog: (input: AliceAuditLogInput) => Promise<void>
   appendConversationTurn: (input: AliceConversationTurnInput, options?: DbWriteOptions) => Promise<void>
   getMemoryStats: () => Promise<AliceMemoryStats>
@@ -429,7 +447,7 @@ export async function setupAliceDb(
   }
 
   async function appendConversationTurn(input: AliceConversationTurnInput, options?: DbWriteOptions) {
-    const sessionId = input.sessionId.trim()
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
     if (!sessionId)
       throw new Error('sessionId is required')
 
@@ -468,6 +486,53 @@ export async function setupAliceDb(
         ],
       )
     }, options)
+  }
+
+  async function getLatestConversationSessionId() {
+    const row = await get<{ session_id?: string | null }>(
+      database,
+      `
+      SELECT session_id
+      FROM conversation_turns
+      WHERE session_id IS NOT NULL AND TRIM(session_id) != ''
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+    )
+    if (typeof row?.session_id !== 'string')
+      return undefined
+    const normalized = row.session_id.trim()
+    return normalized || undefined
+  }
+
+  async function listConversationTurnsSince(sinceExclusive: number, options?: { limit?: number }) {
+    const limit = Math.max(1, Math.min(10_000, Math.floor(options?.limit ?? 2_000)))
+    const rows = await all<DbConversationTurnRow>(
+      database,
+      `
+      SELECT
+        turn_id,
+        session_id,
+        user_text,
+        assistant_text,
+        structured_json,
+        created_at
+      FROM conversation_turns
+      WHERE created_at > ?
+      ORDER BY created_at DESC
+      LIMIT ?
+      `,
+      [sinceExclusive, limit],
+    )
+
+    return rows.map(row => ({
+      turnId: row.turn_id,
+      sessionId: row.session_id,
+      userText: row.user_text,
+      assistantText: row.assistant_text,
+      structuredJson: row.structured_json,
+      createdAt: row.created_at,
+    }))
   }
 
   async function upsertMemoryFacts(facts: AliceMemoryFactInput[], source: AliceMemorySource) {
@@ -849,6 +914,8 @@ export async function setupAliceDb(
         await upsertMeta(key, value)
       })
     },
+    getLatestConversationSessionId,
+    listConversationTurnsSince,
     appendAuditLog,
     appendConversationTurn,
     getMemoryStats,

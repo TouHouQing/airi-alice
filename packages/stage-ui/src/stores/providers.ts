@@ -1734,6 +1734,7 @@ export const useProvidersStore = defineStore('providers', () => {
   const providerRuntimeState = ref<Record<string, ProviderRuntimeState>>({})
   const providerValidationInFlight = new Map<string, Promise<boolean>>()
   const providerRevalidationLoops = new Map<string, { resume: () => void }>()
+  const providerValidationBackoffState = new Map<string, { failures: number, nextRetryAt: number }>()
 
   const configuredProviders = computed(() => {
     const result: Record<string, boolean> = {}
@@ -1750,6 +1751,30 @@ export const useProvidersStore = defineStore('providers', () => {
 
   function unmarkProviderAdded(providerId: string) {
     delete addedProviders.value[providerId]
+  }
+
+  function shouldRunRuntimeValidation(providerId: string) {
+    if (!providerMetadata[providerId])
+      return false
+
+    if (providerRuntimeState.value[providerId]?.isConfigured)
+      return true
+
+    return isProviderConfigDirty(providerId)
+  }
+
+  function markValidationFailure(providerId: string) {
+    const previous = providerValidationBackoffState.get(providerId)
+    const failures = Math.min((previous?.failures ?? 0) + 1, 8)
+    const backoffMs = Math.min(10 * 60_000, 15_000 * 2 ** (failures - 1))
+    providerValidationBackoffState.set(providerId, {
+      failures,
+      nextRetryAt: Date.now() + backoffMs,
+    })
+  }
+
+  function clearValidationFailure(providerId: string) {
+    providerValidationBackoffState.delete(providerId)
   }
 
   // Configuration validation functions
@@ -1839,6 +1864,17 @@ export const useProvidersStore = defineStore('providers', () => {
   // Initialize all providers
   Object.keys(providerMetadata).forEach(initializeProvider)
 
+  function getActiveConsciousnessProviderId() {
+    try {
+      return typeof localStorage !== 'undefined'
+        ? String(localStorage.getItem('settings/consciousness/active-provider') ?? '').trim()
+        : ''
+    }
+    catch {
+      return ''
+    }
+  }
+
   function startPeriodicRuntimeValidation() {
     for (const [providerId, intervalMs] of providerValidationIntervalMsById.entries()) {
       if (!providerMetadata[providerId] || intervalMs <= 0)
@@ -1849,7 +1885,28 @@ export const useProvidersStore = defineStore('providers', () => {
       }
 
       const loop = useIntervalFn(() => {
+        const activeProviderId = getActiveConsciousnessProviderId()
+        if (activeProviderId && providerId !== activeProviderId)
+          return
+
+        if (!shouldRunRuntimeValidation(providerId))
+          return
+
+        const backoffState = providerValidationBackoffState.get(providerId)
+        if (backoffState && backoffState.nextRetryAt > Date.now())
+          return
+
         void validateProvider(providerId, { force: true })
+          .then((isValid) => {
+            if (isValid) {
+              clearValidationFailure(providerId)
+              return
+            }
+            markValidationFailure(providerId)
+          })
+          .catch(() => {
+            markValidationFailure(providerId)
+          })
       }, intervalMs, { immediate: false, immediateCallback: false })
       loop.resume()
       providerRevalidationLoops.set(providerId, loop)
@@ -1858,20 +1915,26 @@ export const useProvidersStore = defineStore('providers', () => {
 
   // Update configuration status for all configured providers
   async function updateConfigurationStatus() {
-    await Promise.all(Object.entries(providerMetadata)
-      // TODO: ignore un-configured provider
-      // .filter(([_, provider]) => provider.configured)
-      .map(async ([providerId]) => {
+    await Promise.all(Object.keys(providerMetadata)
+      .filter(providerId => shouldRunRuntimeValidation(providerId))
+      .map(async (providerId) => {
         try {
           if (providerRuntimeState.value[providerId]) {
             const isValid = await validateProvider(providerId)
             providerRuntimeState.value[providerId].isConfigured = isValid
+            if (isValid) {
+              clearValidationFailure(providerId)
+            }
+            else {
+              markValidationFailure(providerId)
+            }
           }
         }
         catch {
           if (providerRuntimeState.value[providerId]) {
             providerRuntimeState.value[providerId].isConfigured = false
           }
+          markValidationFailure(providerId)
         }
       }))
   }

@@ -406,7 +406,8 @@ export interface AliceMemoryMigrationResult {
 
 export interface AliceConversationTurnInput {
   turnId?: string
-  sessionId: string
+  sessionId?: string
+  origin?: 'user-turn' | 'subconscious-proactive'
   userText?: string
   assistantText?: string
   structured?: Record<string, unknown>
@@ -522,9 +523,125 @@ export interface AliceDialogueRespondedPayload {
   cardId: string
   turnId: string
   sessionId: string
+  origin?: 'user-turn' | 'subconscious-proactive'
   structured: AliceDialogueStructuredPayload
   isFallback: boolean
   createdAt: number
+}
+
+export interface AliceSetActiveSessionPayload extends AliceCardScope {
+  sessionId: string
+}
+
+export interface AliceSubconsciousNeedsState {
+  boredom: number
+  loneliness: number
+  fatigue: number
+  lastTickAt: number
+  lastInteractionAt: number
+  lastSavedAt: number
+}
+
+export interface AliceSubconsciousStatePayload extends AliceCardScope, AliceSubconsciousNeedsState {
+  updatedAt: number
+}
+
+export interface AliceSubconsciousTickResult {
+  processedCards: string[]
+  proactiveTriggered: string[]
+  suppressedCards: string[]
+}
+
+export interface AliceDreamRunResult {
+  processedCards: string[]
+  skippedCards: Array<{ cardId: string, reason: string }>
+}
+
+export interface AliceSubconsciousForceDreamPayload extends Partial<AliceCardScope> {
+  reason?: string
+}
+
+export interface AliceChatToolCallEvent {
+  cardId: string
+  turnId: string
+  toolCallId: string
+  toolName: string
+  arguments?: Record<string, unknown>
+}
+
+export interface AliceChatToolResultEvent {
+  cardId: string
+  turnId: string
+  toolCallId: string
+  result?: unknown
+}
+
+export interface AliceChatStreamChunkEvent {
+  cardId: string
+  turnId: string
+  text: string
+}
+
+export interface AliceChatFinishEvent {
+  cardId: string
+  turnId: string
+  status: 'completed' | 'aborted' | 'failed'
+  finishReason?: string
+  fullText?: string
+  error?: string
+}
+
+export interface AliceChatErrorEvent {
+  cardId: string
+  turnId: string
+  error: string
+}
+
+export const aliceChatStreamDispatchChannel = 'alice:chat-stream-dispatch'
+
+export type AliceChatStreamDispatchPayload
+  = | { eventType: 'chunk', body: AliceChatStreamChunkEvent }
+    | { eventType: 'tool-call', body: AliceChatToolCallEvent }
+    | { eventType: 'tool-result', body: AliceChatToolResultEvent }
+    | { eventType: 'finish', body: AliceChatFinishEvent }
+    | { eventType: 'error', body: AliceChatErrorEvent }
+
+export interface AliceChatStartPayload extends AliceCardScope {
+  turnId: string
+  providerId: string
+  model: string
+  providerConfig: Record<string, unknown>
+  messages: Array<{
+    role: 'system' | 'user' | 'assistant' | 'tool'
+    content: unknown
+    toolCallId?: string
+    toolName?: string
+  }>
+  supportsTools?: boolean
+  waitForTools?: boolean
+}
+
+export interface AliceChatStartResult {
+  accepted: boolean
+  turnId: string
+  state?: 'accepted' | 'duplicate-running' | 'duplicate-finished' | 'missing-config' | 'start-failed'
+  reason?: string
+}
+
+export interface AliceChatAbortPayload extends AliceCardScope {
+  turnId: string
+  reason?: string
+}
+
+export interface AliceChatAbortResult {
+  accepted: boolean
+  state: 'aborted' | 'not-found' | 'finished'
+}
+
+export interface AliceLlmConfigPayload {
+  activeProviderId: string
+  activeModelId: string
+  providerCredentials: Record<string, Record<string, unknown>>
 }
 
 export type AliceToolRiskLevel = 'safe' | 'sensitive' | 'danger'
@@ -579,16 +696,31 @@ export const electronAliceMemoryRetrieveFacts = defineInvokeEventa<AliceMemoryFa
 export const electronAliceMemoryUpsertFacts = defineInvokeEventa<void, AliceCardScope & { facts: AliceMemoryFactInput[], source: AliceMemorySource }>('eventa:invoke:electron:alice:memory:upsert-facts')
 export const electronAliceMemoryImportLegacy = defineInvokeEventa<AliceMemoryMigrationResult, AliceCardScope & AliceMemoryLegacySnapshot>('eventa:invoke:electron:alice:memory:import-legacy')
 export const electronAliceAppendConversationTurn = defineInvokeEventa<void, AliceCardScope & AliceConversationTurnInput>('eventa:invoke:electron:alice:conversation:append-turn')
+export const electronAliceSetActiveSession = defineInvokeEventa<void, AliceSetActiveSessionPayload>('eventa:invoke:electron:alice:conversation:set-active-session')
 export const electronAliceAppendAuditLog = defineInvokeEventa<void, AliceCardScope & AliceAuditLogInput>('eventa:invoke:electron:alice:audit:append')
 export const electronAliceRealtimeExecute = defineInvokeEventa<AliceRealtimeExecuteResult, AliceCardScope & AliceRealtimeExecutePayload>('eventa:invoke:electron:alice:realtime:execute')
 export const electronAliceGetSensorySnapshot = defineInvokeEventa<AliceSensoryCacheSnapshot, AliceCardScope>('eventa:invoke:electron:alice:sensory:get-snapshot')
 export const electronAliceSafetyResolvePermission = defineInvokeEventa<AliceSafetyPermissionDecisionResult, AliceSafetyPermissionDecision>('eventa:invoke:electron:alice:safety:resolve-permission')
 export const electronAliceDeleteCardScope = defineInvokeEventa<void, AliceCardScope>('eventa:invoke:electron:alice:delete-card-scope')
+export const electronAliceSubconsciousGetState = defineInvokeEventa<AliceSubconsciousStatePayload, AliceCardScope>('eventa:invoke:electron:alice:subconscious:get-state')
+export const electronAliceSubconsciousForceTick = defineInvokeEventa<AliceSubconsciousTickResult, AliceCardScope>('eventa:invoke:electron:alice:subconscious:force-tick')
+export const electronAliceSubconsciousForceDream = defineInvokeEventa<AliceDreamRunResult, AliceSubconsciousForceDreamPayload>('eventa:invoke:electron:alice:subconscious:force-dream')
+export const electronAliceLlmSyncConfig = defineInvokeEventa<void, AliceLlmConfigPayload>('eventa:invoke:electron:alice:llm:sync-config')
+export const electronAliceLlmGetConfig = defineInvokeEventa<AliceLlmConfigPayload>('eventa:invoke:electron:alice:llm:get-config')
+export const electronAliceChatStart = defineInvokeEventa<AliceChatStartResult, AliceChatStartPayload>('eventa:invoke:electron:alice:chat:start')
+export const electronAliceChatAbort = defineInvokeEventa<AliceChatAbortResult, AliceChatAbortPayload>('eventa:invoke:electron:alice:chat:abort')
+export const aliceChatStartInvokeChannel = 'alice:chat-start'
+export const aliceChatAbortInvokeChannel = 'alice:chat-abort'
 
 export const aliceKillSwitchStateChanged = defineEventa<AliceCardScope & AliceKillSwitchSnapshot>('eventa:event:electron:alice:kill-switch:state-changed')
 export const aliceSoulChanged = defineEventa<AliceCardScope & AliceSoulSnapshot>('eventa:event:electron:alice:soul:changed')
 export const aliceDialogueResponded = defineEventa<AliceDialogueRespondedPayload>('eventa:event:electron:alice:dialogue:responded')
 export const aliceSafetyPermissionRequested = defineEventa<AliceSafetyPermissionRequest>('eventa:event:electron:alice:safety:permission-requested')
+export const aliceChatStreamChunk = defineEventa<AliceChatStreamChunkEvent>('eventa:event:electron:alice:chat:stream-chunk')
+export const aliceChatStreamToolCall = defineEventa<AliceChatToolCallEvent>('eventa:event:electron:alice:chat:stream-tool-call')
+export const aliceChatStreamToolResult = defineEventa<AliceChatToolResultEvent>('eventa:event:electron:alice:chat:stream-tool-result')
+export const aliceChatStreamFinish = defineEventa<AliceChatFinishEvent>('eventa:event:electron:alice:chat:stream-finish')
+export const aliceChatStreamError = defineEventa<AliceChatErrorEvent>('eventa:event:electron:alice:chat:stream-error')
 
 export { electron } from '@proj-airi/electron-eventa'
 export * from '@proj-airi/electron-eventa/electron-updater'

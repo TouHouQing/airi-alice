@@ -66,6 +66,17 @@ const assistantLeakFallbackReply = '我刚才的检索结果混入了内部调�
 const assistantRealtimeUnavailableReply = '当前无法获取可靠的实时外部数据。请稍后重试，或在设置里检查 MCP 实时工具是否可用。'
 const assistantEpoch1StrictFallbackReply = '抱歉，当前是 Epoch 1 受限模式，我无法访问外部实时数据源。你可以继续和我进行本地对话、设定与记忆整理。'
 const assistantStructuredContractFallbackReply = '我在。你可以继续说，我会尽量给你稳定清晰的回复。'
+const assistantStreamFailureFallbackReply = '我这轮回复失败了。请重试一次；如果连续失败，再检查提供方与模型配置。'
+const assistantLocalRuntimeUnavailableFallbackReply = '我这轮没有连上本地模型服务（例如 Ollama `11434` 或 LM Studio `1234`）。请先启动对应服务，再试一次。'
+const assistantStreamTimeoutFallbackReply = '我这轮等待模型响应超时了（服务可能繁忙）。请重试一次。'
+const assistantProviderAuthFallbackReply = '当前提供方认证失败（API Key 或模型权限无效）。请检查后再试一次。'
+const assistantProviderNetworkFallbackReply = '当前到模型服务的网络连接不稳定。请稍后重试。'
+const assistantProviderConfigFallbackReply = '当前提供方或模型配置缺失（例如 provider/model/baseUrl）。请在设置里确认后再试一次。'
+const assistantUnsupportedToolsFallbackReply = '当前模型不支持这轮所需的工具调用。请重试一次，或切换支持工具调用的模型。'
+const runtimeGatewayFirstEventTimeoutMs = 65_000
+const runtimeGatewayIdleTimeoutMs = 45_000
+const runtimeGatewayRetryFirstEventTimeoutMs = 65_000
+const runtimeGatewayRetryIdleTimeoutMs = 25_000
 const aliceEpoch1StrictModeEnabled = false
 const runtimeContractAnchorHeader = 'Output contract (must-follow, highest priority):'
 const structuredRetrySystemPrompt = [
@@ -179,6 +190,133 @@ function resolveAbortReason(error: unknown, stale: boolean): AliceAbortReason {
   }
 
   return 'unknown'
+}
+
+type StreamFailureKind
+  = | 'local-runtime-unavailable'
+    | 'provider-auth'
+    | 'provider-config'
+    | 'provider-network'
+    | 'timeout'
+    | 'model-tools-unsupported'
+    | 'runtime-aborted'
+    | 'unknown'
+
+function resolveStreamFailureFallback(error: unknown): { reply: string, kind: StreamFailureKind } {
+  const message = String(error instanceof Error ? error.message : error ?? '').toLowerCase()
+  if (
+    message.includes('stream start rejected')
+    || message.includes('missing providerid/model')
+    || message.includes('missing provider/model')
+    || message.includes('state=missing-config')
+  ) {
+    return {
+      reply: assistantProviderConfigFallbackReply,
+      kind: 'provider-config',
+    }
+  }
+  if (
+    message.includes('localhost:11434')
+    || message.includes('localhost:1234')
+    || message.includes('econnrefused')
+    || message.includes('connection refused')
+  ) {
+    return {
+      reply: assistantLocalRuntimeUnavailableFallbackReply,
+      kind: 'local-runtime-unavailable',
+    }
+  }
+  if (
+    message.includes('chat-first-event-timeout')
+    || message.includes('stream timed out')
+    || message.includes('main-gateway-timeout')
+    || message.includes('timeout')
+    || message.includes('timed out')
+  ) {
+    return {
+      reply: assistantStreamTimeoutFallbackReply,
+      kind: 'timeout',
+    }
+  }
+  if (
+    message.includes('does not support tools')
+    || message.includes('no endpoints found that support tool use')
+    || message.includes('function calling is not supported')
+    || message.includes('tool use is not supported')
+    || message.includes('unsupported tool')
+  ) {
+    return {
+      reply: assistantUnsupportedToolsFallbackReply,
+      kind: 'model-tools-unsupported',
+    }
+  }
+  if (
+    message.includes('401')
+    || message.includes('403')
+    || message.includes('unauthorized')
+    || message.includes('forbidden')
+    || message.includes('authentication')
+    || message.includes('api key')
+    || message.includes('invalid key')
+  ) {
+    return {
+      reply: assistantProviderAuthFallbackReply,
+      kind: 'provider-auth',
+    }
+  }
+  if (
+    message.includes('enotfound')
+    || message.includes('econnreset')
+    || message.includes('network')
+    || message.includes('fetch failed')
+    || message.includes('socket hang up')
+  ) {
+    return {
+      reply: assistantProviderNetworkFallbackReply,
+      kind: 'provider-network',
+    }
+  }
+  if (
+    message.includes('abort')
+    || message.includes('renderer-abort')
+    || message.includes('kill-switch')
+  ) {
+    return {
+      reply: assistantStreamFailureFallbackReply,
+      kind: 'runtime-aborted',
+    }
+  }
+  return {
+    reply: assistantStreamFailureFallbackReply,
+    kind: 'unknown',
+  }
+}
+
+function shouldRetryStreamWithoutTools(error: unknown, options: { supportsTools?: boolean, sawProgress: boolean }) {
+  if (options.supportsTools === false)
+    return false
+  if (options.sawProgress)
+    return false
+
+  const message = String(error instanceof Error ? error.message : error ?? '').toLowerCase()
+  return message.includes('does not support tools')
+    || message.includes('no endpoints found that support tool use')
+    || message.includes('function calling is not supported')
+    || message.includes('tool use is not supported')
+    || message.includes('unsupported tool')
+}
+
+function isStreamTimeoutError(error: unknown) {
+  const message = String(error instanceof Error ? error.message : error ?? '').toLowerCase()
+  return message.includes('timed out')
+    || message.includes('timeout')
+    || message.includes('chat-first-event-timeout')
+}
+
+function readStreamErrorProgressFlag(error: unknown) {
+  if (!error || typeof error !== 'object')
+    return false
+  return Boolean((error as { __aliceSawProgress?: unknown }).__aliceSawProgress)
 }
 
 function replaceAssistantTextSlices(slices: ChatSlices[], text: string): ChatSlices[] {
@@ -594,6 +732,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
     const sessionMessagesForSend = chatSession.getSessionMessages(sessionId)
     let userTurnMessageId: string | null = null
+    let assistantOutputCommitted = false
 
     try {
       if (options.origin === 'ui-user' && hasAliceBridge()) {
@@ -689,6 +828,201 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         deniedBySafety: false,
       }
       const headers = (options.providerConfig?.headers || {}) as Record<string, string>
+      const streamWithRuntimeGateway = async (
+        messages: Message[],
+        streamOptions: StreamOptions,
+      ) => {
+        const withStreamWatchdog = async (
+          execute: (hooks: { touch: () => void }) => Promise<void>,
+          options: {
+            firstEventTimeoutMs: number
+            idleTimeoutMs: number
+            onTimeout?: () => void
+          },
+        ) => {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          let sawAnyEvent = false
+          let settled = false
+
+          const clearTimer = () => {
+            if (timer) {
+              clearTimeout(timer)
+              timer = undefined
+            }
+          }
+
+          const scheduleTimeout = (timeoutMs: number, reject: (error: unknown) => void) => {
+            clearTimer()
+            timer = setTimeout(() => {
+              if (settled)
+                return
+              options.onTimeout?.()
+              reject(new Error(`A.L.I.C.E stream timed out after ${timeoutMs}ms (${sawAnyEvent ? 'idle-timeout' : 'first-event-timeout'}).`))
+            }, timeoutMs)
+          }
+
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const resolveOnce = () => {
+                if (settled)
+                  return
+                settled = true
+                clearTimer()
+                resolve()
+              }
+              const rejectOnce = (error: unknown) => {
+                if (settled)
+                  return
+                settled = true
+                clearTimer()
+                reject(error)
+              }
+
+              scheduleTimeout(options.firstEventTimeoutMs, rejectOnce)
+              void execute({
+                touch: () => {
+                  sawAnyEvent = true
+                  scheduleTimeout(options.idleTimeoutMs, rejectOnce)
+                },
+              })
+                .then(resolveOnce)
+                .catch(rejectOnce)
+            })
+          }
+          finally {
+            clearTimer()
+          }
+        }
+
+        const bridge = hasAliceBridge() ? getAliceBridge() : null
+        const bridgeStreamChat = bridge?.streamChat
+        if (bridgeStreamChat) {
+          const messagePayload = messages.map((message) => {
+            const entry = message as unknown as Record<string, unknown>
+            const role = message.role === 'developer' ? 'system' : message.role
+            return {
+              role,
+              content: message.content ?? '',
+              toolCallId: typeof entry.tool_call_id === 'string'
+                ? entry.tool_call_id
+                : undefined,
+              toolName: typeof entry.toolName === 'string'
+                ? entry.toolName
+                : undefined,
+            }
+          })
+
+          const runBridgeStream = async (
+            override: { supportsTools?: boolean, waitForTools?: boolean } = {},
+            timeoutOptions: { firstEventTimeoutMs: number, idleTimeoutMs: number } = {
+              firstEventTimeoutMs: runtimeGatewayFirstEventTimeoutMs,
+              idleTimeoutMs: runtimeGatewayIdleTimeoutMs,
+            },
+          ) => {
+            let sawProgress = false
+            try {
+              await withStreamWatchdog(async ({ touch }) => {
+                await bridgeStreamChat({
+                  turnId,
+                  providerId: activeProvider.value || '',
+                  model: options.model,
+                  providerConfig: options.providerConfig ?? {},
+                  messages: messagePayload,
+                  supportsTools: override.supportsTools ?? streamOptions.supportsTools,
+                  waitForTools: override.waitForTools ?? streamOptions.waitForTools,
+                }, {
+                  abortSignal: streamOptions.abortSignal,
+                  onStreamEvent: async (event) => {
+                    if (event.type === 'text-delta' || event.type === 'tool-call' || event.type === 'tool-result') {
+                      sawProgress = true
+                      touch()
+                    }
+                    await streamOptions.onStreamEvent?.(event)
+                  },
+                })
+              }, {
+                firstEventTimeoutMs: timeoutOptions.firstEventTimeoutMs,
+                idleTimeoutMs: timeoutOptions.idleTimeoutMs,
+                onTimeout: () => {
+                  void bridge?.chatAbort?.({
+                    turnId,
+                    reason: 'stream-timeout',
+                  }).catch(() => {})
+                },
+              })
+            }
+            catch (error) {
+              if (error instanceof Error) {
+                ;(error as Error & { __aliceSawProgress?: boolean }).__aliceSawProgress = sawProgress
+              }
+              throw error
+            }
+            return sawProgress
+          }
+
+          let sawProgress = false
+          try {
+            sawProgress = await runBridgeStream()
+          }
+          catch (error) {
+            const sawProgressFromError = readStreamErrorProgressFlag(error)
+            if (sawProgressFromError && isStreamTimeoutError(error)) {
+              await appendAliceAuditLog({
+                level: 'warning',
+                category: 'alice.main-gateway',
+                action: 'stream-timeout-after-progress',
+                message: 'Bridge stream timed out after receiving content; finalized using received partial stream.',
+                details: {
+                  sessionId,
+                  turnId,
+                  reason: error instanceof Error ? error.message : String(error),
+                },
+              })
+              return
+            }
+            if (shouldRetryStreamWithoutTools(error, {
+              supportsTools: streamOptions.supportsTools,
+              sawProgress: sawProgress || sawProgressFromError,
+            })) {
+              await appendAliceAuditLog({
+                level: 'warning',
+                category: 'alice.main-gateway',
+                action: 'stream-retry-without-tools',
+                message: 'Main gateway stream failed without progress; retried once with tools disabled.',
+                details: {
+                  sessionId,
+                  turnId,
+                  reason: error instanceof Error ? error.message : String(error),
+                },
+              })
+              await runBridgeStream({
+                supportsTools: false,
+                waitForTools: false,
+              }, {
+                firstEventTimeoutMs: runtimeGatewayRetryFirstEventTimeoutMs,
+                idleTimeoutMs: runtimeGatewayRetryIdleTimeoutMs,
+              })
+              return
+            }
+            throw error
+          }
+          return
+        }
+
+        await withStreamWatchdog(async ({ touch }) => {
+          await llmStore.stream(options.model, options.chatProvider, messages, {
+            ...streamOptions,
+            onStreamEvent: async (event) => {
+              if (event.type === 'text-delta' || event.type === 'tool-call' || event.type === 'tool-result')
+                touch()
+              await streamOptions.onStreamEvent?.(event)
+            },
+          })
+        }, {
+          firstEventTimeoutMs: runtimeGatewayFirstEventTimeoutMs,
+          idleTimeoutMs: runtimeGatewayIdleTimeoutMs,
+        })
+      }
 
       const categorizer = createStreamingCategorizer(activeProvider.value)
       let streamPosition = 0
@@ -810,7 +1144,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
         let retryFullText = ''
         try {
-          await llmStore.stream(options.model, options.chatProvider, sanitizedRetry.messages as Message[], {
+          await streamWithRuntimeGateway(sanitizedRetry.messages as Message[], {
             headers,
             supportsTools: false,
             waitForTools: false,
@@ -1460,7 +1794,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         })
 
         try {
-          await llmStore.stream(options.model, options.chatProvider, refusalMessages, {
+          await streamWithRuntimeGateway(refusalMessages, {
             headers,
             supportsTools: false,
             waitForTools: false,
@@ -1520,6 +1854,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
 
         await appendConversationTurnRecord(assistantOutputText)
         await emitAssistantTurnHooks(assistantOutputText)
+        assistantOutputCommitted = true
 
         if (isForegroundSession()) {
           streamingMessage.value = createEmptyStreamingMessage()
@@ -1568,6 +1903,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
           await appendConversationTurnRecord(finalAssistantDisplayText || reply)
           persistBuiltAssistantMessage()
           await emitAssistantTurnHooks(finalAssistantDisplayText || reply)
+          assistantOutputCommitted = true
 
           if (isForegroundSession()) {
             streamingMessage.value = createEmptyStreamingMessage()
@@ -1582,7 +1918,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         turnToolEvidence.denialSource = classifyDeniedSource(rawReason)
       }
 
-      await llmStore.stream(options.model, options.chatProvider, newMessages as Message[], {
+      await streamWithRuntimeGateway(newMessages as Message[], {
         headers,
         tools: options.tools,
         supportsTools: true,
@@ -1654,7 +1990,7 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         const sanitizedRetry = sanitizeForRemoteModel(forcedRetryMessages, { timeBudgetMs: 50, chunkSize: 2048 })
         if (!sanitizedRetry.blocked) {
           let forcedRetryFullText = ''
-          await llmStore.stream(options.model, options.chatProvider, sanitizedRetry.messages as Message[], {
+          await streamWithRuntimeGateway(sanitizedRetry.messages as Message[], {
             headers,
             tools: options.tools,
             supportsTools: true,
@@ -1749,13 +2085,14 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
       await appendConversationTurnRecord(assistantOutputText)
 
       await emitAssistantTurnHooks(assistantOutputText)
+      assistantOutputCommitted = true
 
       if (isForegroundSession()) {
         streamingMessage.value = createEmptyStreamingMessage()
       }
     }
     catch (error) {
-      if (isAliceAbortError(error) || abortSignal.aborted || shouldAbort()) {
+      if (abortSignal.aborted || shouldAbort()) {
         const abortReason = resolveAbortReason(error, isStaleGeneration())
         const beforeLength = sessionMessagesForSend.length
         if (userTurnMessageId) {
@@ -1799,6 +2136,58 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         return
       }
 
+      if (!assistantOutputCommitted) {
+        const fallback = resolveStreamFailureFallback(error)
+        const fallbackReply = fallback.reply
+        const fallbackStructured = createStructuredFallback(fallbackReply, 'concerned')
+        const fallbackMessage: StreamingAssistantMessage = {
+          role: 'assistant',
+          content: fallbackReply,
+          slices: [{ type: 'text', text: fallbackReply }],
+          tool_results: [],
+          categorization: {
+            speech: fallbackReply,
+            reasoning: '',
+          },
+          structured: fallbackStructured,
+          createdAt: Date.now(),
+          id: nanoid(),
+        }
+        sessionMessagesForSend.push(fallbackMessage)
+        chatSession.persistSessionMessages(sessionId)
+        if (isForegroundSession()) {
+          streamingMessage.value = createEmptyStreamingMessage()
+        }
+
+        if (hasAliceBridge()) {
+          await getAliceBridge().appendConversationTurn({
+            turnId,
+            sessionId,
+            userText: sendingMessage,
+            assistantText: fallbackReply,
+            structured: { ...fallbackStructured },
+            createdAt: Date.now(),
+          }).catch(() => {})
+        }
+
+        await appendAliceAuditLog({
+          level: 'warning',
+          category: 'alice.chat',
+          action: 'turn-failed-safe-reply',
+          message: 'Primary stream failed and fallback assistant reply was emitted.',
+          details: {
+            sessionId,
+            turnId,
+            reason: error instanceof Error ? error.message : String(error),
+            fallbackKind: fallback.kind,
+          },
+        })
+        return
+      }
+
+      if (isForegroundSession()) {
+        streamingMessage.value = createEmptyStreamingMessage()
+      }
       console.error('Error sending message:', error)
       throw error
     }

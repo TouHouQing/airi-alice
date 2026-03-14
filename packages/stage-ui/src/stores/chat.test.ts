@@ -225,6 +225,8 @@ function installAliceBridge(options?: {
     liveliness: number
     sensibility: number
   }
+  streamChat?: (payload: any, options: any) => Promise<void>
+  chatAbort?: (payload: any) => Promise<any>
 }) {
   appendConversationTurnMock.mockResolvedValue(undefined)
   appendAuditLogMock.mockResolvedValue(undefined)
@@ -277,6 +279,8 @@ function installAliceBridge(options?: {
       nextTickAt: Date.now() + 60_000,
       running: true,
     }),
+    streamChat: options?.streamChat,
+    chatAbort: options?.chatAbort,
   } as any)
 }
 
@@ -524,5 +528,222 @@ describe('chat orchestrator', () => {
     expect(payload?.structured?.emotion).toBe('angry')
     expect(String(payload?.assistantText ?? '')).toContain('别来烦我')
     expect(String(payload?.assistantText ?? '')).not.toContain('好的，我去读一下')
+  })
+
+  it('prefers alice bridge streamChat over direct llmStore.stream when bridge stream is available', async () => {
+    const bridgeStreamChatMock = vi.fn(async (_payload: any, options: any) => {
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"bridge-stream","emotion":"neutral","reply":"通过主进程网关回复。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+    streamMock.mockImplementation(async () => {
+      throw new Error('llmStore.stream should not be called when bridge stream is present')
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(bridgeStreamChatMock.mock.calls.length).toBeGreaterThan(0)
+    expect(streamMock).not.toBeCalled()
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('主进程网关')
+  })
+
+  it('emits a visible fallback reply when bridge stream fails before completion', async () => {
+    const bridgeStreamChatMock = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:11434')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    expect(streamMock).not.toBeCalled()
+    expect(store.sending).toBe(false)
+    expect(appendConversationTurnMock).toBeCalledTimes(1)
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.chat',
+      action: 'turn-failed-safe-reply',
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('本地模型服务')
+    expect(streamingMessage.value.content).toBe('')
+    expect(ensureSessionMessages(activeSessionId.value).at(-1)?.role).toBe('assistant')
+  })
+
+  it('times out stuck bridge streams and emits fallback reply', async () => {
+    vi.useFakeTimers()
+    try {
+      const bridgeChatAbortMock = vi.fn().mockResolvedValue({ accepted: true, state: 'aborted' })
+      const bridgeStreamChatMock = vi.fn(() => new Promise<void>(() => {}))
+      installAliceBridge({
+        streamChat: bridgeStreamChatMock,
+        chatAbort: bridgeChatAbortMock,
+      })
+
+      const store = useChatOrchestratorStore()
+      const pending = store.ingest('你现在心情怎么样', {
+        model: 'mock-model',
+        chatProvider: createChatProviderStub(),
+        origin: 'ui-user',
+      })
+
+      await vi.advanceTimersByTimeAsync(72_500)
+      await expect(pending).resolves.toBeUndefined()
+
+      expect(bridgeStreamChatMock).toBeCalledTimes(1)
+      expect(bridgeChatAbortMock.mock.calls.length).toBeGreaterThanOrEqual(1)
+      expect(store.sending).toBe(false)
+      expect(appendConversationTurnMock).toBeCalledTimes(1)
+      const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+      expect(String(payload?.assistantText ?? '')).toContain('响应超时')
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not misreport provider outage for non-network internal stream failures', async () => {
+    const bridgeStreamChatMock = vi.fn(async () => {
+      throw new Error('chat pipeline parser failed unexpectedly')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('回复失败')
+    expect(String(payload?.assistantText ?? '')).not.toContain('没有连上模型服务')
+  })
+
+  it('surfaces provider configuration fallback when stream start is rejected by missing config', async () => {
+    const bridgeStreamChatMock = vi.fn(async () => {
+      throw new Error('A.L.I.C.E stream start rejected (state=missing-config) for turn turn-x. reason=Missing providerId/model for main-process chat stream.')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('配置缺失')
+    expect(String(payload?.assistantText ?? '')).not.toContain('没有连上本地模型服务')
+  })
+
+  it('retries bridge stream once with tools disabled when first attempt fails before progress', async () => {
+    const bridgeStreamChatMock = vi.fn(async (payload: any, options: any) => {
+      if (payload.supportsTools !== false) {
+        throw new Error('No endpoints found that support tool use.')
+      }
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"obedience=0.50, liveliness=0.50, sensibility=0.50, keep balanced.","emotion":"neutral","reply":"无工具重试成功。"}',
+      })
+      await options.onStreamEvent?.({ type: 'finish' })
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+    })
+
+    const store = useChatOrchestratorStore()
+    await store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })
+
+    expect(bridgeStreamChatMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(bridgeStreamChatMock.mock.calls.some(call => call?.[0]?.supportsTools === true)).toBe(true)
+    expect(bridgeStreamChatMock.mock.calls.some(call => call?.[0]?.supportsTools === false && call?.[0]?.waitForTools === false)).toBe(true)
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('无工具重试成功')
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.main-gateway',
+      action: 'stream-retry-without-tools',
+    }))
+  })
+
+  it('does not trigger no-tools retry on plain stream timeout before progress', async () => {
+    const bridgeStreamChatMock = vi.fn(async () => {
+      throw new Error('A.L.I.C.E stream timed out after 65000ms (first-event-timeout).')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+      chatAbort: vi.fn().mockResolvedValue({ accepted: true, state: 'aborted' }),
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    expect(bridgeStreamChatMock).toBeCalledTimes(1)
+    expect(appendAuditLogMock).not.toBeCalledWith(expect.objectContaining({
+      category: 'alice.main-gateway',
+      action: 'stream-retry-without-tools',
+    }))
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('等待模型响应超时')
+  })
+
+  it('finalizes from partial stream when finish event is missing after text progress', async () => {
+    const bridgeStreamChatMock = vi.fn(async (_payload: any, options: any) => {
+      await options.onStreamEvent?.({
+        type: 'text-delta',
+        text: '{"thought":"partial-stream","emotion":"neutral","reply":"你好，我在。"}',
+      })
+      throw new Error('A.L.I.C.E stream timed out after 12000ms without finish event.')
+    })
+    installAliceBridge({
+      streamChat: bridgeStreamChatMock,
+      chatAbort: vi.fn().mockResolvedValue({ accepted: true, state: 'aborted' }),
+    })
+
+    const store = useChatOrchestratorStore()
+    await expect(store.ingest('你好', {
+      model: 'mock-model',
+      chatProvider: createChatProviderStub(),
+      origin: 'ui-user',
+    })).resolves.toBeUndefined()
+
+    const payload = appendConversationTurnMock.mock.calls.at(-1)?.[0]
+    expect(String(payload?.assistantText ?? '')).toContain('你好，我在')
+    expect(String(payload?.assistantText ?? '')).not.toContain('没有连上模型服务')
+    expect(appendAuditLogMock).toBeCalledWith(expect.objectContaining({
+      category: 'alice.main-gateway',
+      action: 'stream-timeout-after-progress',
+    }))
   })
 })
